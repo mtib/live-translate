@@ -51,16 +51,14 @@ ScreenCaptureKit) without touching `Pipeline`.
 
 ### Key design decisions
 
-- **Dual-source mixing, single recognizer.** Apple Speech serializes
-  recognition tasks per-app — two concurrent recognizers (even one
-  on-device, one server-side) preempt each other and both fast-fail
-  with "No speech detected". Workaround: when both mic and system are
-  enabled, wrap them in `MixedAudioSource`, which interleaves their
-  buffer streams. ONE recognizer sees the merged audio. We lose source
-  attribution as a result — sentences from this mode have no `.kind`
-  label; the UI shows them uncoloured like any other sentence. Both
-  audio sources standardize on 16 kHz mono Float32 (what SFSpeech wants
-  natively) so the mixed stream is format-consistent.
+- **Always mix mic + system.** The app no longer exposes input toggles —
+  mic and system audio are always both captured and sample-summed by
+  `MixedAudioSource` before the single SFSpeechRecognizer sees them.
+  Apple Speech serializes recognition tasks per-app, so two concurrent
+  recognizers can't coexist; mixing into one stream is the workaround.
+  Both audio sources standardize on 16 kHz mono Float32 (SFSpeech's
+  native format) so the mixed stream is format-consistent and the per-
+  sample sum is meaningful.
 - **Transcribers emit sentence snapshots, not raw text.** A `SessionSnapshot`
   carries `[SessionSentence]` already split. The Pipeline reconciles each
   snapshot against its own array by position — this handles "new sentence
@@ -70,18 +68,17 @@ ScreenCaptureKit) without touching `Pipeline`.
 - **Translation cache.** `Pipeline.translationCache: [String: String]`
   keyed by source text. Identical strings across sessions reuse the
   cached translation. LRU-ish eviction at 200 entries.
-- **Per-sentence, debounced translation.** Translation worker only sends
-  sentences that have (a) text different from `lastTranslatedSource`
-  AND (b) either `isFinal == true` OR have been stable (no text change)
-  for ≥0.6 s. Partials growing fast aren't translated until they settle.
-  The pipeline does not keep ballooning with repeat work.
-- **Pruning.** Non-protected sentences whose `lastModified` is older than
-  10s get dropped once per second. Hard cap at 3 retained — this app is a
-  rolling translation panel, not a transcript log. "Protected" means: the
-  very last sentence overall, and each source's *live* (last-active)
-  sentence. Earlier session-active sentences are eligible to drop; if the
-  recognizer's next snapshot still references them, ingest finds no
-  matching UUID and silently skips, so the drop sticks.
+- **Per-sentence, eager translation.** Translation worker sends any
+  sentence whose text differs from `lastTranslatedSource`. The cache
+  keeps duplicate strings free. `translationStabilityDelay` is `0` —
+  partials translate as soon as their text changes. (The variable
+  stays in code as a tunable in case the recognizer ever floods us.)
+- **Pruning.** Non-protected sentences whose `lastModified` is older
+  than **60 s** get dropped once per second. Hard cap at **8** retained.
+  "Protected" means: the most-recent sentence overall, and the live
+  (last-active) sentence. Earlier session-active sentences are eligible
+  to drop; if the recognizer's next snapshot still references them,
+  ingest finds no matching UUID and silently skips, so the drop sticks.
 - **Transcript archive (JSON Lines).** Whenever a sentence is dropped
   (prune or max-count enforcement), it's appended to a per-run file at
   `~/Documents/transcripts/<timestamp>.jsonl`. One JSON object per line:
@@ -164,10 +161,10 @@ silent). After **6** in a row the Pipeline gives up with a
 ### Persisted settings
 
 User-facing settings are stored in `UserDefaults` and restored on launch:
-`micEnabled`, `systemEnabled`, `translateEnabled`, `source` (BCP-47 locale),
-`target` (language code + display name). `compactMode` is stored separately
-via `@AppStorage` because it's a pure View concern. Keys live under the
-`Pipeline.K` private enum / `compactMode` raw key.
+`translateEnabled`, `source` (BCP-47 locale), `target` (language code +
+display name). `compactMode` is stored separately via `@AppStorage`
+because it's a pure View concern. Mic-on / system-on are no longer user
+settings — both are always captured.
 
 ### Permissions
 The bundle declares:

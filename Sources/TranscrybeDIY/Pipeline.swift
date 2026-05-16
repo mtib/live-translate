@@ -48,22 +48,25 @@ final class Pipeline: ObservableObject {
 
     // MARK: - User settings (persisted)
 
-    @Published var micEnabled: Bool { didSet { defaults.set(micEnabled, forKey: K.micEnabled) } }
-    @Published var systemEnabled: Bool { didSet { defaults.set(systemEnabled, forKey: K.systemEnabled) } }
     @Published var source: SourceLocale { didSet { persist(source, forKey: K.source) } }
     @Published var target: TargetLanguage { didSet { persist(target, forKey: K.target) } }
     @Published var translateEnabled: Bool { didSet { defaults.set(translateEnabled, forKey: K.translateEnabled) } }
 
-    /// Non-protected sentence older than this is pruned.
-    var maxAgeSeconds: TimeInterval = 10
+    /// Non-protected sentence older than this is pruned. Generous — old
+    /// sentences are dimmed in the UI but still readable, so we'd rather
+    /// keep them around for re-reading than aggressively churn.
+    var maxAgeSeconds: TimeInterval = 60
 
-    /// Hard cap on retained sentences. Kept tight — this is a rolling
-    /// translation panel, not a transcript log.
-    var maxSentenceCount: Int = 3
+    /// Hard cap on retained sentences. Higher than feels tight on purpose:
+    /// older sentences are pruned by age anyway; this cap only kicks in
+    /// during very fast speech.
+    var maxSentenceCount: Int = 8
 
-    /// Minimum quiet time before translating a non-final sentence. Stops
-    /// us from re-translating partials on every recognizer tick.
-    var translationStabilityDelay: TimeInterval = 0.6
+    /// Minimum quiet time before translating a non-final sentence. Set to
+    /// zero: translate eagerly. The cache (lastTranslatedSource) keeps us
+    /// from re-sending identical text. The recognizer's partial rate is
+    /// modest enough that translating each unique partial is cheap.
+    var translationStabilityDelay: TimeInterval = 0
 
     // MARK: - Available choices
 
@@ -107,8 +110,6 @@ final class Pipeline: ObservableObject {
 
     private let defaults = UserDefaults.standard
     private enum K {
-        static let micEnabled = "pipeline.micEnabled"
-        static let systemEnabled = "pipeline.systemEnabled"
         static let translateEnabled = "pipeline.translateEnabled"
         static let source = "pipeline.source"
         static let target = "pipeline.target"
@@ -141,8 +142,6 @@ final class Pipeline: ObservableObject {
             .sorted { $0.identifier < $1.identifier }
 
         let d = UserDefaults.standard
-        self.micEnabled = d.object(forKey: K.micEnabled) as? Bool ?? true
-        self.systemEnabled = d.object(forKey: K.systemEnabled) as? Bool ?? false
         self.translateEnabled = d.object(forKey: K.translateEnabled) as? Bool ?? true
         self.source = Self.load(SourceLocale.self, forKey: K.source,
                                 defaultValue: SourceLocale(identifier: "de-DE"))
@@ -189,37 +188,24 @@ final class Pipeline: ObservableObject {
             archive = nil
         }
 
-        // 1. Validate selection.
-        guard micEnabled || systemEnabled else {
-            status = .stopped(reason: "No input source enabled — turn on Mic or System audio.")
-            return
-        }
-
-        // 2. Permissions. Mic via TCC up front; SCK prompts on its own.
+        // 1. Permissions. Mic via TCC up front; SCK prompts on its own when
+        //    the stream starts. Both are mandatory — the app always mixes
+        //    mic + system audio so the user can talk and translate ambient
+        //    audio (videos, calls) without choosing one.
         status = .requestingPermissions
-        if micEnabled {
-            let granted: Bool = await withCheckedContinuation { c in
-                AVCaptureDevice.requestAccess(for: .audio) { c.resume(returning: $0) }
-            }
-            guard granted else { status = .stopped(reason: "Microphone permission denied"); return }
+        let micGranted: Bool = await withCheckedContinuation { c in
+            AVCaptureDevice.requestAccess(for: .audio) { c.resume(returning: $0) }
         }
+        guard micGranted else { status = .stopped(reason: "Microphone permission denied"); return }
         let speechAuth = await AppleSpeechTranscriber.requestAuthorization()
         guard speechAuth == .authorized else {
             status = .stopped(reason: "Speech recognition not authorized"); return
         }
 
-        // 3. Build the active source. When both inputs are enabled we mix
-        //    them into one stream (see MixedAudioSource for why and how).
-        let active: AudioSource
-        if micEnabled && systemEnabled {
-            active = MixedAudioSource(micSource, systemSource)
-        } else if micEnabled {
-            active = micSource
-        } else {
-            active = systemSource
-        }
+        // 2. Active source is always the mixed mic+system stream.
+        let active: AudioSource = MixedAudioSource(micSource, systemSource)
 
-        // 4. Start audio.
+        // 3. Start audio.
         status = .starting
         do {
             try await active.start()
@@ -227,21 +213,21 @@ final class Pipeline: ObservableObject {
             status = .stopped(reason: "Audio: \(error.localizedDescription)"); return
         }
 
-        // 5. Archive file for this run.
+        // 4. Archive file for this run.
         do { archive = try TranscriptArchive() }
         catch { Log.line("Pipeline: archive open failed: \(error.localizedDescription)") }
 
         status = .running
 
-        // 6. Workers in a TaskGroup so cancellation cascades. Only ONE
-        //    recognition cycle now — that's the whole point of mixing.
+        // 5. Workers in a TaskGroup so cancellation cascades. Only ONE
+        //    recognition cycle — that's the whole point of mixing.
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await self.runTranslationLoop() }
             group.addTask { await self.runPruneLoop() }
             group.addTask { await self.runRecognitionCycle(audio: active) }
         }
 
-        // 7. Audio cleanup. Awaited so the next Start sees a clean source.
+        // 6. Audio cleanup. Awaited so the next Start sees a clean source.
         await active.stop()
     }
 
