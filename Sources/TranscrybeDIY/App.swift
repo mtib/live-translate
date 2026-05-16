@@ -4,6 +4,10 @@ import SwiftUI
 struct TranscrybeDIYApp: App {
     @StateObject private var pipeline = Pipeline()
 
+    init() {
+        Log.startup()  // truncates the log if it's grown past the cap
+    }
+
     var body: some Scene {
         Window("Transcrybe", id: "main") {
             TranscriptView(pipeline: pipeline)

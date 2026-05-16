@@ -65,9 +65,11 @@ ScreenCaptureKit) without touching `Pipeline`.
 - **Translation cache.** `Pipeline.translationCache: [String: String]`
   keyed by source text. Identical strings across sessions reuse the
   cached translation. LRU-ish eviction at 200 entries.
-- **Per-sentence translation, not whole-transcript.** Translation worker
-  only sends sentences whose `text != lastTranslatedSource`. The pipeline
-  does not keep ballooning with repeat work.
+- **Per-sentence, debounced translation.** Translation worker only sends
+  sentences that have (a) text different from `lastTranslatedSource`
+  AND (b) either `isFinal == true` OR have been stable (no text change)
+  for ≥0.6 s. Partials growing fast aren't translated until they settle.
+  The pipeline does not keep ballooning with repeat work.
 - **Pruning.** Non-protected sentences whose `lastModified` is older than
   10s get dropped once per second. Hard cap at 3 retained — this app is a
   rolling translation panel, not a transcript log. "Protected" means: the
@@ -96,13 +98,14 @@ ScreenCaptureKit) without touching `Pipeline`.
 | `App.swift` | `@main` entry. SwiftUI `Window` scene. Configures the NSWindow for floating / translucent / movable-from-background behavior. |
 | `TranscriptView.swift` | The whole UI. Renders one `SentenceRow` per sentence, with leading color strip + opacity fade. Hosts `.translationTask` (the only way to get a `TranslationSession`). |
 | `VisualEffectBackground.swift` | `NSVisualEffectView` wrapper for the HUD-style translucent background. |
-| `Pipeline.swift` | `@MainActor ObservableObject` orchestrator. Owns the published `sentences` array. Runs **two parallel** recognition cycles, plus translation + prune workers. |
-| `Types.swift` | `SourceLocale`, `TargetLanguage`, `SentenceKind`, `Sentence`, `PipelineStatus`, `SessionSentence` / `SessionSnapshot`. Protocols: `AudioSource`, `Transcriber`, `Translator`. |
-| `MicrophoneSource.swift` | `AVAudioEngine` mic capture. **Broadcaster** — each call to `buffers` gets a fresh `AsyncStream` because AsyncStream is single-consumer. |
-| `SystemAudioSource.swift` | `ScreenCaptureKit`-based system audio capture. Converts `CMSampleBuffer` → `AVAudioPCMBuffer` at 16 kHz mono Float32. |
+| `Pipeline.swift` | `@MainActor ObservableObject` orchestrator. Owns the published `sentences` array. Runs **two parallel** recognition cycles, plus translation + prune workers. Persists user settings via UserDefaults. |
+| `Types.swift` | `SourceLocale`, `TargetLanguage`, `SentenceKind` (with `archiveTag` and `tint`), `Sentence`, `PipelineStatus`, `SessionSentence` / `SessionSnapshot`. Protocols: `AudioSource`, `Transcriber`, `Translator`. |
+| `MicrophoneSource.swift` | `AVAudioEngine` mic capture. **Broadcaster** — each access to `buffers` returns a fresh `AsyncStream`. NSLock-guarded listener map. |
+| `SystemAudioSource.swift` | `ScreenCaptureKit`-based system audio capture. Converts `CMSampleBuffer` → 16 kHz mono Float32 `AVAudioPCMBuffer`. |
 | `AppleSpeechTranscriber.swift` | Apple `Speech` framework. Owns the sentence splitter (`splitIntoSentences`). |
-| `AppleTranslator.swift` | Holds a `TranslationSession` that the View injects via `.translationTask`. |
-| `Log.swift` | Append-only file logger at `/tmp/transcrybe.log`. macOS 26 makes `os_log` / `NSLog` hard to filter for ad-hoc-signed apps, so we just write to disk. |
+| `AppleTranslator.swift` | Holds a `TranslationSession` that the View injects via `Pipeline.installTranslationSession(_:)`. |
+| `TranscriptArchive.swift` | One-per-run JSONL archive file. Writes go through a serial queue so MainActor never blocks on disk. |
+| `Log.swift` | Append-only file logger at `/tmp/transcrybe.log`. Truncates on launch if > 5 MB. |
 
 ## Key behaviors / non-obvious bits
 
@@ -152,6 +155,14 @@ silent). After **6** in a row the Pipeline gives up with a
   or by opening the Translate app once.
 - `Configuration` source/target use bare language codes (`"de"`, `"en"`),
   not full BCP-47 (`"de-DE"`). We trim the region in `translationConfig`.
+
+### Persisted settings
+
+User-facing settings are stored in `UserDefaults` and restored on launch:
+`micEnabled`, `systemEnabled`, `translateEnabled`, `source` (BCP-47 locale),
+`target` (language code + display name). `compactMode` is stored separately
+via `@AppStorage` because it's a pure View concern. Keys live under the
+`Pipeline.K` private enum / `compactMode` raw key.
 
 ### Permissions
 The bundle declares:
@@ -242,3 +253,9 @@ pkill -f TranscrybeDIY                           # kill all instances
     active recognition session — and since a session can run for ~60
     seconds emitting many sentences, the list kept growing forever. Only
     the *live* (last-active) sentence per source needs protection.
+11. **Hoisting `let audio = source.buffers` out of the recognition-cycle
+    while-loop** silently broke session restarts: `AsyncStream` is
+    single-consumer, so the second session's pump task iterated an
+    already-drained stream and the recognizer hit "No speech detected".
+    Rule: `buffers` is a *fresh subscription factory* — call it per
+    consumer, never cache.

@@ -4,13 +4,14 @@ import AVFoundation
 // MARK: - Strongly-typed locale wrappers
 
 /// BCP-47 locale identifier for speech recognition (e.g. "de-DE", "en-US").
-struct SourceLocale: Hashable, Identifiable {
+struct SourceLocale: Hashable, Identifiable, Codable {
     let identifier: String
     var id: String { identifier }
 }
 
-/// BCP-47 language code for translation target (e.g. "en", "zh-Hans").
-struct TargetLanguage: Hashable, Identifiable {
+/// BCP-47 language code + display name for translation target
+/// (e.g. ("en", "English"), ("zh-Hans", "Chinese (Simplified)")).
+struct TargetLanguage: Hashable, Identifiable, Codable {
     let code: String
     let name: String
     var id: String { code }
@@ -19,72 +20,73 @@ struct TargetLanguage: Hashable, Identifiable {
 // MARK: - Transcriber events
 
 /// One sentence as the active recognition session currently sees it. The
-/// Transcriber is responsible for parsing the recognizer's growing partial
-/// text into discrete sentences — this keeps the Pipeline ignorant of how
-/// any particular backend formats its output.
+/// Transcriber owns sentence splitting — the Pipeline stays ignorant of
+/// how any particular backend formats its output.
 struct SessionSentence: Sendable, Equatable {
     let text: String
-    /// True when the source backend has finalized this sentence (sentence
-    /// terminator emitted, or the whole session ended).
+    /// True when the backend has finalized this sentence (terminator
+    /// emitted, or whole session ending).
     let isFinal: Bool
 }
 
 /// A snapshot of the active session's sentences in order. The Pipeline
-/// reconciles this list against its own `Sentence` array by position:
-///   - new entries get new Sentence IDs appended
-///   - existing entries get text/isFinal updated in place (stable ID)
-///   - missing entries (snapshot is shorter than before) are removed
-/// This is what fixes the "an earlier row keeps getting more text" bug —
-/// the recognizer occasionally revises away a sentence boundary, and the
-/// snapshot pattern lets us drop the orphaned trailing sentence cleanly.
-struct SessionSnapshot: Sendable {
+/// reconciles this against its own array by position:
+///   - new entries → new `Sentence` with a fresh UUID
+///   - existing entries → text/isFinal updated in place (UUID preserved)
+///   - missing entries (snapshot shrank) → those `Sentence`s are removed
+struct SessionSnapshot: Sendable, Equatable {
     let sentences: [SessionSentence]
 }
 
 // MARK: - Sentence (UI-facing data model)
 
-/// Which audio source produced a sentence. Used for UI color-coding so the
-/// user can tell at a glance which voice came from where.
-enum SentenceKind: String, Sendable, CaseIterable, Identifiable {
+/// Which audio source produced a sentence. Drives UI color coding and
+/// archive tagging.
+enum SentenceKind: String, Sendable, CaseIterable, Identifiable, Codable {
     case microphone, systemAudio
     var id: String { rawValue }
+
+    /// Short tag used in archive files and logs. Stable across versions —
+    /// don't rename without thinking about consumer scripts.
+    var archiveTag: String {
+        switch self {
+        case .microphone: return "mic"
+        case .systemAudio: return "system"
+        }
+    }
 }
 
-/// One sentence in the rolling transcript. The Pipeline maintains an array
-/// of these (growing as the recognizer emits new sentences, shrinking as
-/// the prune pass removes stale ones). The UI renders one row per sentence
-/// with the most recent at full opacity and older ones fading out.
+/// One sentence in the rolling transcript. The Pipeline maintains an
+/// array of these; the UI renders one row per sentence with the most
+/// recent at full opacity and older ones fading out.
 struct Sentence: Identifiable, Equatable {
     let id: UUID
-    /// Which audio source this came from. Drives color coding in the UI.
+    /// Which audio source this came from.
     let kind: SentenceKind
     /// Source-language text. Updated in place as the live partial grows.
     var text: String
-    /// Target-language text. Empty until the translator has handled it,
-    /// then updated whenever the source text changes.
+    /// Target-language text. Empty until the translator handles it.
     var translation: String
-    /// What `text` was when we last successfully translated. Used to detect
-    /// when a sentence has drifted and needs another translation pass —
-    /// crucially this means we don't re-send unchanged sentences to the
-    /// translator, so the pipeline doesn't keep ballooning with repeat work.
+    /// What `text` was when we last successfully translated. Used to
+    /// detect when a sentence has drifted and needs another translation
+    /// pass — so the pipeline doesn't keep ballooning with repeat work.
     var lastTranslatedSource: String
-    /// Wall-clock time the source text last changed. The prune pass uses
-    /// this to evict sentences that have been quiet for `maxAgeSeconds`.
+    /// Wall-clock time the source text last changed. Prune uses this to
+    /// evict sentences quiet for `maxAgeSeconds`. Translation debounce
+    /// uses this to skip partials that are still actively growing.
     var lastModified: Date
-    /// True once the recognizer has emitted a sentence terminator. Final
-    /// sentences won't be rewritten; only their translation may update.
+    /// True once the backend has emitted a sentence terminator. Final
+    /// sentences won't be rewritten; only translation may update.
     var isFinal: Bool
 }
 
-/// Pipeline status — drives UI state machine. Strings are derived from the
-/// case so the View doesn't sprinkle magic strings.
+/// Pipeline status — drives the UI status line. Kept simple on purpose:
+/// the UI doesn't need session indexes or per-source detail.
 enum PipelineStatus: Equatable {
     case idle
     case requestingPermissions
     case starting
-    case listening(sessionIndex: Int, locale: String)
-    case reconnecting
-    case translating
+    case running
     case stopped(reason: String)
 
     var description: String {
@@ -92,9 +94,7 @@ enum PipelineStatus: Equatable {
         case .idle: return "Idle"
         case .requestingPermissions: return "Requesting permission…"
         case .starting: return "Starting…"
-        case .listening(let i, let loc): return "Listening (\(loc), session #\(i))"
-        case .reconnecting: return "Reconnecting…"
-        case .translating: return "Translating…"
+        case .running: return "Listening"
         case .stopped(let r): return "Stopped: \(r)"
         }
     }
@@ -104,25 +104,26 @@ enum PipelineStatus: Equatable {
 
 /// Produces raw audio buffers from some source (mic, system audio, file…).
 ///
-/// `start()` is `async` so backends like ScreenCaptureKit (which only
-/// exposes async setup) can implement it without faking a synchronous
-/// shim. The previous "block on a semaphore" shim deadlocked the main
-/// actor — Pipeline already runs in an async context, so this is the
-/// natural shape.
+/// `start()` and `stop()` are both `async` so backends that wrap async
+/// APIs (e.g. ScreenCaptureKit) can implement them natively. Pipeline
+/// already runs in an async context, so there's nothing awkward about this.
 protocol AudioSource: AnyObject {
-    /// Begin producing buffers. Multiple calls without `stop()` in between
-    /// are a programmer error.
+    /// Begin producing buffers. Multiple calls without `stop()` in
+    /// between are a programmer error.
     func start() async throws
-    /// Stop producing and release resources.
-    func stop()
-    /// Hot stream of buffers. New subscribers receive future buffers only.
+    /// Stop producing and release resources. Should be cheap and idempotent.
+    func stop() async
+    /// Hot stream of buffers. Each access returns a fresh stream — the
+    /// source broadcasts each callback to all live subscribers. This is
+    /// necessary because AsyncStream is single-consumer; without
+    /// broadcasting, restarting recognition silently breaks.
     var buffers: AsyncStream<AVAudioPCMBuffer> { get }
 }
 
-/// Consumes audio buffers and produces session snapshots — already split
-/// into sentences. One call to `transcribe(...)` represents one recognition
-/// session; the stream finishes when the session ends. The Pipeline calls
-/// this repeatedly to give the user a continuous experience.
+/// Consumes audio buffers and produces session snapshots. One call to
+/// `transcribe(...)` represents one recognition session; the stream
+/// finishes when the session ends. The Pipeline calls this repeatedly
+/// to give the user continuous output across the backend's session caps.
 protocol Transcriber {
     func transcribe(
         audio: AsyncStream<AVAudioPCMBuffer>,
@@ -130,8 +131,9 @@ protocol Transcriber {
     ) -> AsyncThrowingStream<SessionSnapshot, Error>
 }
 
-/// Translates a single string from source to target language. Implementations
-/// may batch or stream internally; we keep the surface as one-shot for simplicity.
+/// Translates a single string. Implementations carry their own
+/// source/target context (Apple's `TranslationSession` does), so the
+/// callsite only needs the text.
 protocol Translator {
-    func translate(_ text: String, from: SourceLocale, to: TargetLanguage) async throws -> String
+    func translate(_ text: String) async throws -> String
 }

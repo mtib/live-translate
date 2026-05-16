@@ -1,33 +1,31 @@
 import Foundation
 import AVFoundation
 
-/// Microphone capture via AVAudioEngine, exposed as a broadcasting source.
+/// Microphone capture via `AVAudioEngine`, exposed as a broadcasting source.
 ///
-/// **Broadcaster pattern.** Each call to the `buffers` property creates a
-/// fresh AsyncStream subscribed to the live tap. The tap callback fans the
-/// buffer out to every active subscriber. Without this, the second call to
-/// `start()` (or any caller that reads `buffers` after a prior consumer's
-/// iterator has finished) silently receives nothing — the recognizer then
-/// hits its "no speech detected" timeout and gives up after ~50 ms. That
-/// was the cause of the "won't restart after Stop" bug.
+/// **Broadcaster pattern.** Each access to `buffers` returns a fresh
+/// `AsyncStream`. The tap callback fans the buffer out to every active
+/// subscriber. Without this, a second `transcribe(...)` call after a
+/// session ends would attach to an already-drained iterator and silently
+/// receive nothing — the recognizer would then hit "no speech detected"
+/// within 50 ms.
 final class MicrophoneSource: AudioSource {
     private let engine = AVAudioEngine()
     private var tapInstalled = false
 
-    /// Live continuations, keyed by an ID so each subscriber can unregister
-    /// itself when its consumer task finishes (via `onTermination`).
+    /// Live continuations keyed by an ID so each subscriber can unregister
+    /// itself when its consumer task finishes. NSLock is fine here — every
+    /// access is short and never blocks on IO.
     private var listeners: [UUID: AsyncStream<AVAudioPCMBuffer>.Continuation] = [:]
-    private let listenerQueue = DispatchQueue(label: "MicrophoneSource.listeners")
+    private let lock = NSLock()
 
-    /// A fresh hot stream each time. Tap callbacks fan out to all current
-    /// subscribers; missing the start of a session is fine because we drop
-    /// the listener when its iterator goes away.
+    /// Fresh hot stream per access — see broadcaster pattern note above.
     var buffers: AsyncStream<AVAudioPCMBuffer> {
         AsyncStream { cont in
             let id = UUID()
-            self.listenerQueue.sync { self.listeners[id] = cont }
+            self.lock.withLock { self.listeners[id] = cont }
             cont.onTermination = { [weak self] _ in
-                self?.listenerQueue.sync { _ = self?.listeners.removeValue(forKey: id) }
+                self?.lock.withLock { _ = self?.listeners.removeValue(forKey: id) }
             }
         }
     }
@@ -42,8 +40,8 @@ final class MicrophoneSource: AudioSource {
         let format = input.outputFormat(forBus: 0)
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buf, _ in
             guard let self else { return }
-            // Snapshot listeners on the queue, yield outside the lock.
-            let conts = self.listenerQueue.sync { Array(self.listeners.values) }
+            // Snapshot under lock, yield outside.
+            let conts = self.lock.withLock { Array(self.listeners.values) }
             for c in conts { c.yield(buf) }
         }
         tapInstalled = true
@@ -52,14 +50,14 @@ final class MicrophoneSource: AudioSource {
         Log.line("Mic: started, format=\(format)")
     }
 
-    func stop() {
+    func stop() async {
         if tapInstalled {
             engine.inputNode.removeTap(onBus: 0)
             tapInstalled = false
         }
         if engine.isRunning { engine.stop() }
-        // Don't `finish()` listeners — Pipeline tears them down via its own
-        // task cancellation. Finishing here would race with consumers.
+        // Don't `finish()` listeners — Pipeline tears them down via its
+        // own task cancellation. Finishing here would race with consumers.
         Log.line("Mic: stopped")
     }
 }

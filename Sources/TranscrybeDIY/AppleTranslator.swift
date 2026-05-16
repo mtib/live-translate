@@ -1,13 +1,11 @@
 import Foundation
 import Translation
 
-/// Wraps a `TranslationSession`, which Apple's framework only hands out via
-/// the SwiftUI `.translationTask` modifier. The View provides us with a
-/// session whenever the configuration (source/target) changes; the Pipeline
-/// calls translate() asynchronously and gets back a string.
-///
-/// If no session has been provided yet (e.g. translation disabled, or
-/// language pair not configured), translate() throws `.noSession`.
+/// Wraps a `TranslationSession`. The session is only obtainable through
+/// SwiftUI's `.translationTask` modifier, so the View pushes one into us
+/// whenever the configuration (source/target language) changes. The
+/// Pipeline asks `translate(_:)` and either gets a translated string back
+/// or `TranslateError.noSession` if the session hasn't been set yet.
 @MainActor
 final class AppleTranslator: Translator {
     private var session: TranslationSession?
@@ -17,7 +15,7 @@ final class AppleTranslator: Translator {
         Log.line("AppleTranslator: session \(session == nil ? "cleared" : "set")")
     }
 
-    func translate(_ text: String, from: SourceLocale, to: TargetLanguage) async throws -> String {
+    func translate(_ text: String) async throws -> String {
         guard let session else { throw TranslateError.noSession }
         let response = try await session.translate(text)
         return response.targetText

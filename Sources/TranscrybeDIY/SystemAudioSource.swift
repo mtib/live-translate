@@ -3,49 +3,39 @@ import AVFoundation
 import ScreenCaptureKit
 import CoreMedia
 
-/// Captures audio playing through the system speakers (or per-app audio,
-/// once we expose that toggle) via `ScreenCaptureKit`. This bypasses the
-/// speaker → microphone round-trip, which is what was making the
-/// MicrophoneSource stall when you tried to transcribe video/music output:
-/// the recognizer was seeing the room mic mixed with the speaker bleed and
-/// either getting "no speech detected" or producing garbage.
+/// Captures audio playing through the system speakers via
+/// `ScreenCaptureKit`. Bypasses the speaker→mic round-trip, which was the
+/// cause of MicrophoneSource stalling on video/music playback: the
+/// recognizer was seeing mic + speaker bleed and either getting
+/// "no speech detected" or producing garbage.
 ///
 /// Requirements:
 ///   - macOS 13+ (we target 15).
 ///   - **Screen Recording permission** in System Settings → Privacy &
-///     Security → Screen Recording. macOS prompts on first start. Without
-///     it, `startCapture()` throws.
+///     Security → Screen Recording. macOS prompts on first start.
 ///
-/// `ScreenCaptureKit` is screen-capture-first, but it can run audio-only:
-/// we just never read the video samples.
+/// `ScreenCaptureKit` is screen-capture-first but supports audio-only
+/// configurations: we just never subscribe to `.screen` samples.
 final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDelegate {
 
     private var stream: SCStream?
     private let sampleQueue = DispatchQueue(label: "SystemAudioSource.samples", qos: .userInteractive)
 
-    /// Broadcaster — see MicrophoneSource for the same pattern. We have to
-    /// re-emit to multiple subscribers because the AsyncStream returned by
-    /// `buffers` is single-consumer.
     private var listeners: [UUID: AsyncStream<AVAudioPCMBuffer>.Continuation] = [:]
-    private let listenerLock = NSLock()
+    private let lock = NSLock()
 
     var buffers: AsyncStream<AVAudioPCMBuffer> {
         AsyncStream { cont in
             let id = UUID()
-            self.listenerLock.lock()
-            self.listeners[id] = cont
-            self.listenerLock.unlock()
+            self.lock.withLock { self.listeners[id] = cont }
             cont.onTermination = { [weak self] _ in
-                self?.listenerLock.lock()
-                self?.listeners.removeValue(forKey: id)
-                self?.listenerLock.unlock()
+                self?.lock.withLock { _ = self?.listeners.removeValue(forKey: id) }
             }
         }
     }
 
-    /// AVAudioConverter to coerce whatever SCK gives us into the 16 kHz mono
-    /// Float32 format that Apple Speech expects. Built lazily because we
-    /// don't know the source format until the first sample arrives.
+    /// Lazy-built converter to coerce SCK's source format into the 16 kHz
+    /// mono Float32 that SFSpeech (and a future whisper backend) accept.
     private var converter: AVAudioConverter?
     private var sourceFormat: AVAudioFormat?
     private let targetFormat = AVAudioFormat(
@@ -55,26 +45,20 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
         interleaved: false
     )!
 
-    /// Async start — see the AudioSource protocol comment. Doing this sync
-    /// with a semaphore deadlocks the MainActor (the async hop has nowhere
-    /// to run because the main thread is blocked waiting on the semaphore).
+    /// SCK setup is natively async — do not fake a sync wrapper around it.
+    /// (Earlier we did, with a `DispatchSemaphore`, and deadlocked the
+    /// MainActor. See CLAUDE.md "Things that have bitten us" #9.)
     func start() async throws {
-        // 1. Shareable content. The "display" is what we attach the audio
-        //    filter to; we exclude no apps so all system audio is captured.
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        guard let display = content.displays.first else {
-            throw SystemAudioError.noDisplay
-        }
+        guard let display = content.displays.first else { throw SystemAudioError.noDisplay }
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
 
-        // 2. Stream config — audio only. We can't disable video entirely, but
-        //    we can keep it tiny and ignore the buffers.
         let cfg = SCStreamConfiguration()
         cfg.capturesAudio = true
-        cfg.excludesCurrentProcessAudio = true        // don't loop our own UI sounds
+        cfg.excludesCurrentProcessAudio = true
         cfg.sampleRate = 48_000
         cfg.channelCount = 2
-        // Minimum-cost video so SCK is happy. We don't subscribe to .screen samples.
+        // SCK requires *some* video config; we keep it tiny and ignore the samples.
         cfg.width = 2
         cfg.height = 2
         cfg.minimumFrameInterval = CMTime(value: 1, timescale: 1)
@@ -86,13 +70,14 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
         Log.line("SystemAudio: capture started")
     }
 
-    func stop() {
+    /// Async so the caller can `await` the SCK teardown — without this,
+    /// rapid Stop→Start cycles could race the new stream against the
+    /// not-yet-stopped previous one.
+    func stop() async {
         guard let stream else { return }
-        Task {
-            do { try await stream.stopCapture() }
-            catch { Log.line("SystemAudio: stopCapture error: \(error)") }
-        }
         self.stream = nil
+        do { try await stream.stopCapture() }
+        catch { Log.line("SystemAudio: stopCapture error: \(error)") }
         Log.line("SystemAudio: capture stopped")
     }
 
@@ -105,9 +90,7 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
         else { return }
         guard let pcm = makePCMBuffer(from: sampleBuffer) else { return }
 
-        listenerLock.lock()
-        let conts = Array(listeners.values)
-        listenerLock.unlock()
+        let conts = lock.withLock { Array(listeners.values) }
         for c in conts { c.yield(pcm) }
     }
 
@@ -119,14 +102,18 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
 
     // MARK: - Sample conversion
 
-    /// Convert a CMSampleBuffer (from SCK) into the AVAudioPCMBuffer format
-    /// Apple Speech expects (16 kHz mono Float32, non-interleaved).
+    /// Convert one `CMSampleBuffer` from SCK into a 16 kHz mono Float32
+    /// `AVAudioPCMBuffer`. The source format is whatever SCK chose
+    /// (typically 48 kHz stereo Float32); we use `AVAudioConverter` to
+    /// downsample + downmix.
     private func makePCMBuffer(from sample: CMSampleBuffer) -> AVAudioPCMBuffer? {
         guard let formatDesc = sample.formatDescription,
               let asbd = formatDesc.audioStreamBasicDescription else { return nil }
 
-        // (Re)build the converter when the source format changes.
-        if converter == nil || sourceFormat?.sampleRate != asbd.mSampleRate
+        // Rebuild the converter when the source format changes (rare —
+        // typically just once at the start of the stream).
+        if converter == nil
+            || sourceFormat?.sampleRate != asbd.mSampleRate
             || sourceFormat?.channelCount != AVAudioChannelCount(asbd.mChannelsPerFrame) {
             var asbdCopy = asbd
             guard let src = AVAudioFormat(streamDescription: &asbdCopy) else { return nil }
@@ -135,7 +122,6 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
         }
         guard let converter, let sourceFormat else { return nil }
 
-        // Pull the data out as an AVAudioPCMBuffer.
         guard let srcBuffer = AVAudioPCMBuffer.fromCMSampleBuffer(sample, format: sourceFormat) else {
             return nil
         }
@@ -154,8 +140,7 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
             outStatus.pointee = .haveData
             return srcBuffer
         }
-        if status == .error { return nil }
-        return outBuffer
+        return status == .error ? nil : outBuffer
     }
 }
 
@@ -170,14 +155,10 @@ enum SystemAudioError: LocalizedError {
 
 // MARK: - Helpers
 
-private extension AudioStreamBasicDescription {
-    func copy() -> AudioStreamBasicDescription { self }
-}
-
 private extension AVAudioPCMBuffer {
-    /// Build an AVAudioPCMBuffer that shares the data of a CMSampleBuffer.
-    /// We copy into a fresh buffer so the lifetime is independent of the
-    /// CMSampleBuffer (which CoreMedia may reclaim once we return).
+    /// Build an `AVAudioPCMBuffer` from a `CMSampleBuffer`. Copies into a
+    /// fresh buffer so the lifetime is independent of CoreMedia (which
+    /// may reclaim the sample buffer once the delegate returns).
     static func fromCMSampleBuffer(_ sample: CMSampleBuffer, format: AVAudioFormat) -> AVAudioPCMBuffer? {
         let numSamples = AVAudioFrameCount(CMSampleBufferGetNumSamples(sample))
         guard numSamples > 0,
@@ -199,9 +180,6 @@ private extension AVAudioPCMBuffer {
         )
         guard status == noErr else { return nil }
 
-        // Copy raw bytes into the destination buffer's channel data.
-        // We assume the source's mBuffers[0] holds all interleaved channel data
-        // matching `format`; AVAudioConverter will handle the actual layout.
         let src = UnsafeMutableAudioBufferListPointer(&audioBufferList)
         guard let firstBuf = src.first,
               let destBuf = buffer.audioBufferList.pointee.mBuffers.mData,
