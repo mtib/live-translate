@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>TranscrybeDIY</string>
+    <key>CFBundleDisplayName</key>
+    <string>Transcrybe DIY</string>
+    <key>CFBundleIdentifier</key>
+    <string>local.mtib.transcrybediy</string>
+    <key>CFBundleVersion</key>
+    <string>0.1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1</string>
+    <key>CFBundleExecutable</key>
+    <string>TranscrybeDIY</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>15.0</string>
+    <key>LSUIElement</key>
+    <false/>
+    <key>NSSupportsAutomaticTermination</key>
+    <false/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Transcrybe DIY needs the microphone to transcribe what you say.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Transcrybe DIY uses on-device speech recognition to turn audio into text.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Transcrybe DIY captures system audio (no video frames are kept) so it can transcribe what you're listening to without going through the microphone.</string>
+</dict>
+</plist>

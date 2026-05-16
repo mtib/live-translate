@@ -1,0 +1,14 @@
+# SwiftPM build artefacts
+.build/
+build/
+Package.resolved
+
+# macOS
+.DS_Store
+
+# Editor noise
+.swiftpm/
+*.xcodeproj/
+*.xcworkspace/
+*.swp
+.vscode/
