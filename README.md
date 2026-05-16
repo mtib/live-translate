@@ -7,6 +7,10 @@ target language of your choice — all in one rolling, hover-able window.
 
 Built with SwiftPM only — no Xcode project, no third-party dependencies.
 
+|  Stopped  |  Running |
+|-----------|----------|
+| ![stopped](docs/stopped.png) | ![running](docs/while_running.png) |
+
 ## Build & run
 
 ```sh
