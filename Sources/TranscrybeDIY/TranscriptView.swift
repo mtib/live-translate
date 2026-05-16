@@ -187,7 +187,7 @@ private struct SentenceRow: View {
     let translateEnabled: Bool
 
     var body: some View {
-        let opacity: Double = isMostRecent ? 1.0 : 0.45
+        let opacity: Double = isMostRecent ? 1.0 : 0.8
 
         VStack(alignment: .leading, spacing: 2) {
             if translateEnabled {

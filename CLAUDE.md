@@ -106,7 +106,7 @@ ScreenCaptureKit) without touching `Pipeline`.
 | `Types.swift` | `SourceLocale`, `TargetLanguage`, `Sentence`, `PipelineStatus`, `SessionSentence` / `SessionSnapshot`. Protocols: `AudioSource`, `Transcriber`, `Translator`. |
 | `MicrophoneSource.swift` | `AVAudioEngine` mic capture. Converts to 16 kHz mono Float32 so output matches `SystemAudioSource` (required by `MixedAudioSource`). Broadcaster pattern. |
 | `SystemAudioSource.swift` | `ScreenCaptureKit`-based system audio capture. Converts `CMSampleBuffer` → 16 kHz mono Float32 `AVAudioPCMBuffer`. |
-| `MixedAudioSource.swift` | Combines two `AudioSource`s by interleaving their buffer streams. Used when both inputs are toggled on. |
+| `MixedAudioSource.swift` | Combines two `AudioSource`s by **sample-summing** at mic's cadence. Mic clocks the output; system samples are pulled from a small queue and added per-sample. Keeps audio-time : wall-time at 1:1 so the recognizer doesn't lag. |
 | `AppleSpeechTranscriber.swift` | Apple `Speech` framework. Owns the sentence splitter (`splitIntoSentences`). |
 | `AppleTranslator.swift` | Holds a `TranslationSession` that the View injects via `Pipeline.installTranslationSession(_:)`. |
 | `TranscriptArchive.swift` | One-per-run JSONL archive file. Writes go through a serial queue so MainActor never blocks on disk. |
@@ -201,6 +201,7 @@ tccutil reset ScreenCapture local.mtib.transcrybediy
 ## Tools / SDKs in use
 
 - `AVAudioEngine`, `AVAudioConverter` — mic capture + sample-rate conversion
+- `Accelerate` (`vDSP_vadd`) — SIMD per-sample sum in `MixedAudioSource`
 - `ScreenCaptureKit` — system audio capture
 - `Speech` (`SFSpeechRecognizer`, `SFSpeechAudioBufferRecognitionRequest`)
 - `Translation` (`TranslationSession`, `.translationTask`)
@@ -297,3 +298,14 @@ pkill -f TranscrybeDIY                           # kill all instances
     audio stream to one recognizer**. We did that via `MixedAudioSource`.
     Trade-off: source attribution is lost (we removed `SentenceKind`
     and color-coding from the UI as part of this).
+15. **Naive "interleave buffer streams" mixing tanked recognition
+    latency.** Forwarding every upstream buffer as it arrived doubled
+    the recognizer's audio-time-to-wall-time ratio (it received ~2 s of
+    audio per real second). Transcription content was correct but
+    emission lagged badly. Fix: mix at the SAMPLE level — mic clocks
+    the output, each mic buffer produces one summed output buffer,
+    system samples are pulled from a small bounded queue and added per-
+    sample. 1:1 audio-to-wall ratio restored, recognition is instant
+    again. The per-sample sum runs through `vDSP_vadd` (Accelerate) on
+    a reusable `UnsafeMutablePointer<Float>` scratch buffer — SIMD on
+    NEON / AVX, no per-call malloc.
