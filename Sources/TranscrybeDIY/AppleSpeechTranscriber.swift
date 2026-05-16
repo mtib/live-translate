@@ -23,18 +23,14 @@ final class AppleSpeechTranscriber: Transcriber {
 
     func transcribe(
         audio: AsyncStream<AVAudioPCMBuffer>,
-        locale: SourceLocale,
-        allowOnDevice: Bool
+        locale: SourceLocale
     ) -> AsyncThrowingStream<SessionSnapshot, Error> {
         AsyncThrowingStream { continuation in
             guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: locale.identifier)) else {
                 continuation.finish(throwing: TranscribeError.noRecognizer(locale.identifier))
                 return
             }
-            // Disabling on-device support steers the recognizer to the
-            // server. Used by Pipeline to keep two concurrent recognizers
-            // from fighting for the single on-device model.
-            recognizer.supportsOnDeviceRecognition = allowOnDevice
+            recognizer.supportsOnDeviceRecognition = true
             guard recognizer.isAvailable else {
                 continuation.finish(throwing: TranscribeError.unavailable(locale.identifier))
                 return
@@ -42,9 +38,9 @@ final class AppleSpeechTranscriber: Transcriber {
 
             let request = SFSpeechAudioBufferRecognitionRequest()
             request.shouldReportPartialResults = true
-            request.requiresOnDeviceRecognition = false  // never force on-device — let the recognizer choose
+            request.requiresOnDeviceRecognition = false  // allow cloud fallback if local model missing
             request.addsPunctuation = true
-            Log.line("Transcriber[\(locale.identifier)]: session opened allowOnDevice=\(allowOnDevice)")
+            Log.line("Transcriber[\(locale.identifier)]: session opened")
 
             // Per-instance throughput counter so we can spot whichever
             // session is starved when dual-source is on. Logged from the

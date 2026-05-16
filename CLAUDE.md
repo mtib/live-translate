@@ -51,17 +51,22 @@ ScreenCaptureKit) without touching `Pipeline`.
 
 ### Key design decisions
 
-- **Dual-source.** Mic and system audio can run **simultaneously**. Each
-  has its own recognition cycle task and own per-session state inside
-  `Pipeline`. Sentences are tagged with `SentenceKind` so the UI can
-  color-code them (mic = green, system audio = blue).
+- **Dual-source mixing, single recognizer.** Apple Speech serializes
+  recognition tasks per-app — two concurrent recognizers (even one
+  on-device, one server-side) preempt each other and both fast-fail
+  with "No speech detected". Workaround: when both mic and system are
+  enabled, wrap them in `MixedAudioSource`, which interleaves their
+  buffer streams. ONE recognizer sees the merged audio. We lose source
+  attribution as a result — sentences from this mode have no `.kind`
+  label; the UI shows them uncoloured like any other sentence. Both
+  audio sources standardize on 16 kHz mono Float32 (what SFSpeech wants
+  natively) so the mixed stream is format-consistent.
 - **Transcribers emit sentence snapshots, not raw text.** A `SessionSnapshot`
   carries `[SessionSentence]` already split. The Pipeline reconciles each
   snapshot against its own array by position — this handles "new sentence
   appeared", "sentence text grew", and "recognizer revised away a sentence
-  boundary" (the last case caused the "earlier row keeps getting more
-  text" bug in the previous design). Splitting lives in the transcriber
-  because it's backend-specific.
+  boundary" uniformly. Splitting lives in the transcriber because it's
+  backend-specific.
 - **Translation cache.** `Pipeline.translationCache: [String: String]`
   keyed by source text. Identical strings across sessions reuse the
   cached translation. LRU-ish eviction at 200 entries.
@@ -81,15 +86,14 @@ ScreenCaptureKit) without touching `Pipeline`.
   (prune or max-count enforcement), it's appended to a per-run file at
   `~/Documents/transcripts/<timestamp>.jsonl`. One JSON object per line:
   ```json
-  {"source":"mic","time":"2026-05-16T22:13:07.123Z","transcription":"…","translation":"…"}
+  {"time":"2026-05-16T22:13:07.123Z","transcription":"…","translation":"…"}
   ```
-  Keys are sorted for grep/diff stability. ISO-8601 timestamps. `source`
-  is `"mic"` or `"system"`. `translation` may be the empty string if
-  translation was disabled or hadn't completed before the sentence was
-  pruned. File is created on Start; no header (JSONL has no header
-  concept). The visible list is the rolling view; the file is the
-  running history. Load it with `jq -c . file.jsonl`, pandas
-  `read_json(..., lines=True)`, etc.
+  Keys are sorted for grep/diff stability. ISO-8601 timestamps.
+  `translation` may be the empty string if translation was disabled or
+  hadn't completed before the sentence was pruned. File is created on
+  Start; no header (JSONL has no header concept). The visible list is
+  the rolling view; the file is the running history. Load it with
+  `jq -c . file.jsonl`, pandas `read_json(..., lines=True)`, etc.
 
 ### Files
 
@@ -98,10 +102,11 @@ ScreenCaptureKit) without touching `Pipeline`.
 | `App.swift` | `@main` entry. SwiftUI `Window` scene. Configures the NSWindow for floating / translucent / movable-from-background behavior. |
 | `TranscriptView.swift` | The whole UI. Renders one `SentenceRow` per sentence, with leading color strip + opacity fade. Hosts `.translationTask` (the only way to get a `TranslationSession`). |
 | `VisualEffectBackground.swift` | `NSVisualEffectView` wrapper for the HUD-style translucent background. |
-| `Pipeline.swift` | `@MainActor ObservableObject` orchestrator. Owns the published `sentences` array. Runs **two parallel** recognition cycles, plus translation + prune workers. Persists user settings via UserDefaults. |
-| `Types.swift` | `SourceLocale`, `TargetLanguage`, `SentenceKind` (with `archiveTag` and `tint`), `Sentence`, `PipelineStatus`, `SessionSentence` / `SessionSnapshot`. Protocols: `AudioSource`, `Transcriber`, `Translator`. |
-| `MicrophoneSource.swift` | `AVAudioEngine` mic capture. **Broadcaster** — each access to `buffers` returns a fresh `AsyncStream`. NSLock-guarded listener map. |
+| `Pipeline.swift` | `@MainActor ObservableObject` orchestrator. Owns the published `sentences` array. Runs **one** recognition cycle on whichever source is active (mic, system, or `MixedAudioSource` when both are enabled), plus translation + prune workers. Persists user settings via UserDefaults. |
+| `Types.swift` | `SourceLocale`, `TargetLanguage`, `Sentence`, `PipelineStatus`, `SessionSentence` / `SessionSnapshot`. Protocols: `AudioSource`, `Transcriber`, `Translator`. |
+| `MicrophoneSource.swift` | `AVAudioEngine` mic capture. Converts to 16 kHz mono Float32 so output matches `SystemAudioSource` (required by `MixedAudioSource`). Broadcaster pattern. |
 | `SystemAudioSource.swift` | `ScreenCaptureKit`-based system audio capture. Converts `CMSampleBuffer` → 16 kHz mono Float32 `AVAudioPCMBuffer`. |
+| `MixedAudioSource.swift` | Combines two `AudioSource`s by interleaving their buffer streams. Used when both inputs are toggled on. |
 | `AppleSpeechTranscriber.swift` | Apple `Speech` framework. Owns the sentence splitter (`splitIntoSentences`). |
 | `AppleTranslator.swift` | Holds a `TranslationSession` that the View injects via `Pipeline.installTranslationSession(_:)`. |
 | `TranscriptArchive.swift` | One-per-run JSONL archive file. Writes go through a serial queue so MainActor never blocks on disk. |
@@ -282,15 +287,13 @@ pkill -f TranscrybeDIY                           # kill all instances
     with `AVAudioPCMBuffer.mutableAudioBufferList` — the destination
     is already correctly sized for its format (separate buffers for
     non-interleaved, one for interleaved).
-14. **Apple's on-device `SFSpeechRecognizer` is effectively single-
-    instance.** Two concurrent on-device recognition sessions both
-    fast-fail with "No speech detected" (each ~0.3s lifetime) until one
-    of them burns through its fast-fail budget and bails — at which
-    point the other recovers immediately. Resolution in `Pipeline`:
-    when both mic and system audio are enabled, the system source is
-    routed to server-side recognition via
-    `recognizer.supportsOnDeviceRecognition = false`. Mic stays
-    on-device (low latency, private). When only one source is active,
-    that source uses on-device. Implication: simultaneous transcription
-    of two sources needs internet for the system audio. CLAUDE.md note
-    in the *Stage protocols* section of `Types.swift` references this.
+14. **Apple Speech serializes recognition tasks per-app — not just
+    on-device.** Two concurrent `SFSpeechRecognizer`s preempt each
+    other on every restart, both fast-failing with "No speech detected"
+    within ~0.3 s. Forcing one to the server (via
+    `recognizer.supportsOnDeviceRecognition = false`) does NOT help —
+    the contention is at the recognition-task level, not the on-device
+    model level. The only fix that works is to send a **single mixed
+    audio stream to one recognizer**. We did that via `MixedAudioSource`.
+    Trade-off: source attribution is lost (we removed `SentenceKind`
+    and color-coding from the UI as part of this).

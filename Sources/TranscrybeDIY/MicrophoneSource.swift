@@ -3,27 +3,34 @@ import AVFoundation
 
 /// Microphone capture via `AVAudioEngine`, exposed as a broadcasting source.
 ///
+/// Always emits **16 kHz mono Float32** so that:
+///   1. Apple Speech sees its documented native format.
+///   2. The output is format-compatible with `SystemAudioSource`, which is
+///      important when `MixedAudioSource` interleaves them — the recognizer
+///      infers format from the first buffer and rejects mismatched ones.
+///
 /// **Broadcaster pattern.** Each access to `buffers` returns a fresh
-/// `AsyncStream`. The tap callback fans the buffer out to every active
-/// subscriber. Without this, a second `transcribe(...)` call after a
-/// session ends would attach to an already-drained iterator and silently
-/// receive nothing — the recognizer would then hit "no speech detected"
-/// within 50 ms.
+/// `AsyncStream`. The tap callback fans the converted buffer out to every
+/// active subscriber. Without this, a second `transcribe(...)` call after
+/// a session ends would attach to an already-drained iterator and silently
+/// receive nothing.
 final class MicrophoneSource: AudioSource {
     private let engine = AVAudioEngine()
     private var tapInstalled = false
 
-    /// Live continuations keyed by an ID so each subscriber can unregister
-    /// itself when its consumer task finishes. NSLock is fine here — every
-    /// access is short and never blocks on IO.
+    /// Target format: 16 kHz mono Float32 non-interleaved — what SFSpeech
+    /// natively expects, and what `SystemAudioSource` produces.
+    private let targetFormat = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32,
+        sampleRate: 16_000,
+        channels: 1,
+        interleaved: false
+    )!
+    private var converter: AVAudioConverter?
+    private var sourceFormat: AVAudioFormat?
+
     private var listeners: [UUID: AsyncStream<AVAudioPCMBuffer>.Continuation] = [:]
     private let lock = NSLock()
-
-    /// Same heartbeat-style diagnostics as SystemAudioSource so we can
-    /// spot silent failures (mic active but no buffers reaching listeners).
-    private var diagSamples: Int = 0
-    private var diagYielded: Int = 0
-    private var diagLastLog: Date = .distantPast
 
     /// Fresh hot stream per access — see broadcaster pattern note above.
     var buffers: AsyncStream<AVAudioPCMBuffer> {
@@ -43,21 +50,20 @@ final class MicrophoneSource: AudioSource {
             input.removeTap(onBus: 0)
             tapInstalled = false
         }
-        let format = input.outputFormat(forBus: 0)
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buf, _ in
+        let native = input.outputFormat(forBus: 0)
+        sourceFormat = native
+        converter = AVAudioConverter(from: native, to: targetFormat)
+
+        input.installTap(onBus: 0, bufferSize: 1024, format: native) { [weak self] buf, _ in
             guard let self else { return }
-            let conts: [AsyncStream<AVAudioPCMBuffer>.Continuation] = self.lock.withLock {
-                self.diagSamples += 1
-                self.diagYielded += self.listeners.count
-                return Array(self.listeners.values)
-            }
-            for c in conts { c.yield(buf) }
-            self.heartbeatIfDue()
+            guard let converted = self.convert(buf) else { return }
+            let conts = self.lock.withLock { Array(self.listeners.values) }
+            for c in conts { c.yield(converted) }
         }
         tapInstalled = true
         engine.prepare()
         try engine.start()
-        Log.line("Mic: started, format=\(format)")
+        Log.line("Mic: started, native=\(native), target=\(targetFormat)")
     }
 
     func stop() async {
@@ -71,17 +77,21 @@ final class MicrophoneSource: AudioSource {
         Log.line("Mic: stopped")
     }
 
-    /// Once-a-second heartbeat. Mirrors SystemAudioSource — if both are on
-    /// you can compare the two streams side-by-side to see who's flowing.
-    private func heartbeatIfDue() {
-        let now = Date()
-        let due: Bool = lock.withLock {
-            if now.timeIntervalSince(diagLastLog) < 1.0 { return false }
-            diagLastLog = now
-            return true
+    /// Convert one input-format buffer to the target format. Returns nil
+    /// on conversion error; very rare in practice.
+    private func convert(_ src: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let converter, let sourceFormat else { return nil }
+        let outCapacity = AVAudioFrameCount(
+            Double(src.frameLength) * targetFormat.sampleRate / sourceFormat.sampleRate
+        ) + 1024
+        guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: outCapacity) else { return nil }
+        var didFeed = false
+        let status = converter.convert(to: out, error: nil) { _, outStatus in
+            if didFeed { outStatus.pointee = .noDataNow; return nil }
+            didFeed = true
+            outStatus.pointee = .haveData
+            return src
         }
-        guard due else { return }
-        let listeners = lock.withLock { self.listeners.count }
-        Log.line("Mic: heartbeat samples=\(diagSamples) yielded=\(diagYielded) listeners=\(listeners)")
+        return status == .error ? nil : out
     }
 }

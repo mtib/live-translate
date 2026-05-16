@@ -42,10 +42,6 @@ struct TranscriptView: View {
             }
             .padding(compactMode ? 10 : 16)
         }
-        // Park here for the lifetime of this configuration. SwiftUI
-        // cancels the Task when configuration changes (e.g. user picks
-        // a different language pair); we clear the session, SwiftUI
-        // immediately spins up a new Task with a fresh session.
         .translationTask(translationConfig) { session in
             pipeline.installTranslationSession(session)
             do {
@@ -150,13 +146,13 @@ struct TranscriptView: View {
                     .buttonStyle(.plain)
                     .help("Compact view")
             }
-            // Second row: input source toggles. Both can be on at once;
-            // sentences from each get distinct color tinting in the list.
+            // Second row: input toggles. Both can be on at once; when both
+            // are enabled, audio from the two is mixed before recognition
+            // (see Pipeline's MixedAudioSource).
             HStack(spacing: 10) {
                 Text("Input").font(.caption).foregroundStyle(.secondary)
                 Toggle(isOn: $pipeline.micEnabled) {
                     Label("Mic", systemImage: "mic.fill")
-                        .foregroundStyle(SentenceKind.microphone.tint)
                 }
                 .toggleStyle(.button)
                 .controlSize(.small)
@@ -164,7 +160,6 @@ struct TranscriptView: View {
 
                 Toggle(isOn: $pipeline.systemEnabled) {
                     Label("System", systemImage: "speaker.wave.2.fill")
-                        .foregroundStyle(SentenceKind.systemAudio.tint)
                 }
                 .toggleStyle(.button)
                 .controlSize(.small)
@@ -184,8 +179,8 @@ struct TranscriptView: View {
 }
 
 /// One sentence row. Most-recent gets full opacity; older sentences fade.
-/// A leading color strip + soft background wash encodes the audio source:
-/// green for mic, blue for system audio.
+/// No source tinting — the Pipeline mixes sources into one stream before
+/// recognition, so per-row attribution would be meaningless.
 private struct SentenceRow: View {
     let sentence: Sentence
     let isMostRecent: Bool
@@ -193,47 +188,27 @@ private struct SentenceRow: View {
 
     var body: some View {
         let opacity: Double = isMostRecent ? 1.0 : 0.45
-        let tint = sentence.kind.tint
 
-        HStack(alignment: .top, spacing: 8) {
-            RoundedRectangle(cornerRadius: 1.5)
-                .fill(tint.opacity(isMostRecent ? 0.9 : 0.5))
-                .frame(width: 3)
-            VStack(alignment: .leading, spacing: 2) {
-                if translateEnabled {
-                    Text(sentence.translation.isEmpty ? "…" : sentence.translation)
-                        .font(.body)
-                        .foregroundStyle(.primary.opacity(opacity))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                    Text(sentence.text)
-                        .font(.caption)
-                        .foregroundStyle(.secondary.opacity(opacity))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                } else {
-                    Text(sentence.text)
-                        .font(.body)
-                        .foregroundStyle(.primary.opacity(opacity))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                }
+        VStack(alignment: .leading, spacing: 2) {
+            if translateEnabled {
+                Text(sentence.translation.isEmpty ? "…" : sentence.translation)
+                    .font(.body)
+                    .foregroundStyle(.primary.opacity(opacity))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                Text(sentence.text)
+                    .font(.caption)
+                    .foregroundStyle(.secondary.opacity(opacity))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            } else {
+                Text(sentence.text)
+                    .font(.body)
+                    .foregroundStyle(.primary.opacity(opacity))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
             }
         }
         .padding(.vertical, 1)
-        .background(
-            RoundedRectangle(cornerRadius: 4)
-                .fill(tint.opacity(isMostRecent ? 0.10 : 0.05))
-        )
-    }
-}
-
-extension SentenceKind {
-    /// Color used to tint rows from this source.
-    var tint: Color {
-        switch self {
-        case .microphone: return .green
-        case .systemAudio: return .blue
-        }
     }
 }

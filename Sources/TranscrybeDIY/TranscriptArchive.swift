@@ -4,12 +4,12 @@ import Foundation
 /// (pruned or evicted by the max-count cap). Lives at
 /// `~/Documents/transcripts/<timestamp>.jsonl` — one JSON object per line:
 ///
-///     {"source":"mic","time":"2026-05-16T22:13:07.123Z","transcription":"…","translation":"…"}
+///     {"time":"2026-05-16T22:13:07.123Z","transcription":"…","translation":"…"}
 ///
-/// `time` is ISO-8601 with fractional seconds, `source` is the lowercase
-/// archive tag from `SentenceKind`, both `transcription` and `translation`
-/// are always present (empty strings allowed). Schema is intentionally
-/// stable so consumers (`jq`, pandas, etc.) can load files without surprises.
+/// `time` is ISO-8601 with fractional seconds. Both `transcription` and
+/// `translation` are always present (empty strings allowed). Schema is
+/// intentionally stable so consumers (`jq`, pandas, etc.) can load files
+/// without surprises.
 ///
 /// One `TranscriptArchive` belongs to one run. The Pipeline creates one on
 /// Start and lets it drop on Stop. Writes go through a serial queue so the
@@ -58,7 +58,6 @@ final class TranscriptArchive {
     func append(_ sentence: Sentence) {
         let record = Record(
             time: Self.isoFormatter.string(from: sentence.lastModified),
-            source: sentence.kind.archiveTag,
             transcription: sentence.text,
             translation: sentence.translation
         )
@@ -79,7 +78,6 @@ final class TranscriptArchive {
 
     private struct Record: Encodable {
         let time: String
-        let source: String          // "mic" | "system"
         let transcription: String
         let translation: String
     }
