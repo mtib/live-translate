@@ -124,11 +124,28 @@ protocol AudioSource: AnyObject {
 /// `transcribe(...)` represents one recognition session; the stream
 /// finishes when the session ends. The Pipeline calls this repeatedly
 /// to give the user continuous output across the backend's session caps.
+///
+/// `allowOnDevice` lets the caller force a server-side path. Apple's
+/// on-device speech recognizer is effectively single-instance — two
+/// concurrent on-device sessions both fast-fail with "No speech
+/// detected". When the Pipeline runs both mic and system audio at
+/// once, one source must use server-based recognition so they don't
+/// fight for the local model.
 protocol Transcriber {
     func transcribe(
         audio: AsyncStream<AVAudioPCMBuffer>,
-        locale: SourceLocale
+        locale: SourceLocale,
+        allowOnDevice: Bool
     ) -> AsyncThrowingStream<SessionSnapshot, Error>
+}
+
+extension Transcriber {
+    func transcribe(
+        audio: AsyncStream<AVAudioPCMBuffer>,
+        locale: SourceLocale
+    ) -> AsyncThrowingStream<SessionSnapshot, Error> {
+        transcribe(audio: audio, locale: locale, allowOnDevice: true)
+    }
 }
 
 /// Translates a single string. Implementations carry their own

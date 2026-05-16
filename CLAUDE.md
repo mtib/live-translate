@@ -282,3 +282,15 @@ pkill -f TranscrybeDIY                           # kill all instances
     with `AVAudioPCMBuffer.mutableAudioBufferList` — the destination
     is already correctly sized for its format (separate buffers for
     non-interleaved, one for interleaved).
+14. **Apple's on-device `SFSpeechRecognizer` is effectively single-
+    instance.** Two concurrent on-device recognition sessions both
+    fast-fail with "No speech detected" (each ~0.3s lifetime) until one
+    of them burns through its fast-fail budget and bails — at which
+    point the other recovers immediately. Resolution in `Pipeline`:
+    when both mic and system audio are enabled, the system source is
+    routed to server-side recognition via
+    `recognizer.supportsOnDeviceRecognition = false`. Mic stays
+    on-device (low latency, private). When only one source is active,
+    that source uses on-device. Implication: simultaneous transcription
+    of two sources needs internet for the system audio. CLAUDE.md note
+    in the *Stage protocols* section of `Types.swift` references this.

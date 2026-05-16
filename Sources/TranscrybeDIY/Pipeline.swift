@@ -292,8 +292,18 @@ final class Pipeline: ObservableObject {
             // got no audio and hit "No speech detected" within 50 ms.
             let audio = sourceFor(kind: kind).buffers
 
+            // When both audio sources are running, Apple's on-device
+            // recognizer is single-instance — concurrent on-device sessions
+            // both fast-fail with "No speech detected". Resolution: mic
+            // keeps on-device (low latency, private); system gets routed
+            // to the server. When only one source is enabled, both paths
+            // can use on-device freely.
+            let allowOnDevice = !(micEnabled && systemEnabled) || kind == .microphone
+
             do {
-                for try await snapshot in transcriber.transcribe(audio: audio, locale: source) {
+                for try await snapshot in transcriber.transcribe(
+                    audio: audio, locale: source, allowOnDevice: allowOnDevice
+                ) {
                     if Task.isCancelled { break }
                     ingest(snapshot, kind: kind)
                 }

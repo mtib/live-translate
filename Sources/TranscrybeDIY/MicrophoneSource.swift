@@ -19,6 +19,12 @@ final class MicrophoneSource: AudioSource {
     private var listeners: [UUID: AsyncStream<AVAudioPCMBuffer>.Continuation] = [:]
     private let lock = NSLock()
 
+    /// Same heartbeat-style diagnostics as SystemAudioSource so we can
+    /// spot silent failures (mic active but no buffers reaching listeners).
+    private var diagSamples: Int = 0
+    private var diagYielded: Int = 0
+    private var diagLastLog: Date = .distantPast
+
     /// Fresh hot stream per access — see broadcaster pattern note above.
     var buffers: AsyncStream<AVAudioPCMBuffer> {
         AsyncStream { cont in
@@ -40,9 +46,13 @@ final class MicrophoneSource: AudioSource {
         let format = input.outputFormat(forBus: 0)
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buf, _ in
             guard let self else { return }
-            // Snapshot under lock, yield outside.
-            let conts = self.lock.withLock { Array(self.listeners.values) }
+            let conts: [AsyncStream<AVAudioPCMBuffer>.Continuation] = self.lock.withLock {
+                self.diagSamples += 1
+                self.diagYielded += self.listeners.count
+                return Array(self.listeners.values)
+            }
             for c in conts { c.yield(buf) }
+            self.heartbeatIfDue()
         }
         tapInstalled = true
         engine.prepare()
@@ -59,5 +69,19 @@ final class MicrophoneSource: AudioSource {
         // Don't `finish()` listeners — Pipeline tears them down via its
         // own task cancellation. Finishing here would race with consumers.
         Log.line("Mic: stopped")
+    }
+
+    /// Once-a-second heartbeat. Mirrors SystemAudioSource — if both are on
+    /// you can compare the two streams side-by-side to see who's flowing.
+    private func heartbeatIfDue() {
+        let now = Date()
+        let due: Bool = lock.withLock {
+            if now.timeIntervalSince(diagLastLog) < 1.0 { return false }
+            diagLastLog = now
+            return true
+        }
+        guard due else { return }
+        let listeners = lock.withLock { self.listeners.count }
+        Log.line("Mic: heartbeat samples=\(diagSamples) yielded=\(diagYielded) listeners=\(listeners)")
     }
 }

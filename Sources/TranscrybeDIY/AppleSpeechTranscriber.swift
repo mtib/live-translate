@@ -23,14 +23,18 @@ final class AppleSpeechTranscriber: Transcriber {
 
     func transcribe(
         audio: AsyncStream<AVAudioPCMBuffer>,
-        locale: SourceLocale
+        locale: SourceLocale,
+        allowOnDevice: Bool
     ) -> AsyncThrowingStream<SessionSnapshot, Error> {
         AsyncThrowingStream { continuation in
             guard let recognizer = SFSpeechRecognizer(locale: Locale(identifier: locale.identifier)) else {
                 continuation.finish(throwing: TranscribeError.noRecognizer(locale.identifier))
                 return
             }
-            recognizer.supportsOnDeviceRecognition = true
+            // Disabling on-device support steers the recognizer to the
+            // server. Used by Pipeline to keep two concurrent recognizers
+            // from fighting for the single on-device model.
+            recognizer.supportsOnDeviceRecognition = allowOnDevice
             guard recognizer.isAvailable else {
                 continuation.finish(throwing: TranscribeError.unavailable(locale.identifier))
                 return
@@ -38,8 +42,15 @@ final class AppleSpeechTranscriber: Transcriber {
 
             let request = SFSpeechAudioBufferRecognitionRequest()
             request.shouldReportPartialResults = true
-            request.requiresOnDeviceRecognition = false  // cloud fallback when no local model
+            request.requiresOnDeviceRecognition = false  // never force on-device — let the recognizer choose
             request.addsPunctuation = true
+            Log.line("Transcriber[\(locale.identifier)]: session opened allowOnDevice=\(allowOnDevice)")
+
+            // Per-instance throughput counter so we can spot whichever
+            // session is starved when dual-source is on. Logged from the
+            // pump task.
+            var appendedBuffers = 0
+            let bufferCountLock = NSLock()
 
             let task = recognizer.recognitionTask(with: request) { result, error in
                 if let result {
@@ -60,8 +71,15 @@ final class AppleSpeechTranscriber: Transcriber {
 
             // Pump audio into the recognition request from the shared mic stream.
             let pump = Task {
+                var lastLog = Date.distantPast
                 for await buf in audio {
                     request.append(buf)
+                    bufferCountLock.withLock { appendedBuffers += 1 }
+                    if Date().timeIntervalSince(lastLog) >= 1.0 {
+                        let count = bufferCountLock.withLock { appendedBuffers }
+                        Log.line("Transcriber[\(locale.identifier)]: appended=\(count)")
+                        lastLog = Date()
+                    }
                 }
                 request.endAudio()
             }
