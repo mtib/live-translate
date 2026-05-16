@@ -3,6 +3,12 @@ name: Build & Release
 on:
   push:
     branches: [main]
+    # Doc-only edits shouldn't burn a CI run or churn out a new release.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - ".gitignore"
+      - "LICENSE"
   workflow_dispatch:
 
 permissions:
