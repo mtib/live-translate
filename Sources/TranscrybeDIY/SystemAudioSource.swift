@@ -24,6 +24,18 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
     private var listeners: [UUID: AsyncStream<AVAudioPCMBuffer>.Continuation] = [:]
     private let lock = NSLock()
 
+    /// Diagnostic counters logged once per second so we can verify the
+    /// system-audio path is actually delivering samples — silent failure
+    /// here is otherwise hard to spot.
+    private var diag = Diag()
+    private struct Diag {
+        var samplesReceived: Int = 0
+        var samplesYielded: Int = 0
+        var conversionFailures: Int = 0
+        var lastLog: Date = .distantPast
+        var loggedFormat: Bool = false
+    }
+
     var buffers: AsyncStream<AVAudioPCMBuffer> {
         AsyncStream { cont in
             let id = UUID()
@@ -88,10 +100,37 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
               sampleBuffer.isValid,
               CMSampleBufferDataIsReady(sampleBuffer)
         else { return }
-        guard let pcm = makePCMBuffer(from: sampleBuffer) else { return }
+        diag.samplesReceived += 1
+
+        // Log the actual source format once — helps debug "why is nothing
+        // being transcribed". Often the recognizer is fine; we're just
+        // sending it the wrong format or silence.
+        if !diag.loggedFormat,
+           let asbd = sampleBuffer.formatDescription?.audioStreamBasicDescription {
+            Log.line("SystemAudio: source ASBD sr=\(asbd.mSampleRate) ch=\(asbd.mChannelsPerFrame) bits=\(asbd.mBitsPerChannel) flags=\(asbd.mFormatFlags)")
+            diag.loggedFormat = true
+        }
+
+        guard let pcm = makePCMBuffer(from: sampleBuffer) else {
+            diag.conversionFailures += 1
+            heartbeatIfDue()
+            return
+        }
+        diag.samplesYielded += 1
+        heartbeatIfDue()
 
         let conts = lock.withLock { Array(listeners.values) }
         for c in conts { c.yield(pcm) }
+    }
+
+    /// Once per second, dump throughput counters so we can spot silent
+    /// failures (samples received but never yielded, or never received at
+    /// all — both common with ScreenCaptureKit misconfiguration).
+    private func heartbeatIfDue() {
+        let now = Date()
+        guard now.timeIntervalSince(diag.lastLog) >= 1.0 else { return }
+        Log.line("SystemAudio: heartbeat received=\(diag.samplesReceived) yielded=\(diag.samplesYielded) convFails=\(diag.conversionFailures) listeners=\(lock.withLock { listeners.count })")
+        diag.lastLog = now
     }
 
     // MARK: - SCStreamDelegate
@@ -156,9 +195,19 @@ enum SystemAudioError: LocalizedError {
 // MARK: - Helpers
 
 private extension AVAudioPCMBuffer {
-    /// Build an `AVAudioPCMBuffer` from a `CMSampleBuffer`. Copies into a
-    /// fresh buffer so the lifetime is independent of CoreMedia (which
-    /// may reclaim the sample buffer once the delegate returns).
+    /// Build an `AVAudioPCMBuffer` from a `CMSampleBuffer`, copying the
+    /// sample data so the buffer's lifetime is independent of CoreMedia.
+    ///
+    /// Uses `CMSampleBufferCopyPCMDataIntoAudioBufferList`, which writes
+    /// straight into the destination's `mutableAudioBufferList`. This
+    /// matters because `mutableAudioBufferList` is sized correctly for
+    /// the destination's format (e.g. 2 separate buffers for
+    /// non-interleaved stereo). The previous implementation used
+    /// `CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer` with a
+    /// fixed-size `AudioBufferList`, which only fits **one** AudioBuffer
+    /// slot — so non-interleaved stereo sources (which is what
+    /// ScreenCaptureKit actually delivers) failed every sample with
+    /// `kCMSampleBufferError_ArrayTooSmall`.
     static func fromCMSampleBuffer(_ sample: CMSampleBuffer, format: AVAudioFormat) -> AVAudioPCMBuffer? {
         let numSamples = AVAudioFrameCount(CMSampleBufferGetNumSamples(sample))
         guard numSamples > 0,
@@ -166,26 +215,12 @@ private extension AVAudioPCMBuffer {
         else { return nil }
         buffer.frameLength = numSamples
 
-        var blockBuffer: CMBlockBuffer?
-        var audioBufferList = AudioBufferList()
-        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+        let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
             sample,
-            bufferListSizeNeededOut: nil,
-            bufferListOut: &audioBufferList,
-            bufferListSize: MemoryLayout<AudioBufferList>.size,
-            blockBufferAllocator: nil,
-            blockBufferMemoryAllocator: nil,
-            flags: 0,
-            blockBufferOut: &blockBuffer
+            at: 0,
+            frameCount: Int32(numSamples),
+            into: buffer.mutableAudioBufferList
         )
-        guard status == noErr else { return nil }
-
-        let src = UnsafeMutableAudioBufferListPointer(&audioBufferList)
-        guard let firstBuf = src.first,
-              let destBuf = buffer.audioBufferList.pointee.mBuffers.mData,
-              let srcData = firstBuf.mData else { return buffer }
-        let copyBytes = Int(min(firstBuf.mDataByteSize, buffer.audioBufferList.pointee.mBuffers.mDataByteSize))
-        memcpy(destBuf, srcData, copyBytes)
-        return buffer
+        return status == noErr ? buffer : nil
     }
 }

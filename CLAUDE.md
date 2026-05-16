@@ -259,3 +259,26 @@ pkill -f TranscrybeDIY                           # kill all instances
     already-drained stream and the recognizer hit "No speech detected".
     Rule: `buffers` is a *fresh subscription factory* — call it per
     consumer, never cache.
+12. **Unstructured `Task { ... }` children inside a cancellable parent
+    don't inherit cancellation.** The original `run()` spawned its
+    translation/prune workers and per-source recognition cycles as
+    independent Tasks, then awaited their `.value`. When the parent
+    Task was cancelled (via `Pipeline.stop()`), the await woke up but
+    the child Tasks kept running independently — recognition continued
+    producing transcripts, and a second Stop press would actually start
+    a *fresh* run on top (creating a duplicate JSONL archive). Fix:
+    spawn children inside `withTaskGroup` so cancellation cascades.
+    Related rule: don't `runTask = nil` inside `stop()` — leave it set
+    so `toggle()` no-ops during the wind-down rather than starting a
+    new run on top.
+13. **`CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer` with
+    `bufferListSize: MemoryLayout<AudioBufferList>.size` only fits ONE
+    AudioBuffer.** ScreenCaptureKit delivers non-interleaved stereo
+    Float32 — two separate AudioBuffers — which made the call fail with
+    `kCMSampleBufferError_ArrayTooSmall` on *every* sample. Diagnostic
+    counters (`SystemAudio: heartbeat received=X yielded=0 convFails=X`)
+    were the giveaway. Fix: use
+    `CMSampleBufferCopyPCMDataIntoAudioBufferList(_:at:frameCount:into:)`
+    with `AVAudioPCMBuffer.mutableAudioBufferList` — the destination
+    is already correctly sized for its format (separate buffers for
+    non-interleaved, one for interleaved).

@@ -109,12 +109,13 @@ final class Pipeline: ObservableObject {
     private var runTask: Task<Void, Never>?
     private var archive: TranscriptArchive?
 
-    var isRunning: Bool {
-        switch status {
-        case .running, .starting, .requestingPermissions: return true
-        default: return false
-        }
-    }
+    /// True from when `run()` enters until its cleanup completes. This is
+    /// what the UI's Start/Stop button reflects. Distinct from `runTask`:
+    /// `runTask` is non-nil even during the *cancellation wind-down*, so we
+    /// can no-op a redundant Stop press without starting a fresh run.
+    @Published private(set) var isActive: Bool = false
+
+    var isRunning: Bool { isActive }
 
     // MARK: - Persistence
 
@@ -176,7 +177,12 @@ final class Pipeline: ObservableObject {
     func stop() {
         Log.line("Pipeline.stop()")
         runTask?.cancel()
-        runTask = nil
+        // Intentionally NOT setting runTask = nil here. We let run()'s
+        // cleanup clear it once children have actually finished. If we
+        // nilled it now, a second Stop tap (or any toggle()) would see
+        // runTask == nil during the wind-down window and start a fresh
+        // run on top of the still-cleaning-up old one — which would
+        // create a duplicate transcript archive file.
     }
 
     func clear() {
@@ -196,10 +202,11 @@ final class Pipeline: ObservableObject {
     // MARK: - Run loop
 
     private func run() async {
+        isActive = true
         defer {
-            Task { await micSource.stop(); await systemSource.stop() }
             if case .stopped = status { } else { status = .idle }
             runTask = nil
+            isActive = false
             activeIDsBySource = [:]
             lastSnapshotBySource = [:]
             archive = nil
@@ -239,20 +246,27 @@ final class Pipeline: ObservableObject {
 
         status = .running
 
-        // 5. Concurrent workers: translation + prune.
-        let translationWorker = Task { await runTranslationLoop() }
-        let pruneWorker = Task { await runPruneLoop() }
-        defer {
-            translationWorker.cancel()
-            pruneWorker.cancel()
+        // 5. All concurrent workers live inside a TaskGroup so cancellation
+        //    of the parent (runTask) propagates to every child. With the
+        //    previous unstructured `Task { ... }` children, cancel() didn't
+        //    reach them — recognition kept running after Stop, and a second
+        //    Stop press would actually start a fresh run on top.
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await self.runTranslationLoop() }
+            group.addTask { await self.runPruneLoop() }
+            if micEnabled {
+                group.addTask { await self.runRecognitionCycle(kind: .microphone) }
+            }
+            if systemEnabled {
+                group.addTask { await self.runRecognitionCycle(kind: .systemAudio) }
+            }
         }
 
-        // 6. Per-source recognition cycles.
-        let micTask = micEnabled  ? Task { await runRecognitionCycle(kind: .microphone) } : nil
-        let systemTask = systemEnabled ? Task { await runRecognitionCycle(kind: .systemAudio) } : nil
-
-        await micTask?.value
-        await systemTask?.value
+        // 6. Audio cleanup is awaited so the next Start sees fully-stopped
+        //    sources. Previously this was fire-and-forget which could race
+        //    a rapid Stop→Start.
+        await micSource.stop()
+        await systemSource.stop()
     }
 
     /// Recognition cycle for one audio source. Keeps re-starting sessions
@@ -280,8 +294,11 @@ final class Pipeline: ObservableObject {
 
             do {
                 for try await snapshot in transcriber.transcribe(audio: audio, locale: source) {
+                    if Task.isCancelled { break }
                     ingest(snapshot, kind: kind)
                 }
+            } catch is CancellationError {
+                // Expected on Stop — fall through to cleanup.
             } catch {
                 Log.line("[\(kind.archiveTag)] session #\(sessionIndex) error: \(error.localizedDescription)")
             }
