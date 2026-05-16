@@ -1,6 +1,6 @@
 import Foundation
 
-/// Append-only debug log at `/tmp/transcrybe.log`. macOS 26 makes the
+/// Append-only debug log at `/tmp/livetranslate.log`. macOS 26 makes the
 /// unified log painful to filter for ad-hoc-signed apps, so we just write
 /// to disk and `tail -f` it during development.
 ///
@@ -8,8 +8,8 @@ import Foundation
 /// the file is truncated. We don't rotate mid-run — long-running sessions
 /// can grow the file but a single run is bounded by sane wall time.
 enum Log {
-    private static let url: URL = URL(fileURLWithPath: "/tmp/transcrybe.log")
-    private static let queue = DispatchQueue(label: "TranscrybeDIY.log")
+    private static let url: URL = URL(fileURLWithPath: "/tmp/livetranslate.log")
+    private static let queue = DispatchQueue(label: "LiveTranslate.log")
     private static let maxBytes: Int = 5 * 1024 * 1024   // 5 MB
     private static let df: DateFormatter = {
         let f = DateFormatter()

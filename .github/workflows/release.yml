@@ -1,0 +1,51 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Build .app bundle
+        run: ./build.sh
+
+      - name: Compute version tag
+        id: tag
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y.%m.%d-%H%M%S)
+          echo "tag=v${DATE}-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Package .app into a zip
+        run: |
+          cd build
+          ditto -ck --keepParent --rsrc --sequesterRsrc LiveTranslate.app LiveTranslate.zip
+          ls -lh LiveTranslate.zip
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: LiveTranslate ${{ steps.tag.outputs.tag }}
+          body: |
+            Automated build from commit `${{ steps.tag.outputs.sha }}`.
+
+            **macOS 15+ required.** Ad-hoc signed — Gatekeeper will warn
+            on first launch; right-click → Open the first time, or
+            `xattr -dr com.apple.quarantine LiveTranslate.app` to clear.
+          files: build/LiveTranslate.zip
+          fail_on_unmatched_files: true

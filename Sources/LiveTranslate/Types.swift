@@ -7,6 +7,16 @@ import AVFoundation
 struct SourceLocale: Hashable, Identifiable, Codable {
     let identifier: String
     var id: String { identifier }
+
+    /// Human-readable label rendered in the current locale. e.g. "de-DE"
+    /// becomes "German (Germany)" on an English-speaking Mac. Falls back
+    /// to the raw identifier if the system can't localize it.
+    var displayName: String {
+        let l = Locale.current
+        return l.localizedString(forIdentifier: identifier)
+            ?? l.localizedString(forLanguageCode: identifier)
+            ?? identifier
+    }
 }
 
 /// BCP-47 language code + display name for translation target
@@ -78,6 +88,16 @@ enum PipelineStatus: Equatable {
         case .starting: return "Starting…"
         case .running: return "Listening"
         case .stopped(let r): return "Stopped: \(r)"
+        }
+    }
+
+    /// True when the pipeline is doing something the user-visible status
+    /// dot should pulse for. Pure presentation concern, lives here so the
+    /// View doesn't have to enumerate cases.
+    var isLive: Bool {
+        switch self {
+        case .running, .starting, .requestingPermissions: return true
+        default: return false
         }
     }
 }

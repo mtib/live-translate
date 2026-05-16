@@ -44,8 +44,8 @@ final class MixedAudioSource: AudioSource {
     private let queueLock = NSLock()
     private let maxQueuedSamples = 16_000   // ~1 second at 16 kHz
 
-    private var listeners: [UUID: AsyncStream<AVAudioPCMBuffer>.Continuation] = [:]
-    private let listenerLock = NSLock()
+    private let broadcaster = BufferBroadcaster()
+    var buffers: AsyncStream<AVAudioPCMBuffer> { broadcaster.stream }
 
     /// Tasks driving the upstream readers. Cancelled in `stop()`.
     private var micReaderTask: Task<Void, Never>?
@@ -100,16 +100,6 @@ final class MixedAudioSource: AudioSource {
         await systemSource.stop()
         queueLock.withLock { systemQueue.removeAll() }
         Log.line("MixedAudioSource: stopped")
-    }
-
-    var buffers: AsyncStream<AVAudioPCMBuffer> {
-        AsyncStream { cont in
-            let id = UUID()
-            self.listenerLock.withLock { self.listeners[id] = cont }
-            cont.onTermination = { [weak self] _ in
-                self?.listenerLock.withLock { _ = self?.listeners.removeValue(forKey: id) }
-            }
-        }
     }
 
     // MARK: - Mixing internals
@@ -171,7 +161,6 @@ final class MixedAudioSource: AudioSource {
         // outData[i] = micData[i] + scratch[i], SIMD.
         vDSP_vadd(micData, 1, scratch, 1, outData, 1, vDSP_Length(n))
 
-        let conts = listenerLock.withLock { Array(listeners.values) }
-        for c in conts { c.yield(out) }
+        broadcaster.emit(out)
     }
 }

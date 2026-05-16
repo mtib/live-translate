@@ -42,12 +42,6 @@ final class AppleSpeechTranscriber: Transcriber {
             request.addsPunctuation = true
             Log.line("Transcriber[\(locale.identifier)]: session opened")
 
-            // Per-instance throughput counter so we can spot whichever
-            // session is starved when dual-source is on. Logged from the
-            // pump task.
-            var appendedBuffers = 0
-            let bufferCountLock = NSLock()
-
             let task = recognizer.recognitionTask(with: request) { result, error in
                 if let result {
                     let snapshot = SessionSnapshot(
@@ -65,17 +59,10 @@ final class AppleSpeechTranscriber: Transcriber {
                 }
             }
 
-            // Pump audio into the recognition request from the shared mic stream.
+            // Pump audio into the recognition request from the shared stream.
             let pump = Task {
-                var lastLog = Date.distantPast
                 for await buf in audio {
                     request.append(buf)
-                    bufferCountLock.withLock { appendedBuffers += 1 }
-                    if Date().timeIntervalSince(lastLog) >= 1.0 {
-                        let count = bufferCountLock.withLock { appendedBuffers }
-                        Log.line("Transcriber[\(locale.identifier)]: appended=\(count)")
-                        lastLog = Date()
-                    }
                 }
                 request.endAudio()
             }

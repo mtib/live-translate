@@ -4,10 +4,8 @@ import ScreenCaptureKit
 import CoreMedia
 
 /// Captures audio playing through the system speakers via
-/// `ScreenCaptureKit`. Bypasses the speaker→mic round-trip, which was the
-/// cause of MicrophoneSource stalling on video/music playback: the
-/// recognizer was seeing mic + speaker bleed and either getting
-/// "no speech detected" or producing garbage.
+/// `ScreenCaptureKit`. Bypasses the speaker→mic round-trip, so video
+/// or call audio reaches the recognizer clean.
 ///
 /// Requirements:
 ///   - macOS 13+ (we target 15).
@@ -21,33 +19,11 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
     private var stream: SCStream?
     private let sampleQueue = DispatchQueue(label: "SystemAudioSource.samples", qos: .userInteractive)
 
-    private var listeners: [UUID: AsyncStream<AVAudioPCMBuffer>.Continuation] = [:]
-    private let lock = NSLock()
+    private let broadcaster = BufferBroadcaster()
+    var buffers: AsyncStream<AVAudioPCMBuffer> { broadcaster.stream }
 
-    /// Diagnostic counters logged once per second so we can verify the
-    /// system-audio path is actually delivering samples — silent failure
-    /// here is otherwise hard to spot.
-    private var diag = Diag()
-    private struct Diag {
-        var samplesReceived: Int = 0
-        var samplesYielded: Int = 0
-        var conversionFailures: Int = 0
-        var lastLog: Date = .distantPast
-        var loggedFormat: Bool = false
-    }
-
-    var buffers: AsyncStream<AVAudioPCMBuffer> {
-        AsyncStream { cont in
-            let id = UUID()
-            self.lock.withLock { self.listeners[id] = cont }
-            cont.onTermination = { [weak self] _ in
-                self?.lock.withLock { _ = self?.listeners.removeValue(forKey: id) }
-            }
-        }
-    }
-
-    /// Lazy-built converter to coerce SCK's source format into the 16 kHz
-    /// mono Float32 that SFSpeech (and a future whisper backend) accept.
+    /// Lazy converter: SCK source format → 16 kHz mono Float32 (what
+    /// SFSpeech expects natively and what MicrophoneSource also produces).
     private var converter: AVAudioConverter?
     private var sourceFormat: AVAudioFormat?
     private let targetFormat = AVAudioFormat(
@@ -57,9 +33,8 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
         interleaved: false
     )!
 
-    /// SCK setup is natively async — do not fake a sync wrapper around it.
-    /// (Earlier we did, with a `DispatchSemaphore`, and deadlocked the
-    /// MainActor. See CLAUDE.md "Things that have bitten us" #9.)
+    /// SCK setup is natively async — never wrap with a `DispatchSemaphore`
+    /// (deadlocks the MainActor, see CLAUDE.md lesson #9).
     func start() async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         guard let display = content.displays.first else { throw SystemAudioError.noDisplay }
@@ -100,37 +75,8 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
               sampleBuffer.isValid,
               CMSampleBufferDataIsReady(sampleBuffer)
         else { return }
-        diag.samplesReceived += 1
-
-        // Log the actual source format once — helps debug "why is nothing
-        // being transcribed". Often the recognizer is fine; we're just
-        // sending it the wrong format or silence.
-        if !diag.loggedFormat,
-           let asbd = sampleBuffer.formatDescription?.audioStreamBasicDescription {
-            Log.line("SystemAudio: source ASBD sr=\(asbd.mSampleRate) ch=\(asbd.mChannelsPerFrame) bits=\(asbd.mBitsPerChannel) flags=\(asbd.mFormatFlags)")
-            diag.loggedFormat = true
-        }
-
-        guard let pcm = makePCMBuffer(from: sampleBuffer) else {
-            diag.conversionFailures += 1
-            heartbeatIfDue()
-            return
-        }
-        diag.samplesYielded += 1
-        heartbeatIfDue()
-
-        let conts = lock.withLock { Array(listeners.values) }
-        for c in conts { c.yield(pcm) }
-    }
-
-    /// Once per second, dump throughput counters so we can spot silent
-    /// failures (samples received but never yielded, or never received at
-    /// all — both common with ScreenCaptureKit misconfiguration).
-    private func heartbeatIfDue() {
-        let now = Date()
-        guard now.timeIntervalSince(diag.lastLog) >= 1.0 else { return }
-        Log.line("SystemAudio: heartbeat received=\(diag.samplesReceived) yielded=\(diag.samplesYielded) convFails=\(diag.conversionFailures) listeners=\(lock.withLock { listeners.count })")
-        diag.lastLog = now
+        guard let pcm = makePCMBuffer(from: sampleBuffer) else { return }
+        broadcaster.emit(pcm)
     }
 
     // MARK: - SCStreamDelegate
@@ -142,15 +88,12 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
     // MARK: - Sample conversion
 
     /// Convert one `CMSampleBuffer` from SCK into a 16 kHz mono Float32
-    /// `AVAudioPCMBuffer`. The source format is whatever SCK chose
-    /// (typically 48 kHz stereo Float32); we use `AVAudioConverter` to
-    /// downsample + downmix.
+    /// `AVAudioPCMBuffer`. SCK typically delivers 48 kHz stereo Float32;
+    /// `AVAudioConverter` handles downsample + downmix.
     private func makePCMBuffer(from sample: CMSampleBuffer) -> AVAudioPCMBuffer? {
         guard let formatDesc = sample.formatDescription,
               let asbd = formatDesc.audioStreamBasicDescription else { return nil }
 
-        // Rebuild the converter when the source format changes (rare —
-        // typically just once at the start of the stream).
         if converter == nil
             || sourceFormat?.sampleRate != asbd.mSampleRate
             || sourceFormat?.channelCount != AVAudioChannelCount(asbd.mChannelsPerFrame) {
@@ -195,26 +138,23 @@ enum SystemAudioError: LocalizedError {
 // MARK: - Helpers
 
 private extension AVAudioPCMBuffer {
-    /// Build an `AVAudioPCMBuffer` from a `CMSampleBuffer`, copying the
-    /// sample data so the buffer's lifetime is independent of CoreMedia.
+    /// Build an `AVAudioPCMBuffer` from a `CMSampleBuffer`. Copies into a
+    /// fresh buffer so the lifetime is independent of CoreMedia (which
+    /// may reclaim the sample buffer once the delegate returns).
     ///
     /// Uses `CMSampleBufferCopyPCMDataIntoAudioBufferList`, which writes
-    /// straight into the destination's `mutableAudioBufferList`. This
-    /// matters because `mutableAudioBufferList` is sized correctly for
-    /// the destination's format (e.g. 2 separate buffers for
-    /// non-interleaved stereo). The previous implementation used
-    /// `CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer` with a
-    /// fixed-size `AudioBufferList`, which only fits **one** AudioBuffer
-    /// slot — so non-interleaved stereo sources (which is what
-    /// ScreenCaptureKit actually delivers) failed every sample with
-    /// `kCMSampleBufferError_ArrayTooSmall`.
+    /// directly into the destination's `mutableAudioBufferList` — that's
+    /// already correctly sized for the destination format (one buffer for
+    /// interleaved, N buffers for non-interleaved with N channels). The
+    /// earlier `GetAudioBufferListWithRetainedBlockBuffer` approach with
+    /// a fixed-size `AudioBufferList` failed on non-interleaved stereo —
+    /// see CLAUDE.md lesson #13.
     static func fromCMSampleBuffer(_ sample: CMSampleBuffer, format: AVAudioFormat) -> AVAudioPCMBuffer? {
         let numSamples = AVAudioFrameCount(CMSampleBufferGetNumSamples(sample))
         guard numSamples > 0,
               let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: numSamples)
         else { return nil }
         buffer.frameLength = numSamples
-
         let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
             sample,
             at: 0,

@@ -1,25 +1,13 @@
 import Foundation
 import AVFoundation
 
-/// Microphone capture via `AVAudioEngine`, exposed as a broadcasting source.
-///
-/// Always emits **16 kHz mono Float32** so that:
-///   1. Apple Speech sees its documented native format.
-///   2. The output is format-compatible with `SystemAudioSource`, which is
-///      important when `MixedAudioSource` interleaves them — the recognizer
-///      infers format from the first buffer and rejects mismatched ones.
-///
-/// **Broadcaster pattern.** Each access to `buffers` returns a fresh
-/// `AsyncStream`. The tap callback fans the converted buffer out to every
-/// active subscriber. Without this, a second `transcribe(...)` call after
-/// a session ends would attach to an already-drained iterator and silently
-/// receive nothing.
+/// Microphone capture via `AVAudioEngine`. Always emits 16 kHz mono
+/// Float32 so output matches `SystemAudioSource` — required by
+/// `MixedAudioSource`, which sample-sums the two streams.
 final class MicrophoneSource: AudioSource {
     private let engine = AVAudioEngine()
     private var tapInstalled = false
 
-    /// Target format: 16 kHz mono Float32 non-interleaved — what SFSpeech
-    /// natively expects, and what `SystemAudioSource` produces.
     private let targetFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
         sampleRate: 16_000,
@@ -29,19 +17,8 @@ final class MicrophoneSource: AudioSource {
     private var converter: AVAudioConverter?
     private var sourceFormat: AVAudioFormat?
 
-    private var listeners: [UUID: AsyncStream<AVAudioPCMBuffer>.Continuation] = [:]
-    private let lock = NSLock()
-
-    /// Fresh hot stream per access — see broadcaster pattern note above.
-    var buffers: AsyncStream<AVAudioPCMBuffer> {
-        AsyncStream { cont in
-            let id = UUID()
-            self.lock.withLock { self.listeners[id] = cont }
-            cont.onTermination = { [weak self] _ in
-                self?.lock.withLock { _ = self?.listeners.removeValue(forKey: id) }
-            }
-        }
-    }
+    private let broadcaster = BufferBroadcaster()
+    var buffers: AsyncStream<AVAudioPCMBuffer> { broadcaster.stream }
 
     func start() async throws {
         guard !engine.isRunning else { return }
@@ -55,10 +32,8 @@ final class MicrophoneSource: AudioSource {
         converter = AVAudioConverter(from: native, to: targetFormat)
 
         input.installTap(onBus: 0, bufferSize: 1024, format: native) { [weak self] buf, _ in
-            guard let self else { return }
-            guard let converted = self.convert(buf) else { return }
-            let conts = self.lock.withLock { Array(self.listeners.values) }
-            for c in conts { c.yield(converted) }
+            guard let self, let converted = self.convert(buf) else { return }
+            self.broadcaster.emit(converted)
         }
         tapInstalled = true
         engine.prepare()

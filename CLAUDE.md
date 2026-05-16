@@ -1,4 +1,4 @@
-# Transcrybe DIY — context for Claude
+# LiveTranslate — context for Claude
 
 A minimal, no-Xcode macOS app that does on-device speech transcription and
 translation from one or two audio sources at the same time. A learning / DIY
@@ -25,8 +25,8 @@ clone of [transcrybe.app](https://transcrybe.app).
   `.swiftLanguageMode(.v5)` because the Translation / Speech APIs are awkward
   under Swift 6 strict concurrency.
 - `./build.sh` compiles via `swift build -c release` and wraps the binary
-  into `build/TranscrybeDIY.app/` with `Info.plist` + ad-hoc codesign.
-  **Always launch via `open build/TranscrybeDIY.app`** — never run the binary
+  into `build/LiveTranslate.app/` with `Info.plist` + ad-hoc codesign.
+  **Always launch via `open build/LiveTranslate.app`** — never run the binary
   directly. TCC associates permission grants with the bundle, not the
   executable path; direct exec leads to the system thinking
   `NSSpeechRecognitionUsageDescription` is missing.
@@ -97,9 +97,9 @@ ScreenCaptureKit) without touching `Pipeline`.
 | File | Role |
 |---|---|
 | `App.swift` | `@main` entry. SwiftUI `Window` scene. Configures the NSWindow for floating / translucent / movable-from-background behavior. |
-| `TranscriptView.swift` | The whole UI. Renders one `SentenceRow` per sentence, with leading color strip + opacity fade. Hosts `.translationTask` (the only way to get a `TranslationSession`). |
-| `VisualEffectBackground.swift` | `NSVisualEffectView` wrapper for the HUD-style translucent background. |
-| `Pipeline.swift` | `@MainActor ObservableObject` orchestrator. Owns the published `sentences` array. Runs **one** recognition cycle on whichever source is active (mic, system, or `MixedAudioSource` when both are enabled), plus translation + prune workers. Persists user settings via UserDefaults. |
+| `TranscriptView.swift` | The whole UI. Renders one `SentenceRow` per sentence, with opacity fade for older rows. Hosts `.translationTask` (the only way to get a `TranslationSession`). Background is a flat translucent color — no blur. |
+| `Pipeline.swift` | `@MainActor ObservableObject` orchestrator. Owns the published `sentences` array. Runs **one** recognition cycle on a `MixedAudioSource` that sample-sums mic + system. Translation + prune workers run alongside. Persists user settings via UserDefaults. |
+| `BufferBroadcaster.swift` | Helper that fans audio buffers out to any number of subscribed `AsyncStream`s — used by all three `AudioSource` implementations to avoid duplicating the broadcaster pattern. |
 | `Types.swift` | `SourceLocale`, `TargetLanguage`, `Sentence`, `PipelineStatus`, `SessionSentence` / `SessionSnapshot`. Protocols: `AudioSource`, `Transcriber`, `Translator`. |
 | `MicrophoneSource.swift` | `AVAudioEngine` mic capture. Converts to 16 kHz mono Float32 so output matches `SystemAudioSource` (required by `MixedAudioSource`). Broadcaster pattern. |
 | `SystemAudioSource.swift` | `ScreenCaptureKit`-based system audio capture. Converts `CMSampleBuffer` → 16 kHz mono Float32 `AVAudioPCMBuffer`. |
@@ -107,7 +107,7 @@ ScreenCaptureKit) without touching `Pipeline`.
 | `AppleSpeechTranscriber.swift` | Apple `Speech` framework. Owns the sentence splitter (`splitIntoSentences`). |
 | `AppleTranslator.swift` | Holds a `TranslationSession` that the View injects via `Pipeline.installTranslationSession(_:)`. |
 | `TranscriptArchive.swift` | One-per-run JSONL archive file. Writes go through a serial queue so MainActor never blocks on disk. |
-| `Log.swift` | Append-only file logger at `/tmp/transcrybe.log`. Truncates on launch if > 5 MB. |
+| `Log.swift` | Append-only file logger at `/tmp/livetranslate.log`. Truncates on launch if > 5 MB. |
 
 ## Key behaviors / non-obvious bits
 
@@ -178,9 +178,9 @@ Mic prompts via `AVCaptureDevice.requestAccess`. Speech prompts via
 
 Reset stale grants with:
 ```sh
-tccutil reset Microphone local.mtib.transcrybediy
-tccutil reset SpeechRecognition local.mtib.transcrybediy
-tccutil reset ScreenCapture local.mtib.transcrybediy
+tccutil reset Microphone local.mtib.livetranslate
+tccutil reset SpeechRecognition local.mtib.livetranslate
+tccutil reset ScreenCapture local.mtib.livetranslate
 ```
 
 ### Window
@@ -217,9 +217,9 @@ tccutil reset ScreenCapture local.mtib.transcrybediy
 
 ```sh
 ./build.sh                                       # build & bundle
-open build/TranscrybeDIY.app                     # launch (always via `open`!)
-tail -f /tmp/transcrybe.log                      # see log output
-pkill -f TranscrybeDIY                           # kill all instances
+open build/LiveTranslate.app                     # launch (always via `open`!)
+tail -f /tmp/livetranslate.log                      # see log output
+pkill -f LiveTranslate                           # kill all instances
 ```
 
 ## Things that have bitten us already
@@ -234,7 +234,7 @@ pkill -f TranscrybeDIY                           # kill all instances
    model isn't installed yet. We set it to `false` so the system can fall
    back to cloud if needed.
 4. **`NSLog`** doesn't reliably appear in `log show` for ad-hoc-signed
-   apps on macOS 26. Use `Log.line(_:)` → `/tmp/transcrybe.log` instead.
+   apps on macOS 26. Use `Log.line(_:)` → `/tmp/livetranslate.log` instead.
 5. **Command Line Tools don't ship XCTest or Swift Testing.** No `swift test`
    support without installing full Xcode. Tests deliberately omitted.
 6. **Single-consumer AsyncStream** silently breaks every Start after the

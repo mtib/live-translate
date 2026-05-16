@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Build TranscrybeDIY and wrap it into a proper .app bundle so macOS
+# Build LiveTranslate and wrap it into a proper .app bundle so macOS
 # treats it as a real app (entitlements, menu bar, permissions prompts).
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
 CONFIG="${CONFIG:-release}"
-APP_NAME="TranscrybeDIY"
+APP_NAME="LiveTranslate"
 APP_DIR="build/${APP_NAME}.app"
 
 echo "→ swift build -c ${CONFIG}"

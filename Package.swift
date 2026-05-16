@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "TranscrybeDIY",
+    name: "LiveTranslate",
     platforms: [.macOS(.v15)],
     targets: [
         .executableTarget(
-            name: "TranscrybeDIY",
-            path: "Sources/TranscrybeDIY",
+            name: "LiveTranslate",
+            path: "Sources/LiveTranslate",
             swiftSettings: [
                 // Swift 5 mode keeps the data-flow code (AsyncStream pumping
                 // a non-Sendable AVAudioPCMBuffer into SFSpeech) tractable

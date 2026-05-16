@@ -53,6 +53,12 @@ final class TranscriptArchive {
         self.url = url
     }
 
+    /// Block until every queued write has hit disk. Used on shutdown so
+    /// we don't lose in-flight records when the process exits.
+    func flush() {
+        queue.sync {}
+    }
+
     /// Append one sentence record. Returns immediately — actual disk IO
     /// happens asynchronously on the archive's queue.
     func append(_ sentence: Sentence) {

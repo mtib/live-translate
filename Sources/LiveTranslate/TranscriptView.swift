@@ -24,7 +24,12 @@ struct TranscriptView: View {
 
     var body: some View {
         ZStack {
-            VisualEffectBackground().ignoresSafeArea()
+            // Translucent flat color (no blur). Adapts to light/dark mode
+            // via the system window background. Lower opacity = more of
+            // the content behind the window shows through.
+            Color(nsColor: .windowBackgroundColor)
+                .opacity(0.55)
+                .ignoresSafeArea()
             content
         }
         // Park the translation session for the lifetime of this config.
@@ -80,9 +85,10 @@ struct TranscriptView: View {
         }
     }
 
-    /// Full bar: one clean horizontal row with everything inline.
-    /// Primary on the left, language config in the middle, secondary
-    /// controls on the right. No labels — icons + tooltips are enough.
+    /// Full bar: one clean horizontal row.
+    /// Primary on the left, language pair in the middle, indicator and
+    /// compact-mode toggle on the right. No labels — the arrow between
+    /// the pickers tells you which way translation goes.
     private var fullBar: some View {
         HStack(spacing: 10) {
             primaryButton(compact: false)
@@ -92,12 +98,6 @@ struct TranscriptView: View {
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             targetPicker
-
-            Toggle("", isOn: $pipeline.translateEnabled)
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .labelsHidden()
-                .help(pipeline.translateEnabled ? "Translation on" : "Translation off")
 
             Spacer(minLength: 6)
 
@@ -152,11 +152,11 @@ struct TranscriptView: View {
     private var sourcePicker: some View {
         Picker("", selection: $pipeline.source) {
             ForEach(pipeline.availableSources) { src in
-                Text(src.identifier).tag(src)
+                Text(src.displayName).tag(src)
             }
         }
         .labelsHidden()
-        .frame(maxWidth: 95)
+        .frame(maxWidth: 170)
         .disabled(pipeline.isRunning)
         .controlSize(.small)
     }
@@ -168,40 +168,29 @@ struct TranscriptView: View {
             }
         }
         .labelsHidden()
-        .frame(maxWidth: 130)
-        .disabled(!pipeline.translateEnabled)
+        .frame(maxWidth: 140)
         .controlSize(.small)
     }
 
-    /// 8x8 colored dot reflecting `PipelineStatus`. Hover for the full
-    /// status text — keeps the UI quiet in normal use.
+    /// 8×8 colored dot reflecting `PipelineStatus`. Pulses while live;
+    /// hover for the full status text.
     private var statusDot: some View {
-        let (color, label) = statusVisual(pipeline.status)
+        let color = pipeline.status.dotColor
+        let live = pipeline.status.isLive
         return Circle()
             .fill(color)
             .frame(width: 8, height: 8)
             .overlay(
-                Circle().stroke(color.opacity(0.4), lineWidth: 3)
-                    .scaleEffect(pipeline.isRunning ? 1.5 : 1.0)
-                    .opacity(pipeline.isRunning ? 0.6 : 0)
+                Circle()
+                    .stroke(color.opacity(0.4), lineWidth: 3)
+                    .scaleEffect(live ? 1.5 : 1.0)
+                    .opacity(live ? 0.6 : 0)
                     .animation(
-                        pipeline.isRunning
-                            ? .easeInOut(duration: 1.2).repeatForever(autoreverses: true)
-                            : .default,
-                        value: pipeline.isRunning
+                        live ? .easeInOut(duration: 1.2).repeatForever(autoreverses: true) : .default,
+                        value: live
                     )
             )
-            .help(label)
-    }
-
-    private func statusVisual(_ s: PipelineStatus) -> (Color, String) {
-        switch s {
-        case .idle: return (.secondary, "Idle")
-        case .requestingPermissions: return (.orange, "Requesting permission…")
-        case .starting: return (.yellow, "Starting…")
-        case .running: return (.green, "Listening")
-        case .stopped(let reason): return (.red, "Stopped: \(reason)")
-        }
+            .help(pipeline.status.description)
     }
 
     private func iconButton(_ systemName: String, help: String, action: @escaping () -> Void) -> some View {
@@ -232,7 +221,6 @@ struct TranscriptView: View {
                         SentenceRow(
                             sentence: sentence,
                             isMostRecent: idx == pipeline.sentences.count - 1,
-                            translateEnabled: pipeline.translateEnabled,
                             compact: compact
                         )
                         .id(sentence.id)
@@ -257,38 +245,42 @@ struct TranscriptView: View {
     }
 }
 
-/// One sentence row. Most-recent is full opacity; older fade to 0.8.
-/// In compact mode the source-language line is hidden for non-current
-/// sentences to save vertical space.
+/// Status-dot color mapping. Lives here (not on the enum itself) because
+/// `Color` is a SwiftUI type and Types.swift is import-free of SwiftUI.
+private extension PipelineStatus {
+    var dotColor: Color {
+        switch self {
+        case .idle: return .secondary
+        case .requestingPermissions: return .orange
+        case .starting: return .yellow
+        case .running: return .green
+        case .stopped: return .red
+        }
+    }
+}
+
+/// One sentence row: translation as the primary line, source text as a
+/// caption underneath. Most-recent sentence is full opacity; older rows
+/// fade to 0.8. In compact mode the source caption is hidden for older
+/// rows to keep the overlay slim.
 private struct SentenceRow: View {
     let sentence: Sentence
     let isMostRecent: Bool
-    let translateEnabled: Bool
     let compact: Bool
 
     var body: some View {
         let opacity: Double = isMostRecent ? 1.0 : 0.8
 
         VStack(alignment: .leading, spacing: 1) {
-            if translateEnabled {
-                Text(sentence.translation.isEmpty ? "…" : sentence.translation)
-                    .font(compact ? .callout : .body)
-                    .foregroundStyle(.primary.opacity(opacity))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-                // Source caption is shown always in full mode, only for
-                // the live row in compact mode.
-                if !compact || isMostRecent {
-                    Text(sentence.text)
-                        .font(.caption)
-                        .foregroundStyle(.secondary.opacity(opacity * 0.85))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                }
-            } else {
+            Text(sentence.translation.isEmpty ? sentence.text : sentence.translation)
+                .font(compact ? .callout : .body)
+                .foregroundStyle(.primary.opacity(opacity))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+            if !sentence.translation.isEmpty, (!compact || isMostRecent) {
                 Text(sentence.text)
-                    .font(compact ? .callout : .body)
-                    .foregroundStyle(.primary.opacity(opacity))
+                    .font(.caption)
+                    .foregroundStyle(.secondary.opacity(opacity * 0.85))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
             }

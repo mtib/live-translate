@@ -1,34 +1,67 @@
-# Transcrybe DIY
+# LiveTranslate
 
-A DIY on-device speech-to-text + translation app for macOS. No Xcode, just
-SwiftPM + a build script.
+Floating, translucent macOS app that captures **your microphone *and* the
+audio your Mac is playing** at the same time, transcribes them on-device
+(or via Apple's server fallback), and translates the result into the
+target language of your choice — all in one rolling, hover-able window.
+
+Built with SwiftPM only — no Xcode project, no third-party dependencies.
 
 ## Build & run
 
 ```sh
 ./build.sh
-open build/TranscrybeDIY.app
+open build/LiveTranslate.app
 ```
 
-First launch will prompt for **Microphone** and **Speech Recognition**
-permission, and on first use of a translation pair will also prompt for the
-on-device translation model download. All processing is local.
+You need only the Command Line Tools (`xcode-select --install`); no
+full Xcode required.
 
-## Architecture
+## ⚠️ One-time setup: download languages
 
-See [CLAUDE.md](CLAUDE.md) for the full architectural overview, file map,
-known gotchas, and contribution notes.
+Both transcription and translation rely on language packs that macOS
+**only downloads on demand**. Do this *before* the first run or the app
+will sit there silently:
 
-```
-AudioSource → Transcriber → Pipeline → Translator → UI
-   (mic)      (Apple Speech)            (Apple Translation)
-```
+1. **Speech recognition language** (e.g. German for transcribing German
+   speech). Open
+   **System Settings → Keyboard → Dictation**, click the **Edit…** button
+   next to *Languages*, and add the source language. macOS downloads the
+   on-device model in the background.
 
-Each stage is a protocol — drop in whisper.cpp / OpenRouter / ScreenCaptureKit
-by writing a new conforming type and passing it to `Pipeline(...)`.
+2. **Translation language pair** (e.g. German → English). Open
+   **System Settings → Apple Intelligence & Siri → Translation Languages**
+   (or, on slightly older macOS, **System Settings → General → Language &
+   Region → Translation Languages**) and add both the source and target
+   languages.
+
+Without these downloads the recognizer will hit "No speech detected"
+within a fraction of a second and the translation panel stays empty.
+
+## Permissions
+
+First launch prompts for, in order:
+- **Microphone** — to capture your voice.
+- **Speech Recognition** — to transcribe captured audio.
+- **Screen Recording** — required by `ScreenCaptureKit` to access system
+  audio. No screen frames are kept; only the audio stream is used.
+
+## How it works (one-paragraph version)
+
+The mic feeds an `AVAudioEngine` tap; system audio comes from
+`ScreenCaptureKit` (audio-only configuration). Both are converted to
+16 kHz mono Float32 and **sample-summed** with hardware-accelerated
+`vDSP_vadd` so that one continuous audio stream reaches Apple's
+`SFSpeechRecognizer`. Recognized sentences are translated per-sentence
+via the `Translation` framework (cached by source text). Old sentences
+fade out and eventually drop into a per-run JSONL archive at
+`~/Documents/transcripts/<timestamp>.jsonl`.
+
+See [CLAUDE.md](CLAUDE.md) for full architectural notes, the things
+that have bitten us, and the file-by-file map.
 
 ## Debug log
 
 ```sh
-tail -f /tmp/transcrybe.log
+tail -f /tmp/livetranslate.log
 ```

@@ -3,17 +3,17 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>TranscrybeDIY</string>
+    <string>LiveTranslate</string>
     <key>CFBundleDisplayName</key>
-    <string>Transcrybe DIY</string>
+    <string>LiveTranslate</string>
     <key>CFBundleIdentifier</key>
-    <string>local.mtib.transcrybediy</string>
+    <string>local.mtib.livetranslate</string>
     <key>CFBundleVersion</key>
     <string>0.1</string>
     <key>CFBundleShortVersionString</key>
     <string>0.1</string>
     <key>CFBundleExecutable</key>
-    <string>TranscrybeDIY</string>
+    <string>LiveTranslate</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
@@ -23,10 +23,10 @@
     <key>NSSupportsAutomaticTermination</key>
     <false/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Transcrybe DIY needs the microphone to transcribe what you say.</string>
+    <string>LiveTranslate needs the microphone to transcribe what you say.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
-    <string>Transcrybe DIY uses on-device speech recognition to turn audio into text.</string>
+    <string>LiveTranslate uses on-device speech recognition to turn audio into text.</string>
     <key>NSScreenCaptureUsageDescription</key>
-    <string>Transcrybe DIY captures system audio (no video frames are kept) so it can transcribe what you're listening to without going through the microphone.</string>
+    <string>LiveTranslate captures system audio (no video frames are kept) so it can transcribe what you're listening to without going through the microphone.</string>
 </dict>
 </plist>

@@ -50,7 +50,6 @@ final class Pipeline: ObservableObject {
 
     @Published var source: SourceLocale { didSet { persist(source, forKey: K.source) } }
     @Published var target: TargetLanguage { didSet { persist(target, forKey: K.target) } }
-    @Published var translateEnabled: Bool { didSet { defaults.set(translateEnabled, forKey: K.translateEnabled) } }
 
     /// Non-protected sentence older than this is pruned. Generous — old
     /// sentences are dimmed in the UI but still readable, so we'd rather
@@ -61,12 +60,6 @@ final class Pipeline: ObservableObject {
     /// older sentences are pruned by age anyway; this cap only kicks in
     /// during very fast speech.
     var maxSentenceCount: Int = 8
-
-    /// Minimum quiet time before translating a non-final sentence. Set to
-    /// zero: translate eagerly. The cache (lastTranslatedSource) keeps us
-    /// from re-sending identical text. The recognizer's partial rate is
-    /// modest enough that translating each unique partial is cheap.
-    var translationStabilityDelay: TimeInterval = 0
 
     // MARK: - Available choices
 
@@ -110,7 +103,6 @@ final class Pipeline: ObservableObject {
 
     private let defaults = UserDefaults.standard
     private enum K {
-        static let translateEnabled = "pipeline.translateEnabled"
         static let source = "pipeline.source"
         static let target = "pipeline.target"
     }
@@ -141,8 +133,6 @@ final class Pipeline: ObservableObject {
             .map { SourceLocale(identifier: $0.identifier) }
             .sorted { $0.identifier < $1.identifier }
 
-        let d = UserDefaults.standard
-        self.translateEnabled = d.object(forKey: K.translateEnabled) as? Bool ?? true
         self.source = Self.load(SourceLocale.self, forKey: K.source,
                                 defaultValue: SourceLocale(identifier: "de-DE"))
         self.target = Self.load(TargetLanguage.self, forKey: K.target,
@@ -175,11 +165,28 @@ final class Pipeline: ObservableObject {
         (translator as? AppleTranslator)?.setSession(session)
     }
 
+    /// Flush every still-visible sentence to the JSONL archive, then wait
+    /// until disk writes complete. Safe to call from `applicationWill-
+    /// Terminate` — blocks the main thread briefly so the file lands.
+    /// Idempotent: no-op when there's no active archive.
+    func flushPendingSentences() {
+        guard let archive else { return }
+        for s in sentences { archive.append(s) }
+        archive.flush()
+        sentences = []
+    }
+
     // MARK: - Run loop
 
     private func run() async {
         isActive = true
         defer {
+            // Flush any still-visible sentences before letting the archive
+            // drop so a normal Stop doesn't lose live content.
+            if let archive {
+                for s in sentences { archive.append(s) }
+                archive.flush()
+            }
             if case .stopped = status { } else { status = .idle }
             runTask = nil
             isActive = false
@@ -224,7 +231,7 @@ final class Pipeline: ObservableObject {
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await self.runTranslationLoop() }
             group.addTask { await self.runPruneLoop() }
-            group.addTask { await self.runRecognitionCycle(audio: active) }
+            group.addTask { await self.runRecognitionCycle(audioSource: active) }
         }
 
         // 6. Audio cleanup. Awaited so the next Start sees a clean source.
@@ -234,7 +241,7 @@ final class Pipeline: ObservableObject {
     /// One recognition cycle, restarting sessions as they end. Bails after
     /// 6 consecutive fast-fails (typically the language model isn't installed,
     /// or no audio is reaching the recognizer).
-    private func runRecognitionCycle(audio source: AudioSource) async {
+    private func runRecognitionCycle(audioSource: AudioSource) async {
         var sessionIndex = 0
         var consecutiveFastFails = 0
         let maxFastFails = 6
@@ -245,15 +252,15 @@ final class Pipeline: ObservableObject {
             activeIDs = []
             lastSnapshot = nil
             let started = Date()
-            Log.line("Session #\(sessionIndex) starting locale=\(self.source.identifier)")
+            Log.line("Session #\(sessionIndex) starting locale=\(source.identifier)")
 
             // CRITICAL: fresh buffer subscription per session. `.buffers`
             // is a fresh-subscription factory; AsyncStream is single-
             // consumer, so caching across sessions silently breaks restarts.
-            let audio = source.buffers
+            let audio = audioSource.buffers
 
             do {
-                for try await snapshot in transcriber.transcribe(audio: audio, locale: self.source) {
+                for try await snapshot in transcriber.transcribe(audio: audio, locale: source) {
                     if Task.isCancelled { break }
                     ingest(snapshot)
                 }
@@ -333,20 +340,15 @@ final class Pipeline: ObservableObject {
 
     // MARK: - Translation worker
 
-    /// Translates sentences that have changed AND are either final or
-    /// stable. Cached by source text.
+    /// Translates every sentence whose text has changed since its last
+    /// translation. Cache (`lastTranslatedSource` + `translationCache`)
+    /// keeps duplicate strings from re-hitting the framework.
     private func runTranslationLoop() async {
         Log.line("Translation loop started")
         while !Task.isCancelled {
             try? await Task.sleep(nanoseconds: 400_000_000)
-            guard translateEnabled else { continue }
-
-            let now = Date()
             let pending: [(id: UUID, text: String)] = sentences.compactMap { s in
-                guard !s.text.isEmpty,
-                      s.text != s.lastTranslatedSource,
-                      s.isFinal || now.timeIntervalSince(s.lastModified) >= translationStabilityDelay
-                else { return nil }
+                guard !s.text.isEmpty, s.text != s.lastTranslatedSource else { return nil }
                 return (s.id, s.text)
             }
 
