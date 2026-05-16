@@ -28,7 +28,7 @@ struct TranscriptView: View {
             // via the system window background. Lower opacity = more of
             // the content behind the window shows through.
             Color(nsColor: .windowBackgroundColor)
-                .opacity(0.55)
+                .opacity(0.8)
                 .ignoresSafeArea()
             content
         }
