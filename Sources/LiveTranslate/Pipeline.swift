@@ -544,8 +544,12 @@ final class Pipeline: ObservableObject {
         for merged in mergedSubtitles.values { merged.flush() }
         Log.line("Pipeline: finalize — writers flushed, building MKV")
         await MKVExporter.export(outputs: outputs, langs: allLangs)
-        Log.line("Pipeline: zipping work dir → \(outputs.zipDestination.lastPathComponent)")
-        await ZipArchiver.zipAndCleanup(directory: outputs.workDir, into: outputs.zipDestination)
+        Log.line("Pipeline: packing \(outputs.shippedFiles.count) files → \(outputs.zipDestination.lastPathComponent)")
+        await ZipArchiver.zipFilesAndCleanup(
+            outputs.shippedFiles,
+            into: outputs.zipDestination,
+            workDir: outputs.workDir
+        )
     }
 
     // MARK: - Translation cache

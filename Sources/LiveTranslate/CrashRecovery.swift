@@ -69,7 +69,11 @@ enum CrashRecovery {
         let langs = discoverLanguages(in: workDir, stamp: stamp)
 
         await MKVExporter.export(outputs: outputs, langs: langs)
-        await ZipArchiver.zipAndCleanup(directory: workDir, into: outputs.zipDestination)
+        await ZipArchiver.zipFilesAndCleanup(
+            outputs.shippedFiles,
+            into: outputs.zipDestination,
+            workDir: workDir
+        )
     }
 
     /// Scan `<workDir>/transcripts/` for merged SRT files

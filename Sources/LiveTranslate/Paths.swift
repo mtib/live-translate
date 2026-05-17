@@ -33,86 +33,69 @@ enum Paths {
         return url
     }
 
-    /// All output paths for one in-progress session. Files inside the
-    /// work directory are organised into subdirs (`audio/`,
-    /// `transcripts/`, `logs/`, `recordings/`) so when the zip is
-    /// extracted, VLC opening the MKV doesn't pick up the per-source
-    /// SRTs as sidecar tracks (it only scans its own directory).
+    /// All output paths for one in-progress session. Flat layout
+    /// inside the work directory — only intermediates that ffmpeg
+    /// needs (per-source WAVs, per-language merged SRTs) plus the
+    /// two shipped artifacts (JSONL + MKV) live there. Everything
+    /// outside `shippedFiles` is deleted when the work dir is
+    /// removed after the zip is written.
     struct Outputs {
         /// `<stamp>` — e.g. `2026-05-17_15-42-10`.
         let timestamp: String
-        /// Temp directory holding all session artifacts. Removed after
-        /// zipping.
+        /// Temp directory holding all session artifacts. Removed
+        /// after the zip is written.
         let workDir: URL
         /// Final per-session zip in `~/Documents/LiveTranslate/`.
         let zipDestination: URL
 
-        /// `<workDir>/logs/<stamp>.jsonl` — one JSON object per
-        /// emitted sentence, with `source` field.
+        /// `<workDir>/<stamp>.jsonl` — one JSON object per emitted
+        /// sentence, with `source` field. The shipped text record.
         var transcript: URL {
-            workDir.appendingPathComponent("logs", isDirectory: true)
-                   .appendingPathComponent("\(timestamp).jsonl")
+            workDir.appendingPathComponent("\(timestamp).jsonl")
         }
 
-        /// `<workDir>/audio/<stamp>.<source>.wav` — per-source
-        /// post-denoise + AGC audio.
+        /// `<workDir>/<stamp>.<source>.wav` — per-source post-denoise
+        /// + AGC audio. Intermediate only; consumed by ffmpeg's
+        /// `amix` filter at session end.
         func recording(_ source: SourceTag) -> URL {
-            workDir.appendingPathComponent("audio", isDirectory: true)
-                   .appendingPathComponent("\(timestamp).\(source.rawValue).wav")
+            workDir.appendingPathComponent("\(timestamp).\(source.rawValue).wav")
         }
 
-        /// `<workDir>/transcripts/<stamp>.<source>.<lang>.srt` —
-        /// per-source SRT (kept for debugging / inspection; *not*
-        /// embedded in the MKV).
-        func subtitle(_ source: SourceTag, _ langCode: String) -> URL {
-            workDir.appendingPathComponent("transcripts", isDirectory: true)
-                   .appendingPathComponent("\(timestamp).\(source.rawValue).\(langCode).srt")
-        }
-
-        /// `<workDir>/transcripts/<stamp>.<lang>.srt` — merged SRT,
-        /// `[Mic]` / `[Sys]` prefixed. The MKV embeds this; VLC sees
-        /// it as an embedded track, not a sidecar.
+        /// `<workDir>/<stamp>.<lang>.srt` — live-merged SRT for one
+        /// language, both sources interleaved with `[Mic]` / `[Sys]`
+        /// prefixes. Intermediate only; embedded in the MKV.
         func mergedSubtitle(_ langCode: String) -> URL {
-            workDir.appendingPathComponent("transcripts", isDirectory: true)
-                   .appendingPathComponent("\(timestamp).\(langCode).srt")
+            workDir.appendingPathComponent("\(timestamp).\(langCode).srt")
         }
 
-        /// `<workDir>/recordings/<stamp>.mkv` — built by
-        /// `MKVExporter`. In its own subdir so it doesn't share a
-        /// directory with the SRTs (VLC sidecar auto-load).
+        /// `<workDir>/<stamp>.mkv` — final per-session video bundle:
+        /// merged audio (amix'd from per-source WAVs) + both
+        /// language SRTs embedded over a 640×360 black frame.
         var mkvOutput: URL {
-            workDir.appendingPathComponent("recordings", isDirectory: true)
-                   .appendingPathComponent("\(timestamp).mkv")
+            workDir.appendingPathComponent("\(timestamp).mkv")
         }
 
-        /// Internal helper — list every per-run subdir that must
-        /// exist before writers open their files.
-        var allSubdirs: [URL] {
-            ["audio", "transcripts", "logs", "recordings"].map {
-                workDir.appendingPathComponent($0, isDirectory: true)
-            }
+        /// The files that go into the user-facing zip: just the
+        /// transcript and the MKV. Everything else in the work dir
+        /// is intermediate.
+        var shippedFiles: [URL] {
+            [transcript, mkvOutput]
         }
     }
 
-    /// Allocate a fresh work directory + per-run subdirs for a new
-    /// session.
+    /// Allocate a fresh work directory for a new session.
     static func newRunOutputs(now: Date = Date()) throws -> Outputs {
         let stamp = runFilenameFormatter.string(from: now)
         let workURL = URL(
             fileURLWithPath: NSTemporaryDirectory().appendingPathComponent("livetranslate-\(stamp)", isDirectory: true),
             isDirectory: true
         )
-        let fm = FileManager.default
-        try fm.createDirectory(at: workURL, withIntermediateDirectories: true)
-        let outputs = Outputs(
+        try FileManager.default.createDirectory(at: workURL, withIntermediateDirectories: true)
+        return Outputs(
             timestamp: stamp,
             workDir: workURL,
             zipDestination: try documentsRoot().appendingPathComponent("\(stamp).zip")
         )
-        for sub in outputs.allSubdirs {
-            try fm.createDirectory(at: sub, withIntermediateDirectories: true)
-        }
-        return outputs
     }
 }
 

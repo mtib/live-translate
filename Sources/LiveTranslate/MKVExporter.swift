@@ -72,13 +72,19 @@ enum MKVExporter {
     ) -> [String] {
         // `-t` before `-i` bounds the lavfi color generator to the
         // audio's length. Combined with no `-shortest` further down,
-        // the output runs as long as the longest audio input and isn't
-        // trimmed to the last subtitle cue.
+        // the output runs as long as the longest audio input and
+        // isn't trimmed to the last subtitle cue.
+        // Framerate is `r=10`: low enough to keep file size trivial,
+        // high enough that x264 produces a well-formed stream with
+        // proper `pix_fmt` / SPS-PPS that VLC will render. The
+        // earlier `r=2` plus `-tune stillimage` produced an
+        // essentially-empty stream (`pix_fmt=unknown`, junk
+        // framerate metadata).
         var args: [String] = [
             "-y",
             "-loglevel", "warning",
             "-f", "lavfi", "-t", String(format: "%.3f", videoDuration),
-            "-i", "color=c=black:s=640x360:r=2",
+            "-i", "color=c=black:s=640x360:r=10",
         ]
         var audioInputs: [Int] = []
         var nextIdx = 1
@@ -113,12 +119,12 @@ enum MKVExporter {
             args.append(contentsOf: ["-map", "\(firstSRTIdx + i)"])
         }
         args.append(contentsOf: [
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
-            // `-pix_fmt yuv420p` is load-bearing — without it the
-            // ultrafast/stillimage combo leaves `pix_fmt=unknown` in
-            // the output stream metadata and VLC refuses to render
-            // the video track (treats the MKV as audio-only, hiding
-            // the subtitles too).
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            // Drop `-tune stillimage` — combined with very low
+            // framerates it was producing a malformed H.264 stream
+            // (unknown pix_fmt, junk r_frame_rate metadata) that
+            // VLC refused to render.
             "-pix_fmt", "yuv420p",
             "-c:a", "aac",
             "-c:s", "srt",
@@ -126,6 +132,14 @@ enum MKVExporter {
         for (i, (_, lang)) in srts.enumerated() {
             args.append(contentsOf: ["-metadata:s:s:\(i)", "language=\(iso639_3(lang))"])
         }
+        // Explicitly mark video + audio + first subtitle as default.
+        // Without this, the MKV mux leaves all dispositions cleared
+        // (probably because lavfi-color and amix outputs don't get
+        // any default tag), and VLC interprets a video stream with
+        // `default=0` as "auto-deselect" — showing the file as
+        // audio-only.
+        args.append(contentsOf: ["-disposition:v:0", "default"])
+        args.append(contentsOf: ["-disposition:a:0", "default"])
         if !srts.isEmpty {
             args.append(contentsOf: ["-disposition:s:0", "default"])
         }
@@ -195,17 +209,32 @@ enum MKVExporter {
     }
 }
 
-/// Zip a directory into a single archive and (on success) delete the
-/// source directory. Uses macOS-bundled `/usr/bin/zip` so there's no
-/// external dependency. Caller is responsible for ensuring the parent
-/// directory of `destination` exists.
+/// Pack a specific set of files into a flat zip (no directory
+/// structure) and delete the entire work directory on success. Uses
+/// macOS-bundled `/usr/bin/zip` — no external dependency. Caller is
+/// responsible for ensuring the parent directory of `destination`
+/// exists.
 enum ZipArchiver {
-    static func zipAndCleanup(directory: URL, into destination: URL) async {
+
+    /// Zip exactly `files` into `destination`, flat (no paths), then
+    /// delete `workDir`. The work dir holds all the intermediate
+    /// per-source artifacts that aren't worth shipping; cleanup is
+    /// gated on the zip succeeding so we don't lose data on a
+    /// failed pack.
+    static func zipFilesAndCleanup(_ files: [URL], into destination: URL, workDir: URL) async {
+        // Skip files that aren't actually present (e.g. ffmpeg
+        // missing → no MKV). Zip can't include a missing file and
+        // we'd rather end up with a partial zip than a hard failure.
+        let existing = files.filter { FileManager.default.fileExists(atPath: $0.path) }
+        guard !existing.isEmpty else {
+            Log.line("ZipArchiver: no shippable files; leaving work dir for inspection: \(workDir.path)")
+            return
+        }
         do {
-            try await run(zipping: directory, into: destination)
+            try await runZip(files: existing, into: destination)
             do {
-                try FileManager.default.removeItem(at: directory)
-                Log.line("ZipArchiver: wrote \(destination.path), cleaned \(directory.path)")
+                try FileManager.default.removeItem(at: workDir)
+                Log.line("ZipArchiver: wrote \(destination.path), cleaned \(workDir.path)")
             } catch {
                 Log.line("ZipArchiver: zip ok but cleanup failed: \(error.localizedDescription)")
             }
@@ -214,15 +243,15 @@ enum ZipArchiver {
         }
     }
 
-    private static func run(zipping directory: URL, into destination: URL) async throws {
+    private static func runZip(files: [URL], into destination: URL) async throws {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
-            // -r recursive, -q quiet, -X strip extra file attrs.
-            // Use directory's basename as the entry inside the zip so
-            // extraction produces `<stamp>/...`.
-            proc.currentDirectoryURL = directory.deletingLastPathComponent()
-            proc.arguments = ["-r", "-q", "-X", destination.path, directory.lastPathComponent]
+            // `-j` junks paths so files land flat at the zip root.
+            // `-q` quiet, `-X` strip extra file attrs.
+            var args: [String] = ["-j", "-q", "-X", destination.path]
+            args.append(contentsOf: files.map(\.path))
+            proc.arguments = args
             proc.terminationHandler = { p in
                 if p.terminationStatus == 0 {
                     cont.resume()
