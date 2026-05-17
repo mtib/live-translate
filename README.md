@@ -73,6 +73,56 @@ The `.srt` files use cue times relative to the start of the matching
 `.wav`, so you can drop them straight into a video player along with
 the audio. They're also plain text — `grep -i term *.srt` works.
 
+## Reviewing a run
+
+VLC (and most other players) only render subtitles when there's a
+video track to draw them onto, so a bare `.wav` + `.srt` won't show
+captions. Easiest fix: wrap the run into a single MKV with a tiny
+black "video", the audio, and **both** subtitle tracks embedded —
+your player's *Subtitle → Sub Track* menu then switches between
+languages on the fly.
+
+One-liner from inside `~/Documents/LiveTranslate/`:
+
+```sh
+STAMP=2026-05-17_11-59-50   # ← change to the run you want
+
+ffmpeg \
+  -f lavfi -i color=c=black:s=960x180:r=2 \
+  -i "recordings/${STAMP}.wav" \
+  -i "transcripts/${STAMP}.de.srt" \
+  -i "transcripts/${STAMP}.en.srt" \
+  -map 0:v -map 1:a -map 2 -map 3 \
+  -c:v libx264 -preset ultrafast -tune stillimage \
+  -c:a copy -c:s srt \
+  -metadata:s:s:0 language=deu \
+  -metadata:s:s:1 language=eng \
+  -disposition:s:0 default \
+  -shortest "${STAMP}.mkv"
+```
+
+Adjust the two `language=` codes to match your actual source/target
+(`deu`, `eng`, `fra`, `spa`, `nld`…). `-disposition:s:0 default` makes
+the source-language subtitle the one VLC turns on by default; drop it
+if you'd rather start with no subtitles visible.
+
+If you specifically want subtitles **burned in** (one fixed language,
+playable in any tool that can't toggle tracks):
+
+```sh
+ffmpeg \
+  -f lavfi -i color=c=black:s=960x180:r=10 \
+  -i "recordings/${STAMP}.wav" \
+  -vf "subtitles=filename=transcripts/${STAMP}.en.srt" \
+  -map 0:v -map 1:a \
+  -c:v libx264 -preset ultrafast -tune stillimage -c:a aac \
+  -shortest "${STAMP}.en.mp4"
+```
+
+(`subtitles=` requires an ffmpeg built with libass — the Homebrew
+default. If you see *"No such filter: 'subtitles'"*, `brew reinstall
+ffmpeg`.)
+
 See [CLAUDE.md](CLAUDE.md) for full architectural notes, the things
 that have bitten us, and the file-by-file map.
 
