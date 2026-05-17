@@ -79,6 +79,13 @@ final class TTSSpeaker: @unchecked Sendable {
         self.onPCM = onPCM
         self.onActivityChanged = onActivityChanged
         Log.line("TTSSpeaker: voice=\(voice.name) [\(voice.language)] quality=\(qualityLabel(voice.quality))")
+        // Pre-warm: synthesize a silent utterance now so the voice model
+        // is loaded before the first real sentence arrives.
+        q.async { [synth, voice] in
+            let utt = AVSpeechUtterance(string: " ")
+            utt.voice = voice
+            synth.write(utt) { _ in }
+        }
     }
 
     /// Drop pending utterances. Currently-speaking one finishes
