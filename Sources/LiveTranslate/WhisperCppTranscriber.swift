@@ -5,10 +5,11 @@ import CWhisper
 
 /// Whisper.cpp backend — the project's only `Transcriber` implementation.
 ///
-/// **Model.** `ggml-large-v3-turbo-q5_0.bin` (~547 MB), bundled into the
-/// `.app` by `build.sh`. Override at `~/Documents/LiveTranslate/models/`
-/// with another GGML model file (same filename) to swap. MIT-licensed
-/// (Whisper weights from OpenAI, GGML repackaging by ggerganov).
+/// **Model.** Whichever GGML file `build.sh` bundled into the `.app`
+/// (see `bundledModelName` below; controlled by `MODEL_NAME` in
+/// `tools/build-whisper.sh`). The app has no runtime override — what
+/// you built is what you run. MIT-licensed (Whisper weights from
+/// OpenAI, GGML repackaging by ggerganov).
 ///
 /// **Pipeline.**
 ///   1. Audio buffers arrive 48 kHz mono Float32 (post-RNNoise).
@@ -189,11 +190,10 @@ final class WhisperCppTranscriber: Transcriber {
 
     // MARK: - Model loading
 
-    /// Resolve and load the GGML model file. Order of resolution:
-    ///   1. `~/Documents/LiveTranslate/models/ggml-base-q5_1.bin`
-    ///      (user override — drop a different size here to swap models).
-    ///   2. `Bundle.main`'s `ggml-base-q5_1.bin` resource (shipped
-    ///      with the .app by `build.sh`).
+    /// Resolve and load the bundled GGML model file. The build script
+    /// downloads + bundles a specific model under the name below; the
+    /// app only loads that file (no runtime override) so the user
+    /// experience is "what you build is what you run".
     private func ensureContextLoaded() throws -> OpaquePointer {
         ctxLoadLock.lock()
         defer { ctxLoadLock.unlock() }
@@ -201,17 +201,13 @@ final class WhisperCppTranscriber: Transcriber {
         if let modelLoadError { throw modelLoadError }
 
         let modelURL: URL
-        if let overrideURL = Self.userOverrideModelURL() {
-            modelURL = overrideURL
-            Log.line("Whisper: using user-override model at \(overrideURL.path)")
-        } else if let bundleURL = Bundle.main.url(forResource: "ggml-large-v3-turbo-q5_0", withExtension: "bin") {
-            modelURL = bundleURL
-            Log.line("Whisper: using bundled model at \(bundleURL.path)")
-        } else {
-            let err = TranscribeError.unavailable("whisper.cpp: no model file found (expected bundled ggml-large-v3-turbo-q5_0.bin)")
+        guard let bundleURL = Bundle.main.url(forResource: Self.bundledModelName, withExtension: "bin") else {
+            let err = TranscribeError.unavailable("whisper.cpp: bundled model \(Self.bundledModelName).bin missing from app Resources")
             modelLoadError = err
             throw err
         }
+        modelURL = bundleURL
+        Log.line("Whisper: loading bundled model at \(bundleURL.path)")
 
         var params = whisper_context_default_params()
         // Metal GPU on Apple Silicon. Pure CPU fallback on Intel — the
@@ -228,11 +224,10 @@ final class WhisperCppTranscriber: Transcriber {
         return loaded
     }
 
-    private static func userOverrideModelURL() -> URL? {
-        let dir = Paths.modelsDir
-        let candidate = dir.appendingPathComponent("ggml-large-v3-turbo-q5_0.bin")
-        return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
-    }
+    /// Name of the bundled GGML model (without `.bin`). Has to match
+    /// the file `build.sh` copies into `Contents/Resources/` and the
+    /// `MODEL_NAME` default in `tools/build-whisper.sh`.
+    private static let bundledModelName = "ggml-small-q5_1"
 
     // MARK: - Transcribe (continuous chunk loop)
     //

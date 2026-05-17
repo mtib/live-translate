@@ -32,7 +32,10 @@ cp Info.plist "${APP_DIR}/Contents/Info.plist"
 # looks here first (via Bundle.main.url(forResource:withExtension:))
 # and falls back to ~/Documents/LiveTranslate/models/ for user
 # overrides (drop a larger model file there if you want).
-cp "build/whisper-models/ggml-large-v3-turbo-q5_0.bin" "${APP_DIR}/Contents/Resources/ggml-large-v3-turbo-q5_0.bin"
+# Filename is matched against `WhisperCppTranscriber.bundledModelName`
+# at runtime — they must agree.
+MODEL_NAME="${WHISPER_MODEL:-ggml-small-q5_1.bin}"
+cp "build/whisper-models/${MODEL_NAME}" "${APP_DIR}/Contents/Resources/${MODEL_NAME}"
 
 # Generate the app icon (idempotent — re-renders from the same SF Symbol
 # every time) and drop the .icns into Resources/.

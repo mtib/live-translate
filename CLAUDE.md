@@ -40,12 +40,18 @@ clone of [transcrybe.app](https://transcrybe.app).
 - `swift-tools-version: 6.0`, but the executable target is pinned to
   `.swiftLanguageMode(.v5)` because the Translation APIs are awkward
   under Swift 6 strict concurrency.
+- `./dev-setup.sh` pre-downloads a curated set of GGML models into
+  the repo-local `models/` directory (gitignored). `build.sh` then
+  prefers that cache; falls back to fetching into
+  `build/whisper-models/`.
 - `./build.sh` first runs `tools/build-whisper.sh` (idempotent — clones
   whisper.cpp v1.7.4 into `external/`, builds static libraries into
-  `build/whisper-prefix/`, downloads `ggml-base-q5_1.bin` into
+  `build/whisper-prefix/`, ensures the chosen `WHISPER_MODEL` is in
   `build/whisper-models/`), then `swift build -c release`, then wraps
-  the binary into `build/LiveTranslate.app/` with `Info.plist`, the
-  GGML model copied into Resources, and ad-hoc codesign.
+  the binary into `build/LiveTranslate.app/`, copies the chosen GGML
+  model into Resources, and codesigns (ad-hoc by default; set
+  `LIVETRANSLATE_SIGN_IDENTITY` to a self-signed cert name to persist
+  TCC grants across rebuilds).
 - **Always launch via `open build/LiveTranslate.app`** — never run the
   binary directly. TCC associates permission grants with the bundle,
   not the executable path; direct exec leads to the system thinking
@@ -129,13 +135,22 @@ identity stays stable across the lifecycle.
   become the sentence's `startSeconds` / `endSeconds`, anchored by
   Pipeline at `runStartedAt` so JSONL/SRT timestamps map directly to
   positions in the paired `.wav`.
-- **GGML model file resolution.** `WhisperCppTranscriber` looks for
-  `~/Documents/LiveTranslate/models/ggml-large-v3-turbo-q5_0.bin`
-  first (user override — drop a different model file there with the
-  same name), then falls back to the `.app`'s bundled copy. Bundled
-  default is large-v3-turbo Q5_0 (~570 MB). MIT licensed (Whisper
-  weights from OpenAI, GGML packaging by ggerganov on Hugging Face).
-  Copied into `Contents/Resources/` by `build.sh`.
+- **GGML model: bundled only.** `WhisperCppTranscriber.bundledModelName`
+  is the filename (sans `.bin`) of the model loaded at runtime. The
+  build script copies `models/<MODEL_NAME>` (or downloads it if not
+  cached) into `Contents/Resources/`. Default is `ggml-small-q5_1`
+  (~190 MB) — ~2× faster than the previous large-v3-turbo at
+  acceptable quality for live use. Swap by editing both
+  `bundledModelName` and `WHISPER_MODEL` (env var consumed by
+  `build.sh` + `tools/build-whisper.sh`). No runtime user-override
+  path; what you built is what you run.
+- **Auto-gain control.** `DenoisingAudioSource` runs a per-instance
+  envelope-follower AGC after RNNoise and before the crosstalk gate:
+  measure RMS via `vDSP_measqv`, EMA the input level on voiced
+  buffers, target ~0.1 RMS, smooth the applied gain (slow ramp to
+  avoid pumping), multiply via `vDSP_vsmul`. Caps at 8× boost; never
+  attenuates (`agcMinGain=1`). This lets mic and system arrive at
+  comparable loudness without manual tuning.
 - **Transcribers emit one sentence per closed chunk.** The
   transcriber owns chunk boundaries (via RMS) and the joining of
   whisper's internal segments. Pipeline never edits a `Sentence`
@@ -156,24 +171,34 @@ identity stays stable across the lifecycle.
   retained — generous so the user can scroll back through history.
   "Protected" means just the most-recent sentence (so the UI is never
   briefly empty mid-stream).
-- **Per-run output files.** Each Start opens up to four paired files
-  under one app-private root, sharing a `YYYY-MM-DD_HH-MM-SS` timestamp:
+- **Per-run output: temp dir then zip.** Each session writes into a
+  fresh temp working directory (`NSTemporaryDirectory()/livetranslate-<stamp>/`).
+  All artifacts (per-source WAVs, per-source SRTs, live-merged
+  per-language SRTs, JSONL log) land there immediately as they're
+  produced. At Stop the MKV is built in-place (ffmpeg, if available),
+  then `/usr/bin/zip` packs the directory into
+  `~/Documents/LiveTranslate/<stamp>.zip` and the temp dir is
+  deleted. Layout inside the zip:
 
   ```
-  ~/Documents/LiveTranslate/
-      transcripts/<stamp>.jsonl       ← every dropped sentence
-      transcripts/<stamp>.<src>.srt   ← SubRip subtitles, source language
-      transcripts/<stamp>.<tgt>.srt   ← SubRip subtitles, target language
-      recordings/<stamp>.wav          ← mixed mic+system audio
+  <stamp>/
+      <stamp>.jsonl                       ← every sentence (source-tagged)
+      <stamp>.mic.<src>.srt               ← per-source SRTs, source language
+      <stamp>.mic.<tgt>.srt
+      <stamp>.system.<src>.srt
+      <stamp>.system.<tgt>.srt
+      <stamp>.<lang>.srt                  ← merged SRT per language ([Mic]/[Sys])
+      <stamp>.mic.wav                     ← post-denoise + AGC audio
+      <stamp>.system.wav
+      <stamp>.mkv                         ← 640×360 black + amix audio + SRTs
   ```
 
-  The `.srt` files use cue times measured from the start of the
-  recording (so they play in sync with the paired `.wav`) and are
-  plain text — `grep` works as a transcript search tool. Skipped when
-  source == target (no point translating into itself). SRT was chosen
-  over WebVTT / LRC / custom plaintext because every video player
-  (VLC, QuickTime, mpv, browsers via `<track>`, ffmpeg) reads it
-  natively, AND it's readable enough to cat.
+  SRTs are written live during the session — both per-source files
+  (one cue per sentence as it graduates) and the merged ones
+  (in-memory re-sort + atomic rewrite on each graduate). MKVExporter
+  consumes the already-merged files; it doesn't re-merge. If ffmpeg
+  isn't installed, no `.mkv` is produced and the zip just contains
+  the audio + SRTs + JSONL.
 
   The transcript line shape:
   ```json

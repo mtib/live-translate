@@ -1,188 +1,68 @@
 # LiveTranslate
 
-Floating, translucent macOS app that captures **your microphone *and* the
-audio your Mac is playing** at the same time, transcribes them on-device
-(or via Apple's server fallback), and translates the result into the
-target language of your choice — all in one rolling, hover-able window.
-
-Built with SwiftPM and a CMake-driven dependency on
-[whisper.cpp](https://github.com/ggerganov/whisper.cpp) — no Xcode project required.
+Floating, translucent macOS app that captures your **microphone and
+system audio** in parallel, transcribes both on-device via
+[whisper.cpp](https://github.com/ggerganov/whisper.cpp), and translates
+the result with Apple's `Translation` framework. Each session lands
+as a single zip in `~/Documents/LiveTranslate/<stamp>.zip` containing
+both `.wav`s, the per-source + merged SRTs, the JSONL log, and a
+ready-to-watch `.mkv` (640×360 black background, both subtitle tracks
+embedded).
 
 ![Default layout](docs/default.png)
-
 ![Compact layout](docs/compact.png)
 
 ## Build & run
 
 ```sh
-./build.sh
+brew install cmake ffmpeg     # one-time
+./dev-setup.sh                # pre-download GGML models into models/  (optional but recommended)
+./build.sh                    # ~60–90 s the first time, ~5 s after
 open build/LiveTranslate.app
 ```
 
-Prerequisites:
-- Apple Command Line Tools (`xcode-select --install`).
-- CMake (`brew install cmake`). Used once on first build to compile
-  whisper.cpp; cached after.
+The build clones `whisper.cpp` v1.7.4 into `external/`, compiles it
+to static archives, picks the GGML model from `models/` (or downloads
+into `build/whisper-models/`), and bundles it into the `.app`. Default
+bundled model is `ggml-small-q5_1.bin` (~190 MB). Set
+`WHISPER_MODEL=ggml-tiny-q5_1.bin` (or another file from `models/`)
+before `./build.sh` and update
+`WhisperCppTranscriber.bundledModelName` to match if you want a
+different one.
 
-The first run of `./build.sh` clones whisper.cpp v1.7.4 into `external/`,
-builds it into static libraries under `build/whisper-prefix/`, and
-downloads the bundled `ggml-base-q5_1.bin` model (~57 MB) into
-`build/whisper-models/`. The model is then copied into the `.app`'s
-`Contents/Resources/` so the user doesn't need to fetch it separately.
-The first build takes ~60-90 seconds. Subsequent builds skip these
-steps and complete in a few seconds.
+## One-time macOS setup
 
-## ⚠️ One-time setup: translation language pack
+- **Translation language pack.** Apple downloads pairs on demand —
+  add yours under **System Settings → Apple Intelligence & Siri →
+  Translation Languages** before first run, otherwise the translation
+  panel stays empty.
+- **Permissions** (Microphone + Screen Recording). Prompted on first
+  launch.
+- **Persistent permissions across rebuilds.** Ad-hoc signing churns
+  the `cdhash` every build and macOS re-prompts. Create a self-signed
+  cert in Keychain Access → Certificate Assistant (name e.g.
+  `LiveTranslateDev`, Code Signing, Self Signed Root), then
+  `export LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev` — `build.sh`
+  picks it up.
 
-Apple's `Translation` framework only downloads language pairs **on
-demand**. Do this *before* the first run or the translation panel will
-stay empty:
+## How it works (one paragraph)
 
-Open **System Settings → Apple Intelligence & Siri → Translation
-Languages** (or, on slightly older macOS, **System Settings → General →
-Language & Region → Translation Languages**) and add both your source
-and target languages.
+Mic via `AVAudioEngine`, system via `ScreenCaptureKit`. Each stream
+goes through its own `RNNoise` instance and an envelope-follower AGC
+(SIMD via Accelerate). The two streams are kept independent end-to-end
+— their own audio recorders, their own per-source SRT files, their
+own `WhisperCppTranscriber.transcribe(...)` call (shared `ctx`,
+`NSLock` around `whisper_full` so the two streams take turns). Whisper
+is fed in 1–5 s chunks closed on silence; each closed chunk reserves a
+UI row that flips through *listening → transcribing → translating*
+and graduates to a final sentence. Mic samples during system
+playback are zeroed upstream of the broadcaster (cross-talk gate), so
+the mic `.wav` doesn't carry speaker bleed. At Stop, the work
+directory is built into an MKV via ffmpeg's `amix` and zipped to
+`~/Documents/LiveTranslate/<stamp>.zip`.
 
-Transcription itself doesn't need any system download — whisper.cpp
-runs against a model bundled inside the app. Just pick the source
-language in the UI and start talking.
-
-To use a larger / different whisper model, drop a GGML `.bin` named
-`ggml-base-q5_1.bin` into `~/Documents/LiveTranslate/models/` — the app
-picks that up in preference to the bundled default. Grab alternatives
-(tiny, small, medium, large variants — quantized or full-precision)
-from <https://huggingface.co/ggerganov/whisper.cpp>.
-
-## Permissions
-
-First launch prompts for:
-- **Microphone** — to capture your voice.
-- **Screen Recording** — required by `ScreenCaptureKit` to access system
-  audio. No screen frames are kept; only the audio stream is used.
-
-### Persisting permissions across rebuilds
-
-By default `build.sh` ad-hoc-signs the bundle, which means every
-rebuild produces a fresh `cdhash` and macOS re-prompts for permissions.
-To persist mic + screen-recording grants across rebuilds, sign with a
-stable self-signed code-signing certificate:
-
-1. Open **Keychain Access** → menu **Keychain Access → Certificate
-   Assistant → Create a Certificate…**
-2. Name: `LiveTranslateDev` (any name works). Identity Type: **Self
-   Signed Root**. Certificate Type: **Code Signing**. Click *Create*.
-3. Build with the env var set, then `open` the app and grant
-   permissions one last time:
-   ```sh
-   LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev ./build.sh
-   open build/LiveTranslate.app
-   ```
-4. Future builds reuse the same identity — TCC keys the grants on the
-   certificate, not on the binary hash, so the permissions stick.
-
-You can also export the variable in your shell rc so you don't have to
-prefix every invocation.
-
-## How it works (one-paragraph version)
-
-The mic feeds an `AVAudioEngine` tap; system audio comes from
-`ScreenCaptureKit` (audio-only configuration). Each stream stays
-independent — both are 48 kHz mono Float32, each goes through its
-**own** copy of [xiph/rnnoise](https://github.com/xiph/rnnoise) (a tiny
-GRU-based denoiser, BSD 3-clause), then each is downsampled to 16 kHz
-and fed to [whisper.cpp](https://github.com/ggerganov/whisper.cpp) in
-chunks (closed at silence or after 5 s). The two streams share one
-whisper model + a mutex around `whisper_full`, so they're transcribed
-in chunk-arrival order without contention. Recognized sentences are
-translated per-sentence via Apple's `Translation` framework and tagged
-with their source stream in the UI (faint warm tint = mic, faint cool
-tint = system). Old sentences eventually drop into a per-run JSONL
-archive paired with per-stream `.wav` + `.srt` files:
-
-```
-~/Documents/LiveTranslate/
-    transcripts/<stamp>.jsonl                       (mic + system interleaved, "source" field)
-    transcripts/<stamp>.mic.<src>.srt              (mic subtitles, source language)
-    transcripts/<stamp>.mic.<tgt>.srt              (mic subtitles, translated)
-    transcripts/<stamp>.system.<src>.srt           (system subtitles, source language)
-    transcripts/<stamp>.system.<tgt>.srt           (system subtitles, translated)
-    recordings/<stamp>.mic.wav                     (post-denoise mic, 48 kHz mono)
-    recordings/<stamp>.system.wav                  (post-denoise system, 48 kHz mono)
-```
-
-The `.srt` files use cue times relative to the start of the matching
-`.wav`, so you can drop them straight into a video player along with
-the audio. They're also plain text — `grep -i term *.srt` works.
-
-## Reviewing a run
-
-You usually want both streams playing simultaneously and one merged
-subtitle track per language. Two steps:
-
-**Step 1: merge SRTs.** `tools/merge-srt.py` reads the two per-source
-SRTs and interleaves them into one, tagging each cue with `[Mic]` or
-`[Sys]` so the speaker is obvious:
-
-```sh
-STAMP=2026-05-17_13-46-19   # ← change to the run you want
-REPO=/path/to/live-translate   # ← wherever you cloned this repo
-cd ~/Documents/LiveTranslate
-
-"${REPO}/tools/merge-srt.py" \
-    "transcripts/${STAMP}.mic.de.srt" "transcripts/${STAMP}.system.de.srt" \
-    "transcripts/${STAMP}.de.srt"
-"${REPO}/tools/merge-srt.py" \
-    "transcripts/${STAMP}.mic.en.srt" "transcripts/${STAMP}.system.en.srt" \
-    "transcripts/${STAMP}.en.srt"
-```
-
-**Step 2: build the MKV.** ffmpeg's `amix` filter sums the two WAVs at
-the same wall-clock rate (both start at the run's t=0). Both merged
-subtitle tracks embed; toggle in your player's *Subtitle → Sub Track*
-menu:
-
-```sh
-ffmpeg -y \
-  -f lavfi -i color=c=black:s=960x180:r=2 \
-  -i "recordings/${STAMP}.mic.wav" \
-  -i "recordings/${STAMP}.system.wav" \
-  -i "transcripts/${STAMP}.de.srt" \
-  -i "transcripts/${STAMP}.en.srt" \
-  -filter_complex "[1:a][2:a]amix=inputs=2:normalize=0[aout]" \
-  -map 0:v -map "[aout]" -map 3 -map 4 \
-  -c:v libx264 -preset ultrafast -tune stillimage \
-  -c:a aac -c:s srt \
-  -metadata:s:s:0 language=deu \
-  -metadata:s:s:1 language=eng \
-  -disposition:s:0 default \
-  -shortest "${STAMP}.mkv"
-```
-
-Adjust the two `language=` codes (`deu`, `eng`, `fra`, `spa`, `nld`…)
-to match your actual source/target. `normalize=0` keeps mic and system
-at their original loudness; switch to `=1` if one dominates the mix.
-
-If you want subtitles **burned in** (one fixed language, playable in
-any tool that can't toggle tracks):
-
-```sh
-ffmpeg -y \
-  -f lavfi -i color=c=black:s=960x180:r=10 \
-  -i "recordings/${STAMP}.mic.wav" \
-  -i "recordings/${STAMP}.system.wav" \
-  -filter_complex "[1:a][2:a]amix=inputs=2:normalize=0[aout]" \
-  -vf "subtitles=filename=transcripts/${STAMP}.en.srt" \
-  -map 0:v -map "[aout]" \
-  -c:v libx264 -preset ultrafast -tune stillimage -c:a aac \
-  -shortest "${STAMP}.en.mp4"
-```
-
-(`subtitles=` requires an ffmpeg built with libass — the Homebrew
-default. If you see *"No such filter: 'subtitles'"*, `brew reinstall
-ffmpeg`.)
-
-See [CLAUDE.md](CLAUDE.md) for full architectural notes, the things
-that have bitten us, and the file-by-file map.
+See [CLAUDE.md](CLAUDE.md) for the file-by-file map, architecture
+diagram, and the lessons learned along the way.
 
 ## Debug log
 

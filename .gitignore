@@ -7,6 +7,11 @@ Package.resolved
 # Not vendored to keep the repo lean; recreated on every fresh checkout.
 external/
 
+# Local model cache populated by ./dev-setup.sh — large binary GGML
+# files. The build pulls from here first, falling back to downloading
+# into build/ if a model isn't cached.
+models/
+
 # whisper.cpp public headers — mirrored into the bridge target by
 # tools/build-whisper.sh so SwiftPM's clang-module sandbox can find them
 # at `import CWhisper` time. Kept out of git: the build script

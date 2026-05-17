@@ -124,10 +124,19 @@ final class Pipeline: ObservableObject {
     /// here, distinguished by the `source` field.
     private var archive: TranscriptArchive?
     /// One per-stream pipeline per `SourceTag`. Each owns its recorder
-    /// and SRT writers. Held here so `stop()` can signal each one to
-    /// drain its audio source, and so `archiveDrop` can route SRT
-    /// writes to the right per-source file.
+    /// and per-source SRT writers. Held here so `stop()` can signal
+    /// each one to drain its audio source, and so `recordSentence`
+    /// can route per-source SRT writes to the right files.
     private var sourcePipelines: [SourceTag: SourcePipeline] = [:]
+    /// Live merged-SRT writers, one per language. Updated whenever a
+    /// sentence graduates so the file on disk tracks the session in
+    /// real time. `MKVExporter` reads from these at session end —
+    /// it doesn't re-merge.
+    private var mergedSubtitles: [String: MergedSubtitleArchive] = [:]
+    /// Where session artifacts live during the run + where the final
+    /// zip lands. Captured at run start so the cleanup path can read
+    /// it after `defer` clears the rest of the state.
+    private var currentOutputs: Paths.Outputs?
 
     /// Set by a settings-change observer; read by run()'s defer. When
     /// true after the current run winds down, defer spawns a fresh run.
@@ -278,9 +287,9 @@ final class Pipeline: ObservableObject {
     /// Turn an inflight chunk into a `Sentence`. The Sentence gets a
     /// **fresh** UUID — reusing the chunk's UUID would collide with
     /// the inflight row's `.id()` in SwiftUI's LazyVStack and break
-    /// the row swap (the View can't morph between two different
-    /// concrete View types under one identity). Distinct UUIDs let
-    /// SwiftUI run a clean remove-then-insert transition.
+    /// the row swap. The sentence is also archived immediately to
+    /// JSONL + per-source SRT + merged SRT(s) so the work-dir files
+    /// stay live throughout the session (not just at end).
     private func graduate(
         id: UUID, source: SourceTag, text: String, translation: String,
         createdAt: Date, endsAt: Date
@@ -291,7 +300,30 @@ final class Pipeline: ObservableObject {
         )
         sentences.append(sentence)
         inflightChunks.removeAll { $0.id == id }
+        recordSentence(sentence)
         enforceMaxCount()
+    }
+
+    /// Write a freshly-graduated sentence to every persistent output:
+    /// shared JSONL, per-source SRTs (via `SourcePipeline.archiveSRT`),
+    /// and per-language merged SRTs (with `[Mic]` / `[Sys]` prefix).
+    /// All writes are queue-backed so this returns immediately.
+    private func recordSentence(_ s: Sentence) {
+        archive?.append(s)
+        let prefix = "[\(s.source.shortLabel)]"
+        let start = s.createdAt.timeIntervalSince(runStartedAt)
+        let end = max(start, s.endsAt.timeIntervalSince(runStartedAt))
+        sourcePipelines[s.source]?.archiveSRT(s)
+        // Source-language merged: always.
+        let srcLang = String(source.identifier.prefix(2))
+        mergedSubtitles[srcLang]?.add(text: s.text, prefix: prefix, startSeconds: start, endSeconds: end)
+        // Target-language merged: only if translation present and
+        // distinct from source. Otherwise we'd write the same text
+        // twice or write into the same file.
+        let tgtLang = target.code
+        if tgtLang != srcLang, !s.translation.isEmpty {
+            mergedSubtitles[tgtLang]?.add(text: s.translation, prefix: prefix, startSeconds: start, endSeconds: end)
+        }
     }
 
     // MARK: - Public controls
@@ -364,32 +396,31 @@ final class Pipeline: ObservableObject {
         (translator as? AppleTranslator)?.setSession(session)
     }
 
-    /// Flush every still-visible sentence to every output, then block
-    /// briefly so queued writes (transcript + audio + SRTs) land on
-    /// disk. Safe to call from `applicationWillTerminate`. Idempotent.
+    /// Block until queued writes hit disk. Sentences are already
+    /// archived on graduate (`recordSentence`); this just awaits the
+    /// per-writer dispatch queues so nothing is in flight when the
+    /// process exits. Safe to call from `applicationWillTerminate`.
     func flushPendingSentences() {
-        for s in sentences { archiveDrop(s) }
         archive?.flush()
         for sp in sourcePipelines.values { sp.flush() }
-        sentences = []
+        for merged in mergedSubtitles.values { merged.flush() }
     }
 
     // MARK: - Run loop
 
     private func run() async {
         isActive = true
+        // The defer only clears terminal state. Disk flushes + MKV +
+        // zip happen explicitly below so the exporter and zipper see
+        // complete files.
         defer {
-            // Flush still-visible sentences and any in-flight chunk
-            // that we have transcribed text for, so clean Stop persists
-            // everything the user could see at the moment they pressed it.
-            for s in sentences { archiveDrop(s) }
-            archive?.flush()
-            for sp in sourcePipelines.values { sp.flush() }
             if case .stopped = status { } else { status = .idle }
             runTask = nil
             isActive = false
             archive = nil
             sourcePipelines.removeAll()
+            mergedSubtitles.removeAll()
+            currentOutputs = nil
             inflightChunks.removeAll()
             if restartRequested {
                 restartRequested = false
@@ -431,8 +462,8 @@ final class Pipeline: ObservableObject {
             status = .stopped(reason: "Audio: \(error.localizedDescription)"); return
         }
 
-        // 3. Open output files. One shared JSONL; per-source WAVs and
-        //    per-(source,language) SRTs.
+        // 3. Open output files. All session artifacts go into a temp
+        //    work dir; we zip + delete it after the MKV is built.
         runStartedAt = Date()
         let srcLangCode = String(source.identifier.prefix(2))
         let tgtLangCode = target.code
@@ -441,11 +472,12 @@ final class Pipeline: ObservableObject {
             outputs = try Paths.newRunOutputs(now: runStartedAt)
             archive = try TranscriptArchive(at: outputs.transcript)
         } catch {
-            Log.line("Pipeline: opening JSONL archive failed: \(error.localizedDescription)")
+            Log.line("Pipeline: opening work dir failed: \(error.localizedDescription)")
             for src in denoised.values { await src.stop() }
             status = .stopped(reason: "Output: \(error.localizedDescription)")
             return
         }
+        currentOutputs = outputs
 
         // 4. Build per-source pipelines with their own recorder + SRTs.
         for tag in SourceTag.allCases {
@@ -466,7 +498,14 @@ final class Pipeline: ObservableObject {
                 targetSubs: targetSubs
             )
         }
-        Log.line("Run outputs: \(outputs.timestamp) (.jsonl, 2 .wav, per-source SRTs)")
+        // 4b. Open live merged-SRT archives, one per distinct language.
+        let allLangs: [String] = (srcLangCode == tgtLangCode) ? [srcLangCode] : [srcLangCode, tgtLangCode]
+        for lang in allLangs {
+            if let merged = try? MergedSubtitleArchive(at: outputs.mergedSubtitle(lang)) {
+                mergedSubtitles[lang] = merged
+            }
+        }
+        Log.line("Run outputs: \(outputs.workDir.path) → \(outputs.zipDestination.lastPathComponent)")
 
         status = .running
 
@@ -494,6 +533,19 @@ final class Pipeline: ObservableObject {
 
         // 8. Final audio cleanup. Each `stop()` is idempotent.
         for sp in sourcePipelines.values { await sp.stop() }
+
+        // 9. Finalize: flush writers, build MKV, zip work dir → docs.
+        //    UI shows a spinner throughout. Sentences themselves are
+        //    already archived (`recordSentence` ran on each graduate),
+        //    so flushing just awaits the disk queues to drain.
+        status = .finalizing
+        archive?.flush()
+        for sp in sourcePipelines.values { sp.flush() }
+        for merged in mergedSubtitles.values { merged.flush() }
+        Log.line("Pipeline: finalize — writers flushed, building MKV")
+        await MKVExporter.export(outputs: outputs, langs: allLangs)
+        Log.line("Pipeline: zipping work dir → \(outputs.zipDestination.lastPathComponent)")
+        await ZipArchiver.zipAndCleanup(directory: outputs.workDir, into: outputs.zipDestination)
     }
 
     // MARK: - Translation cache
@@ -533,7 +585,7 @@ final class Pipeline: ObservableObject {
         while i >= 0 {
             let s = sentences[i]
             if !protected.contains(s.id) && s.lastModified < cutoff {
-                dropSentence(at: i)
+                sentences.remove(at: i)
             }
             i -= 1
         }
@@ -543,26 +595,10 @@ final class Pipeline: ObservableObject {
         while sentences.count > maxSentenceCount {
             let protected = protectedIDs()
             if let i = sentences.firstIndex(where: { !protected.contains($0.id) }) {
-                dropSentence(at: i)
+                sentences.remove(at: i)
             } else {
                 break
             }
         }
-    }
-
-    /// Single point that archives, then drops a sentence. Always use this
-    /// rather than `sentences.remove(at:)` directly.
-    private func dropSentence(at idx: Int) {
-        archiveDrop(sentences[idx])
-        sentences.remove(at: idx)
-    }
-
-    /// Fan one outgoing sentence to every writer: shared JSONL (with
-    /// the sentence's source tag) and the matching per-source SRT
-    /// files. Audio recorders are fed elsewhere — each SourcePipeline
-    /// subscribes to its denoised broadcaster directly.
-    private func archiveDrop(_ s: Sentence) {
-        archive?.append(s)
-        sourcePipelines[s.source]?.archiveSRT(s)
     }
 }

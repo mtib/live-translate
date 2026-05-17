@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import Accelerate
 
 /// Wraps any `AudioSource` and applies `RNNoise` to its 48 kHz mono
 /// Float32 buffers before re-broadcasting. Each input stream (mic,
@@ -26,6 +27,36 @@ final class DenoisingAudioSource: AudioSource {
     /// same muted audio. Pipeline wires this on the mic instance to
     /// suppress speaker bleed during system playback.
     private let muteWhen: (@Sendable () -> Bool)?
+
+    // MARK: - Auto-gain control
+    //
+    // Each stream (mic / system) typically arrives at very different
+    // loudness levels; the mic depends on speaker distance and gain
+    // staging, system audio on the source app's mastering. Without
+    // AGC, one stream often dominates the mix and the quieter one
+    // gets buried (both in the WAV/MKV mix and in whisper's input).
+    //
+    // We run a lightweight envelope-follower AGC per instance:
+    //   - measure each buffer's RMS via `vDSP_measqv` (SIMD)
+    //   - smooth a long-term EMA of RMS over voiced buffers only
+    //   - compute a target gain that brings the EMA toward
+    //     `agcTargetRMS`, capped between `agcMinGain` and `agcMaxGain`
+    //   - smooth the *applied* gain itself (slow ramp) to avoid pumping
+    //   - apply via `vDSP_vsmul` (SIMD multiply)
+    //
+    // The gain is only updated when the input has voiced signal
+    // (rms > noise floor); silence preserves the previous gain so the
+    // next utterance isn't blasted at max. Both apply paths
+    // (recorder + transcriber) see the gained buffer because the
+    // multiply happens in the same place the buffer is emitted.
+    private static let agcTargetRMS: Float = 0.1
+    private static let agcMinGain: Float = 1.0   // never attenuate; only boost
+    private static let agcMaxGain: Float = 8.0
+    private static let agcNoiseFloor: Float = 0.003  // below this, treat as silence
+    private static let agcEnvelopeAlpha: Float = 0.08   // EMA on input RMS
+    private static let agcGainSmoothing: Float = 0.06   // EMA on applied gain
+    private var agcGain: Float = 1.0
+    private var agcRMSAvg: Float = 0.0
 
     /// Pump task: pulls denoised samples through RNNoise and re-emits.
     /// Lifetime is bounded by the upstream's `buffers` stream — when
@@ -93,6 +124,11 @@ final class DenoisingAudioSource: AudioSource {
             // garbage.
             memset(outData.advanced(by: drained), 0, (n - drained) * MemoryLayout<Float>.size)
         }
+        // Auto-gain (SIMD, Accelerate). Adapt to the stream's loudness
+        // before the crosstalk gate so the gate-mute is true silence,
+        // not muted-but-loud-noise. Updates the running gain only on
+        // voiced buffers so silence keeps the previous gain.
+        applyAGC(to: outData, count: n)
         // Crosstalk gate (mic only, when system is voiced) — replace
         // the whole buffer with silence. Done AFTER denoising so the
         // RNNoise GRU stays in a sensible state on the next non-muted
@@ -101,5 +137,34 @@ final class DenoisingAudioSource: AudioSource {
             memset(outData, 0, n * MemoryLayout<Float>.size)
         }
         return out
+    }
+
+    /// Envelope-follower AGC. Measures buffer RMS via `vDSP_measqv`,
+    /// updates a long-term RMS EMA (only on voiced buffers), targets
+    /// `agcTargetRMS`, smooths the gain itself, then applies via
+    /// `vDSP_vsmul`. All operations are SIMD-vectorised by Accelerate.
+    private func applyAGC(to buffer: UnsafeMutablePointer<Float>, count: Int) {
+        // 1. Buffer mean-square → RMS.
+        var meanSquare: Float = 0
+        vDSP_measqv(buffer, 1, &meanSquare, vDSP_Length(count))
+        let bufRMS = sqrt(meanSquare)
+
+        // 2. EMA of input RMS (only when voiced — silence shouldn't
+        //    drag the average down and amplify noise on the next word).
+        if bufRMS > Self.agcNoiseFloor {
+            agcRMSAvg = (1 - Self.agcEnvelopeAlpha) * agcRMSAvg + Self.agcEnvelopeAlpha * bufRMS
+
+            // 3. Target gain brings the EMA toward agcTargetRMS,
+            //    clamped to [agcMinGain, agcMaxGain].
+            let raw = Self.agcTargetRMS / max(agcRMSAvg, Self.agcNoiseFloor)
+            let targetGain = min(max(raw, Self.agcMinGain), Self.agcMaxGain)
+
+            // 4. Smooth the applied gain to avoid pumping.
+            agcGain = (1 - Self.agcGainSmoothing) * agcGain + Self.agcGainSmoothing * targetGain
+        }
+
+        // 5. Multiply in place: buffer *= agcGain  (SIMD).
+        var gain = agcGain
+        vDSP_vsmul(buffer, 1, &gain, buffer, 1, vDSP_Length(count))
     }
 }

@@ -20,12 +20,14 @@ SRC_DIR="external/whisper.cpp"
 BUILD_DIR="build/whisper-build"
 PREFIX_DIR="build/whisper-prefix"
 MODEL_DIR="build/whisper-models"
-# Multilingual large-v3-turbo, Q5_0-quantized. ~570 MB. Materially
-# more accurate than the smaller models while still real-time-friendly
-# on Apple Silicon (the "turbo" variant is a distilled large model
-# designed for streaming). MIT-licensed (Whisper weights from OpenAI,
-# GGML repackaging by ggerganov on Hugging Face).
-MODEL_NAME="${WHISPER_MODEL:-ggml-large-v3-turbo-q5_0.bin}"
+# Multilingual `small` Q5_1, ~190 MB. ~2× faster than large-v3-turbo
+# at modestly lower transcription quality — a good trade for live use
+# where end-to-end latency matters more than nuance. Swap to a heavier
+# model (e.g. `ggml-large-v3-turbo-q5_0.bin`) by exporting WHISPER_MODEL
+# before running `./build.sh`, and remember to update
+# `WhisperCppTranscriber.bundledModelName` to match. MIT-licensed
+# (Whisper weights from OpenAI, GGML repackaging by ggerganov).
+MODEL_NAME="${WHISPER_MODEL:-ggml-small-q5_1.bin}"
 MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/${MODEL_NAME}"
 
 # --force wipes the prefix; the rebuild then re-clones if SRC_DIR is also
@@ -115,13 +117,19 @@ if [[ "${SKIP_LIB_BUILD}" == "0" ]]; then
   cp "${PREFIX_DIR}/include/"*.h "Sources/CWhisper/include/"
 fi
 
-# Model download. Bundled into the .app by build.sh so the user doesn't
-# need to run any curl commands. Cached on disk; only re-downloaded if
-# the file is missing or empty.
+# Model. Prefer the repo-local `models/` cache (populated by
+# `./dev-setup.sh` so switching `WHISPER_MODEL` between builds doesn't
+# trigger a re-download). Fall back to downloading into
+# `build/whisper-models/` if the file isn't cached.
 mkdir -p "${MODEL_DIR}"
 MODEL_PATH="${MODEL_DIR}/${MODEL_NAME}"
-if [[ ! -s "${MODEL_PATH}" ]]; then
-  echo "→ downloading ${MODEL_NAME} (one-time, ~570 MB)"
+LOCAL_CACHE="models/${MODEL_NAME}"
+if [[ -s "${LOCAL_CACHE}" ]]; then
+  if [[ ! -s "${MODEL_PATH}" ]]; then
+    cp "${LOCAL_CACHE}" "${MODEL_PATH}"
+  fi
+elif [[ ! -s "${MODEL_PATH}" ]]; then
+  echo "→ downloading ${MODEL_NAME} (~190 MB; consider running ./dev-setup.sh once to cache it)"
   if command -v curl >/dev/null 2>&1; then
     curl -L --fail --progress-bar -o "${MODEL_PATH}.partial" "${MODEL_URL}"
   elif command -v wget >/dev/null 2>&1; then

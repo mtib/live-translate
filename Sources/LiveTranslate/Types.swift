@@ -163,6 +163,7 @@ enum PipelineStatus: Equatable {
     case requestingPermissions
     case starting
     case running
+    case finalizing            // Stop pressed; draining writers + exporting MKV
     case stopped(reason: String)
 
     var description: String {
@@ -171,18 +172,25 @@ enum PipelineStatus: Equatable {
         case .requestingPermissions: return "Requesting permission…"
         case .starting: return "Starting…"
         case .running: return "Listening"
+        case .finalizing: return "Finalizing…"
         case .stopped(let r): return "Stopped: \(r)"
         }
     }
 
-    /// True when the pipeline is doing something the user-visible status
-    /// dot should pulse for. Pure presentation concern, lives here so the
-    /// View doesn't have to enumerate cases.
+    /// True when the pipeline is doing something the user-visible
+    /// indicator should reflect as in-progress.
     var isLive: Bool {
         switch self {
-        case .running, .starting, .requestingPermissions: return true
+        case .running, .starting, .requestingPermissions, .finalizing: return true
         default: return false
         }
+    }
+
+    /// While finalizing the Start/Stop button shows a spinner instead
+    /// of `play.fill` / `stop.fill`.
+    var isFinalizing: Bool {
+        if case .finalizing = self { return true }
+        return false
     }
 }
 

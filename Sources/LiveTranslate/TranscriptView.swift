@@ -132,27 +132,41 @@ struct TranscriptView: View {
 
     // MARK: - Building blocks
 
-    /// Start/Stop. Stays compact in compact-mode (icon-only) and shows a
-    /// label in full mode.
+    /// Start/Stop with a spinner state during finalize (writers
+    /// flushing + MKV export). Disabled while spinning so the user
+    /// can't kick off a new session mid-export.
     private func primaryButton(compact: Bool) -> some View {
-        Button {
+        let finalizing = pipeline.status.isFinalizing
+        return Button {
             pipeline.toggle()
         } label: {
             if compact {
-                Image(systemName: pipeline.isRunning ? "stop.fill" : "play.fill")
-                    .font(.system(size: 11, weight: .semibold))
-                    .frame(width: 14, height: 14)
+                if finalizing {
+                    ProgressView()
+                        .controlSize(.small)
+                        .frame(width: 14, height: 14)
+                } else {
+                    Image(systemName: pipeline.isRunning ? "stop.fill" : "play.fill")
+                        .font(.system(size: 11, weight: .semibold))
+                        .frame(width: 14, height: 14)
+                }
             } else {
                 HStack(spacing: 5) {
-                    Image(systemName: pipeline.isRunning ? "stop.fill" : "play.fill")
-                        .font(.system(size: 10, weight: .semibold))
-                    Text(pipeline.isRunning ? "Stop" : "Start")
+                    if finalizing {
+                        ProgressView().controlSize(.small)
+                        Text("Finalizing…")
+                    } else {
+                        Image(systemName: pipeline.isRunning ? "stop.fill" : "play.fill")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text(pipeline.isRunning ? "Stop" : "Start")
+                    }
                 }
             }
         }
         .buttonStyle(.bordered)
         .controlSize(compact ? .small : .regular)
-        .tint(pipeline.isRunning ? .red : .accentColor)
+        .tint(finalizing ? .secondary : (pipeline.isRunning ? .red : .accentColor))
+        .disabled(finalizing)
         .keyboardShortcut(.return, modifiers: [])
     }
 
