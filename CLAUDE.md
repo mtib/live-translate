@@ -100,11 +100,13 @@ ScreenCaptureKit) without touching `Pipeline`.
 
   The transcript line shape:
   ```json
-  {"time":"2026-05-16T22:13:07.123Z","transcription":"…","translation":"…"}
+  {"end":"2026-05-16T22:13:09.581Z","start":"2026-05-16T22:13:07.123Z","transcription":"…","translation":"…"}
   ```
-  Keys sorted for grep/diff stability, ISO-8601 timestamps,
-  `transcription` and `translation` always present (translation may be
-  empty if the recognizer hadn't translated it yet).
+  Keys sorted for grep/diff stability, ISO-8601 timestamps with
+  fractional seconds. `start` is when the sentence first appeared,
+  `end` is when its text last changed (matching the SRT cue times).
+  `transcription` / `translation` always present; `translation` may be
+  empty if the translator hadn't gotten to it yet.
 
   The `.wav` is 16 kHz mono signed-16-bit linear PCM (AVAudioFile auto-
   converts our Float32 buffers on the write path). One sample = exactly

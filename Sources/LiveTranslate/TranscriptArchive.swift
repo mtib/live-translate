@@ -6,12 +6,12 @@ import Foundation
 ///
 /// One JSON object per line:
 ///
-///     {"time":"2026-05-16T22:13:07.123Z","transcription":"…","translation":"…"}
+///     {"end":"2026-05-16T22:13:09.581Z","start":"2026-05-16T22:13:07.123Z","transcription":"…","translation":"…"}
 ///
-/// `time` is ISO-8601 with fractional seconds. Both `transcription` and
-/// `translation` are always present (empty strings allowed). Schema is
-/// intentionally stable so consumers (`jq`, pandas, etc.) can load
-/// without surprises.
+/// `start` / `end` are ISO-8601 with fractional seconds, marking when
+/// the sentence first appeared and when its text last changed. Both
+/// `transcription` and `translation` are always present (empty strings
+/// allowed). Sorted keys for grep/diff stability.
 ///
 /// Writes go through a serial queue so the MainActor (where prune runs)
 /// never blocks on disk IO.
@@ -46,7 +46,8 @@ final class TranscriptArchive {
     /// happens asynchronously on the archive's queue.
     func append(_ sentence: Sentence) {
         let record = Record(
-            time: Self.isoFormatter.string(from: sentence.lastModified),
+            start: Self.isoFormatter.string(from: sentence.createdAt),
+            end: Self.isoFormatter.string(from: sentence.lastModified),
             transcription: sentence.text,
             translation: sentence.translation
         )
@@ -66,7 +67,8 @@ final class TranscriptArchive {
     }
 
     private struct Record: Encodable {
-        let time: String
+        let start: String
+        let end: String
         let transcription: String
         let translation: String
     }
