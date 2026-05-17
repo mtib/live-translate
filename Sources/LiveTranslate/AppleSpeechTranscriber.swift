@@ -139,15 +139,15 @@ final class AppleSpeechTranscriber: Transcriber {
     /// How much continuous silence (in seconds) inside one recognition
     /// session triggers a forced `endAudio()` — which lets Apple emit
     /// a final result with proper timestamps so the pause-aware splitter
-    /// can break the text into multiple sentences. Sized to be longer
-    /// than a "thinking pause" so we don't chop mid-thought; speaker
-    /// turn-changes typically have more dead air than that.
-    static var endSessionAfterSilence: TimeInterval = 1.8
+    /// can break the text into multiple sentences. Tuned between
+    /// "aggressive" (1.0 s — chopped mid-thought) and "relaxed" (1.8 s —
+    /// sometimes glued multiple turns together).
+    static var endSessionAfterSilence: TimeInterval = 1.4
 
     /// Ignore the silence detector for this long after a session starts —
     /// Apple's recognizer often opens with a brief calibration silence
     /// that we don't want to count as a sentence break.
-    static var sessionWarmup: TimeInterval = 1.5
+    static var sessionWarmup: TimeInterval = 1.25
 
     /// Soft cap on a running sentence's word count. When the splitter has
     /// accumulated this many tokens and then encounters a comma, it
