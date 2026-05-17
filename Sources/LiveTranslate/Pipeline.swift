@@ -40,6 +40,27 @@ final class Pipeline: ObservableObject {
     @Published private(set) var status: PipelineStatus = .idle
     @Published private(set) var sentences: [Sentence] = []
 
+    /// Per-source "currently accumulating voiced audio into a chunk"
+    /// signal — drives the mic icon in the UI top bar. Set by the
+    /// transcriber's accumulator on voice onset; cleared on chunk
+    /// close or audio-stream end.
+    @Published private(set) var capturingVoice: [SourceTag: Bool] = [:]
+
+    /// Per-source "whisper is currently running on a chunk from this
+    /// stream" signal — drives the transcribing icon. Set by the
+    /// worker when entering `whisper_full`; cleared on return.
+    @Published private(set) var transcribingChunk: [SourceTag: Bool] = [:]
+
+    /// Called from `WhisperCppTranscriber` callbacks (background
+    /// tasks) to update the UI's busy state. Hops to MainActor to
+    /// publish so the `@Published` write is safe.
+    nonisolated func updateActivity(source: SourceTag, capturing: Bool? = nil, transcribing: Bool? = nil) {
+        Task { @MainActor in
+            if let capturing { self.capturingVoice[source] = capturing }
+            if let transcribing { self.transcribingChunk[source] = transcribing }
+        }
+    }
+
     /// True from when `run()` enters until its cleanup completes.
     /// Drives the UI Start/Stop button.
     @Published private(set) var isActive: Bool = false
@@ -158,13 +179,23 @@ final class Pipeline: ObservableObject {
     ) {
         self.micSource = micSource ?? MicrophoneSource()
         self.systemSource = systemSource ?? SystemAudioSource()
-        self.transcriber = transcriber ?? WhisperCppTranscriber()
+        let whisperTranscriber = transcriber ?? WhisperCppTranscriber()
+        self.transcriber = whisperTranscriber
         self.translator = translator ?? AppleTranslator()
 
         self.source = Self.load(SourceLocale.self, forKey: K.source,
                                 defaultValue: SourceLocale(identifier: "de-DE"))
         self.target = Self.load(TargetLanguage.self, forKey: K.target,
                                 defaultValue: TargetLanguage(code: "en", name: "English"))
+
+        // Wire the transcriber's per-source activity callback to the
+        // published dicts. WhisperCppTranscriber calls this from
+        // background tasks; `updateActivity` hops to MainActor.
+        if let w = whisperTranscriber as? WhisperCppTranscriber {
+            w.onActivity = { [weak self] source, capturing, transcribing in
+                self?.updateActivity(source: source, capturing: capturing, transcribing: transcribing)
+            }
+        }
     }
 
     // MARK: - Public controls
@@ -313,6 +344,7 @@ final class Pipeline: ObservableObject {
         // 6. Run each SourcePipeline + a sentence-consumer that merges
         //    its emissions into the shared UI. All exit naturally when
         //    each pipeline's audio source stops.
+        Log.line("Pipeline: entering audio-path TaskGroup with \(sourcePipelines.count) pipelines")
         await withTaskGroup(of: Void.self) { group in
             for (_, sp) in sourcePipelines {
                 group.addTask { await sp.run() }
@@ -333,11 +365,15 @@ final class Pipeline: ObservableObject {
     /// append each to the shared visible list. Exits when the source
     /// pipeline finishes its stream.
     private func consumeSentences(from sp: SourcePipeline) async {
+        Log.line("Pipeline: sentence consumer for \(sp.source.rawValue) started")
+        var count = 0
         for await sentence in sp.sentences {
+            count += 1
+            Log.line("Pipeline: consumer[\(sp.source.rawValue)] got sentence #\(count): \"\(sentence.text.prefix(50))\"")
             self.sentences.append(sentence)
             enforceMaxCount()
         }
-        Log.line("Pipeline: sentence consumer for \(sp.source.rawValue) exited")
+        Log.line("Pipeline: sentence consumer for \(sp.source.rawValue) exited (total \(count))")
     }
 
     /// One recognition cycle, restarting sessions as they end. Bails after

@@ -109,6 +109,13 @@ final class WhisperCppTranscriber: Transcriber {
     /// base-q5_1 model, not catastrophic but worth caching.
     private var ctx: OpaquePointer?
     private var modelLoadError: Error?
+    /// Serializes `ensureContextLoaded()` so two concurrent
+    /// `transcribe()` calls (mic + system) don't both try to
+    /// `whisper_init_from_file_with_params` at the same time — that
+    /// raced and the second load failed with "failed to load model"
+    /// on Metal-backed contexts. After the first call returns, the
+    /// stored `ctx` is reused.
+    private let ctxLoadLock = NSLock()
 
     /// Tail of the previous chunk's text per input stream — fed back
     /// to whisper as `initial_prompt` to keep speaker style, proper
@@ -123,6 +130,44 @@ final class WhisperCppTranscriber: Transcriber {
     /// 1-3 s whisper time, so waits are bounded and small.
     private let whisperLock = NSLock()
 
+    /// UI activity hook — Pipeline installs a closure that updates its
+    /// `capturingVoice` / `transcribingChunk` @Published dicts so the
+    /// view can render per-source mic / pen icons. `Sendable` because
+    /// the accumulator and worker call it from background tasks.
+    var onActivity: (@Sendable (_ source: SourceTag, _ capturing: Bool?, _ transcribing: Bool?) -> Void)?
+
+    /// Cross-talk suppression: the system accumulator stamps the
+    /// wall-clock time of the last "system is voiced" buffer here, and
+    /// the mic accumulator queries it to decide whether mic samples in
+    /// the same time window should be muted (zeroed out) before chunk
+    /// emission. Built into the transcriber because it already mediates
+    /// shared state for both streams.
+    private var lastSystemVoicedAt: Date = .distantPast
+    private let crosstalkLock = NSLock()
+    /// How long after the last system-voiced buffer we keep treating
+    /// the mic as crosstalk-contaminated. Tail covers RNNoise's
+    /// envelope follower lag + room reverberation.
+    static var crosstalkPersistSeconds: TimeInterval = 0.25
+
+    /// Called by the system accumulator each buffer whose RMS clears
+    /// `silenceRMSThreshold`. Cheap (lock + Date()).
+    func markSystemVoiced() {
+        let now = Date()
+        crosstalkLock.withLock { lastSystemVoicedAt = now }
+    }
+
+    /// Called by the mic accumulator each buffer. Returns true when
+    /// system audio was voiced within the past `crosstalkPersistSeconds`
+    /// — the mic accumulator should treat the current buffer as silence
+    /// (zero its samples, don't credit voiced span) to suppress speaker
+    /// bleed.
+    func isSystemRecentlyVoiced() -> Bool {
+        let now = Date()
+        return crosstalkLock.withLock {
+            now.timeIntervalSince(lastSystemVoicedAt) < Self.crosstalkPersistSeconds
+        }
+    }
+
     deinit {
         if let ctx { whisper_free(ctx) }
     }
@@ -135,6 +180,8 @@ final class WhisperCppTranscriber: Transcriber {
     ///   2. `Bundle.main`'s `ggml-base-q5_1.bin` resource (shipped
     ///      with the .app by `build.sh`).
     private func ensureContextLoaded() throws -> OpaquePointer {
+        ctxLoadLock.lock()
+        defer { ctxLoadLock.unlock() }
         if let ctx { return ctx }
         if let modelLoadError { throw modelLoadError }
 
@@ -259,7 +306,7 @@ final class WhisperCppTranscriber: Transcriber {
         let tag = source.rawValue
 
         async let accumulate: Void = {
-            await self.accumulateChunks(audio: audio, sink: queueSink, sourceTag: tag)
+            await self.accumulateChunks(audio: audio, sink: queueSink, sourceTag: tag, source: source)
             Log.line("accumulator[\(tag)]: audio ended, closing queue")
             queueSink.finish()
         }()
@@ -295,21 +342,22 @@ final class WhisperCppTranscriber: Transcriber {
     private func accumulateChunks(
         audio: AsyncStream<AVAudioPCMBuffer>,
         sink: AsyncStream<ChunkBuffer>.Continuation,
-        sourceTag: String
+        sourceTag: String,
+        source: SourceTag
     ) async {
         var sampleRate: Float = 48_000
         var silenceFramesForBreak = Int(sampleRate * Float(Self.endChunkAfterSilence))
         var warmupFrames = Int(sampleRate * Float(Self.chunkWarmup))
         var maxFrames = Int(sampleRate * Float(Self.maxChunkSeconds))
 
-        // Whisper rejects audio under ~1 s. We hold the silence-close
-        // open until the trimmed chunk would clear that threshold —
-        // otherwise an isolated short utterance would close on the
-        // first silence and then either be padded with zeros (lossy) or
-        // dropped by the worker. We compute the trim length the worker
-        // would use, in 16 kHz samples.
-        let voicePaddingSamples = Int(16_000 * Self.voicePaddingSeconds)
-        let minTrimmedSamples = Int(16_000 * Self.minWhisperInputSeconds)
+        // Whisper rejects audio under ~1 s. Hold silence-close open
+        // until the chunk *as a whole* is at least that long. Gating
+        // on trim length instead was wrong: short utterances kept the
+        // trim small forever, silence-close never fired, max-chunk
+        // eventually triggered with a tiny voiced count and the worker
+        // dropped the chunk. With this gate the chunk grows past 1.1 s,
+        // silence-close fires, trim is short but the worker pads it.
+        var silenceMinFrames = Int(sampleRate * Float(Self.minWhisperInputSeconds))
 
         // Per-chunk accumulators — reset on close, never propagated.
         var samples16k: [Float] = []
@@ -353,27 +401,52 @@ final class WhisperCppTranscriber: Transcriber {
                 silenceFramesForBreak = Int(sampleRate * Float(Self.endChunkAfterSilence))
                 warmupFrames = Int(sampleRate * Float(Self.chunkWarmup))
                 maxFrames = Int(sampleRate * Float(Self.maxChunkSeconds))
+                silenceMinFrames = Int(sampleRate * Float(Self.minWhisperInputSeconds))
                 Log.line("accumulator[\(sourceTag)]: sampleRate=\(sampleRate) Hz from first buffer")
             }
 
-            let bufStart16k = samples16k.count
-            if let resampled = converter.convert(buf) {
-                samples16k.append(contentsOf: resampled)
-            }
-            let bufEnd16k = samples16k.count
-            samplesEverEmitted16k += (bufEnd16k - bufStart16k)
-
+            // Per-buffer RMS first — it's what drives both the
+            // VAD decision and (for mic) the crosstalk gate.
             guard let data = buf.floatChannelData?[0] else { continue }
             var ms: Float = 0
             vDSP_measqv(data, 1, &ms, vDSP_Length(n))
             let rms = sqrt(ms)
 
-            if rms >= Self.silenceRMSThreshold {
+            // Crosstalk suppression: when system is currently voiced
+            // (recently), mic audio is contaminated with speaker bleed.
+            // Replace this buffer's 16 kHz samples with silence and
+            // skip voiced-span bookkeeping so the chunk won't claim
+            // voice during the bleed window. The chunk timing still
+            // advances (sampleEverEmitted), so the next genuine voice
+            // segment lines up with the WAV correctly.
+            let mute = (source == .mic) && self.isSystemRecentlyVoiced()
+
+            let bufStart16k = samples16k.count
+            if mute {
+                // Append the right *count* of silent samples (estimated
+                // from the rate ratio) so timestamps stay accurate.
+                let ratio = 16_000.0 / Double(buf.format.sampleRate)
+                let n16 = Int(Double(n) * ratio)
+                samples16k.append(contentsOf: repeatElement(0, count: n16))
+            } else if let resampled = converter.convert(buf) {
+                samples16k.append(contentsOf: resampled)
+            }
+            let bufEnd16k = samples16k.count
+            samplesEverEmitted16k += (bufEnd16k - bufStart16k)
+
+            // System publishes its voiced state so the mic accumulator
+            // can suppress crosstalk windows on the other side.
+            if source == .system && rms >= Self.silenceRMSThreshold {
+                self.markSystemVoiced()
+            }
+
+            if !mute && rms >= Self.silenceRMSThreshold {
                 hadVoice = true
                 consecutiveSilentFrames = 0
                 if firstVoiceSample16k == nil {
                     firstVoiceSample16k = bufStart16k
                     Log.line("accumulator[\(sourceTag)]: voice onset in chunk #\(chunkIndex + 1) at \(String(format: "%.2f", Float(totalFrames) / sampleRate))s (rms=\(String(format: "%.3f", rms)))")
+                    self.onActivity?(source, true, nil)
                 }
                 lastVoiceSample16k = bufEnd16k
                 voicedSampleCount16k += (bufEnd16k - bufStart16k)
@@ -381,23 +454,17 @@ final class WhisperCppTranscriber: Transcriber {
                 consecutiveSilentFrames += n
             }
 
-            // Trim length the worker WOULD apply if we closed right now,
-            // in 16 kHz samples. Silence-close is gated on this clearing
-            // whisper's ~1 s minimum so we don't emit chunks that the
-            // worker would just have to pad or drop.
-            let trimmedLen: Int
-            if let voiceStart = firstVoiceSample16k {
-                let trimStart = max(0, voiceStart - voicePaddingSamples)
-                let trimEnd = min(samples16k.count, lastVoiceSample16k + voicePaddingSamples)
-                trimmedLen = max(0, trimEnd - trimStart)
-            } else {
-                trimmedLen = 0
-            }
-
+            // Silence-close is gated on TOTAL chunk length so short
+            // utterances (e.g. a single "yes") still produce a chunk:
+            // we wait until the chunk grows past whisper's ~1 s minimum,
+            // *then* close on silence. The trimmed audio may still be
+            // under 1 s and the worker pads it. (An earlier version
+            // gated on trim length, which never grew for short
+            // utterances → max-chunk fired with tiny voice → dropped.)
             let hitMax = totalFrames >= maxFrames
             let silenceClose = hadVoice
                 && totalFrames > warmupFrames
-                && trimmedLen >= minTrimmedSamples
+                && totalFrames >= silenceMinFrames
                 && consecutiveSilentFrames >= silenceFramesForBreak
 
             if hitMax || silenceClose {
@@ -414,6 +481,7 @@ final class WhisperCppTranscriber: Transcriber {
                     lastVoiceSample16k: lastVoiceSample16k,
                     voicedSampleCount16k: voicedSampleCount16k
                 )
+                self.onActivity?(source, false, nil)
                 samples16k.removeAll(keepingCapacity: true)
                 chunkStartSample16k = samplesEverEmitted16k
                 firstVoiceSample16k = nil
@@ -521,9 +589,11 @@ final class WhisperCppTranscriber: Transcriber {
         let prompt = previousChunkTail[source] ?? ""
         let started = Date()
         Log.line("worker[\(tag)]: chunk #\(chunk.index) → whisper_full (samples=\(trimmed.count), prompt=\"\(prompt.prefix(40))\")")
+        self.onActivity?(source, nil, true)
         let segments = try await self.runWhisperLocked(
             ctx: ctx, samples: trimmed, languageCode: languageCode, initialPrompt: prompt
         )
+        self.onActivity?(source, nil, false)
         let elapsed = Date().timeIntervalSince(started)
         Log.line("worker[\(tag)]: chunk #\(chunk.index) ← whisper_full in \(String(format: "%.2f", elapsed))s, segments=\(segments.count)")
 

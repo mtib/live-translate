@@ -65,11 +65,12 @@ final class SourcePipeline {
     /// the broadcaster closes its continuations (driven by
     /// `audioSource.stop()` on Pipeline.stop()).
     func run() async {
+        Log.line("SourcePipeline[\(source.rawValue)]: run started")
         async let rec: Void = runRecordingLoop()
         async let trans: Void = runRecognitionCycle()
         _ = await (rec, trans)
         sentencesContinuation.finish()
-        Log.line("SourcePipeline[\(source.rawValue)]: run finished")
+        Log.line("SourcePipeline[\(source.rawValue)]: run finished, sentences stream closed")
     }
 
     /// Stop the audio source. Triggers the broadcaster to close, which

@@ -24,11 +24,14 @@ struct TranscriptView: View {
 
     var body: some View {
         ZStack {
-            // Translucent flat color (no blur). Adapts to light/dark mode
-            // via the system window background. Lower opacity = more of
-            // the content behind the window shows through.
-            Color(nsColor: .windowBackgroundColor)
-                .opacity(0.8)
+            // Translucent flat color (no blur). Use the system's
+            // text-background color (white in light mode, near-black
+            // in dark mode) — same theming as `windowBackgroundColor`
+            // but with materially more contrast against the primary
+            // text. 0.8 opacity keeps the floating overlay translucent
+            // over content behind it.
+            Color(nsColor: .textBackgroundColor)
+                .opacity(0.7)
                 .ignoresSafeArea()
             content
         }
@@ -72,16 +75,17 @@ struct TranscriptView: View {
 
     // MARK: - Bars
 
-    /// Compact bar: status dot, primary action, language pair label, expand.
-    /// Designed to fit a ~280px-wide floating overlay.
+    /// Compact bar: primary action, language pair label, per-source
+    /// activity icons, expand. Designed to fit a ~280px-wide floating
+    /// overlay — icons share the same component as the full bar.
     private var compactBar: some View {
-        HStack(spacing: 8) {
-            statusDot
+        HStack(spacing: 6) {
             primaryButton(compact: true)
             Text("\(pipeline.source.identifier) → \(pipeline.target.code)")
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
-            Spacer()
+            Spacer(minLength: 4)
+            activityIndicators
             iconButton("chevron.down", help: "Show controls") {
                 compactMode = false
             }
@@ -89,9 +93,10 @@ struct TranscriptView: View {
     }
 
     /// Full bar: one clean horizontal row.
-    /// Primary on the left, language pair in the middle, indicator and
-    /// compact-mode toggle on the right. No labels — the arrow between
-    /// the pickers tells you which way translation goes.
+    /// Primary on the left, language pair in the middle, per-source
+    /// activity icons + compact-mode toggle on the right. The
+    /// Start/Stop button is the only "is the pipeline running?" cue —
+    /// no separate status dot.
     private var fullBar: some View {
         HStack(spacing: 10) {
             primaryButton(compact: false)
@@ -104,11 +109,42 @@ struct TranscriptView: View {
 
             Spacer(minLength: 6)
 
-            statusDot
+            activityIndicators
             iconButton("chevron.up", help: "Compact view") {
                 compactMode = true
             }
         }
+    }
+
+    /// Per-source busy state: a mic icon when a chunk is currently
+    /// being captured (voiced) and a "pen on paper" icon when whisper
+    /// is running on a chunk. Each tinted with the source's color
+    /// (mic = warm, system = cool). Up to four icons can be visible
+    /// when both streams are simultaneously capturing + transcribing.
+    private var activityIndicators: some View {
+        HStack(spacing: 3) {
+            indicatorIcon("mic.fill", source: .mic, active: pipeline.capturingVoice[.mic] ?? false, help: "Capturing mic chunk")
+            indicatorIcon("doc.text.fill", source: .mic, active: pipeline.transcribingChunk[.mic] ?? false, help: "Transcribing mic chunk")
+            indicatorIcon("mic.fill", source: .system, active: pipeline.capturingVoice[.system] ?? false, help: "Capturing system chunk")
+            indicatorIcon("doc.text.fill", source: .system, active: pipeline.transcribingChunk[.system] ?? false, help: "Transcribing system chunk")
+        }
+    }
+
+    /// One activity icon — full-saturation source tint when `active`,
+    /// standard secondary text color when idle (theme-aware, so the
+    /// off state reads correctly in both light and dark mode). The
+    /// persistent visible state preserves row layout when activities
+    /// toggle.
+    private func indicatorIcon(_ systemName: String, source: SourceTag, active: Bool, help: String) -> some View {
+        let tint: Color = source == .mic ? .red : .blue
+        let style: AnyShapeStyle = active
+            ? AnyShapeStyle(tint)
+            : AnyShapeStyle(.secondary)
+        return Image(systemName: systemName)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundStyle(style)
+            .frame(width: 14, height: 14)
+            .help(help)
     }
 
     /// Inline banner shown only on `.stopped(reason:)`. Suppressed for
@@ -177,27 +213,6 @@ struct TranscriptView: View {
         .controlSize(.small)
     }
 
-    /// 8×8 colored dot reflecting `PipelineStatus`. Pulses while live;
-    /// hover for the full status text.
-    private var statusDot: some View {
-        let color = pipeline.status.dotColor
-        let live = pipeline.status.isLive
-        return Circle()
-            .fill(color)
-            .frame(width: 8, height: 8)
-            .overlay(
-                Circle()
-                    .stroke(color.opacity(0.4), lineWidth: 3)
-                    .scaleEffect(live ? 1.5 : 1.0)
-                    .opacity(live ? 0.6 : 0)
-                    .animation(
-                        live ? .easeInOut(duration: 1.2).repeatForever(autoreverses: true) : .default,
-                        value: live
-                    )
-            )
-            .help(pipeline.status.description)
-    }
-
     private func iconButton(_ systemName: String, help: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: systemName)
@@ -216,12 +231,6 @@ struct TranscriptView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: compact ? 6 : 8) {
-                    if pipeline.sentences.isEmpty {
-                        Text("…")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                            .padding(.vertical, 2)
-                    }
                     ForEach(Array(pipeline.sentences.enumerated()), id: \.element.id) { idx, sentence in
                         SentenceRow(
                             sentence: sentence,
@@ -255,20 +264,6 @@ struct TranscriptView: View {
     }
 }
 
-/// Status-dot color mapping. Lives here (not on the enum itself) because
-/// `Color` is a SwiftUI type and Types.swift is import-free of SwiftUI.
-private extension PipelineStatus {
-    var dotColor: Color {
-        switch self {
-        case .idle: return .secondary
-        case .requestingPermissions: return .orange
-        case .starting: return .yellow
-        case .running: return .green
-        case .stopped: return .red
-        }
-    }
-}
-
 /// One sentence row: translation as the primary line, source text as a
 /// caption underneath. Most-recent sentence is full opacity; older rows
 /// fade to 0.8. In compact mode the source caption is hidden for older
@@ -280,14 +275,14 @@ private struct SentenceRow: View {
 
     var body: some View {
         let opacity: Double = isMostRecent ? 1.0 : 0.8
-        // Very subtle source tint via `colorMultiply`: shifts each
-        // text pixel's color slightly toward red (mic) or blue
-        // (system). The multiplier is close to white on the dominant
-        // axis so the effect reads as a faint warm/cool cast rather
-        // than a coloured label.
+        // Subtle source tint via `colorMultiply`: shifts text slightly
+        // toward red (mic) or blue (system). ~85% on the off axes — a
+        // gentle warm / cool cast, much subtler than v2's .65 (which
+        // made the translated lines feel dim). The translation stays
+        // bright because it's `.primary` × this near-white multiplier.
         let tintMultiplier: Color = sentence.source == .mic
-            ? Color(red: 1.0, green: 0.92, blue: 0.92)
-            : Color(red: 0.92, green: 0.95, blue: 1.0)
+            ? Color(red: 1.0, green: 0.85, blue: 0.85)
+            : Color(red: 0.85, green: 0.90, blue: 1.0)
 
         VStack(alignment: .leading, spacing: 1) {
             Text(sentence.translation.isEmpty ? sentence.text : sentence.translation)

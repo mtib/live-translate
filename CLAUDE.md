@@ -12,6 +12,12 @@ clone of [transcrybe.app](https://transcrybe.app).
 > needed, the build script, or any of the "Things that have bitten us"
 > entries: update CLAUDE.md.
 >
+> **Persist learnings.** When a bug bites — a race, an actor-isolation
+> surprise, a confused-by-the-API moment — add a numbered entry to
+> the "Things that have bitten us" section explaining what went wrong
+> AND the shape of the fix. This is the durable institutional memory;
+> without it the same trap will be re-stepped in a later session.
+>
 > The reason: this file is the only durable orientation document. Source
 > comments cover *what* a function does; CLAUDE.md covers *why the design
 > is shaped this way* and *what to never do again*. Future sessions read
@@ -237,12 +243,20 @@ The queue is unbounded; backpressure isn't a concern at our rates.
 ### Whisper hallucinates on silence
 
 Trained on captioned video, the model fabricates phrases like "Thanks
-for watching!" or "[Music]" given near-silent input. Three defences:
+for watching!" or "[Music]" given near-silent input. Four defences:
 
 1. **Skip chunks with no voice** — `firstVoiceSample16k == nil`.
 2. **Trim leading/trailing silence** off the chunk (with 100 ms of
    padding so word edges aren't clipped).
-3. **Pad short trimmed clips with trailing zeros to ≥1.1 s.** Whisper
+3. **Silence-close is gated on total chunk length** — the accumulator
+   only allows a silence-driven close once the *chunk as a whole* is
+   at least `minWhisperInputSeconds` (1.1 s). Without this, a short
+   utterance (e.g. "yes") would silence-close instantly and the worker
+   would have to either pad or drop it; with it, the chunk grows past
+   the threshold and we send a clean utterance through. Max-chunk
+   close still fires regardless (the worker's pad-to-1.1s is the
+   final safety net).
+4. **Pad short trimmed clips with trailing zeros to ≥1.1 s.** Whisper
    silently returns zero segments for audio under ~1 s — its
    mel-spectrogram threshold is 100 frames at 10 ms each. Padded
    silence at the end is fine.
@@ -250,9 +264,29 @@ for watching!" or "[Music]" given near-silent input. Three defences:
 ### `initial_prompt` continuity across chunks
 
 The transcriber stashes the last ~120 chars of the previous chunk's
-text as `previousChunkTail` and passes it as `params.initial_prompt`
-on the next chunk. Stops the (aggressive) silence cuts from breaking
-proper-noun or speaker-style continuity.
+text as `previousChunkTail` (a dictionary keyed by `SourceTag`) and
+passes it as `params.initial_prompt` on the next chunk. Per-source
+because mic and system content is unrelated — mixing the tails would
+pollute each.
+
+### Per-source crosstalk suppression (speaker bleed into mic)
+
+The mic always picks up some of what the system is playing through
+the speakers. To stop those phantom transcriptions on the mic side,
+`WhisperCppTranscriber` carries shared state — `lastSystemVoicedAt`
+(`Date`, NSLock-protected) — updated by the system accumulator on
+every voiced buffer. The mic accumulator queries it per buffer; if
+system was voiced within `crosstalkPersistSeconds` (250 ms, covers
+RNNoise envelope follower lag + room reverberation), the mic's
+current buffer is replaced with silence in the 16 kHz sample array
+AND the voiced-span markers aren't credited. The chunk's timing keeps
+advancing (so WAV alignment stays correct) but no false-positive
+voice gets attributed to the mic during system playback.
+
+Note: this affects only what's fed to whisper. The mic `.wav`
+recording still contains the raw bleed — that's a separate concern
+(the WAV is recorded from the broadcaster, upstream of the
+transcriber's per-source muting logic).
 
 ### Broadcaster pattern (the "won't restart after Stop" problem)
 `AsyncStream` is single-consumer. The previous design exposed a single
@@ -431,4 +465,76 @@ pkill -f LiveTranslate                           # kill all instances
     sample. 1:1 audio-to-wall ratio restored, recognition is instant
     again. The per-sample sum runs through `vDSP_vadd` (Accelerate) on
     a reusable `UnsafeMutablePointer<Float>` scratch buffer — SIMD on
-    NEON / AVX, no per-call malloc.
+    NEON / AVX, no per-call malloc. **Mixing has since been removed
+    entirely** in favour of independent per-stream pipelines (see #18);
+    this lesson is kept for the audio-clocking principle.
+16. **Whisper silently drops audio under ~1 s.** Its mel-spectrogram
+    threshold is 100 frames at 10 ms each. The symptom was chunks
+    coming back with `segments=0` in 0.01 s — no error, just empty.
+    Two-layer defence: (a) `accumulator` only allows silence-close
+    once the *total* chunk length clears 1.1 s; (b) `processChunk`
+    pads short trimmed clips with trailing zeros up to 1.1 s as a
+    final safety net. Gating on trim length instead of total length
+    was a separate bug — short utterances kept the trim small and
+    silence-close never fired, leading to max-chunk drops.
+17. **Cancelling `runTask` aborts the recognition mid-flight and
+    drops trailing audio.** The old `Pipeline.stop()` cancelled the
+    run Task; that cancellation propagated to the accumulator's
+    `for await buf in audio`, which exits without emitting a final
+    in-flight chunk, and to the worker's `for await chunk in queue`,
+    which exits before draining. Anything still mid-utterance when
+    Stop is pressed was lost. Fix: shutdown is driven by *ending the
+    audio source*, not cancelling the task. Each `AudioSource.stop()`
+    calls `BufferBroadcaster.finishAll()` to close its subscriptions,
+    so the recognition pipeline drains naturally:
+    `audio source closes → accumulator's for-await ends → final chunk
+    emitted → queue closed → worker drains → run() exits`.
+    Background workers (translation, prune) still need cancellation
+    because they have `while !Task.isCancelled` loops with no
+    natural termination — they run in a separate `Task` cancelled
+    *after* the audio path drains.
+18. **Per-stream pipelines instead of mixing.** The old design
+    sample-summed mic + system before transcribing (lesson #14), then
+    later denoised the mix (lesson #15-era), losing source attribution.
+    The current design runs each input through its own
+    `DenoisingAudioSource`, its own `SourcePipeline` (recorder + SRT
+    writers + transcribe call), and only shares the whisper context
+    (with an `NSLock` around `whisper_full`), the JSONL archive (with
+    a per-row `source` field), and the visible UI sentence array.
+    No mixing, no attribution loss.
+19. **Two concurrent `whisper_init_from_file_with_params` calls fail
+    on Metal contexts.** When mic and system pipelines both invoke
+    `transcribe()` at the same instant, both reach
+    `ensureContextLoaded()` and both see `ctx == nil`. Both then call
+    `whisper_init_from_file_with_params` on the same path; one
+    succeeds, the other fails with "failed to load model". Symptom in
+    the log: `Whisper.transcribe[system]: error … failed to load
+    model`. Fix: serialize `ensureContextLoaded()` with an `NSLock`
+    so the second caller waits, finds `ctx` already set, and reuses
+    it. Without this the system pipeline never produced chunks (and
+    crosstalk suppression never activated because the system
+    accumulator was never running).
+20. **Crosstalk: mic always picks up some of the system's audio
+    through the speakers.** Affects transcription quality (mic
+    transcribes the bleed). Mitigation: `WhisperCppTranscriber`
+    carries a shared `lastSystemVoicedAt: Date` (NSLock-protected);
+    system accumulator stamps it per voiced buffer; mic accumulator
+    queries it per buffer; if system was voiced within
+    `crosstalkPersistSeconds` (250 ms), the mic's current buffer is
+    replaced with silence in the 16 kHz sample array and voiced-span
+    markers aren't credited. The chunk's timing keeps advancing so
+    WAV alignment stays correct. **Caveat**: this affects only what
+    whisper sees; the mic `.wav` recording still has the raw bleed
+    because it consumes the broadcaster directly, upstream of the
+    muting logic. Acceptable for transcription quality; a future
+    improvement could mute the recorded buffer too.
+21. **`SourcePipeline` shouldn't be `@MainActor`.** Pipeline is
+    @MainActor, and naively making child classes follow suit would
+    serialize the per-stream accumulators on the MainActor — both
+    audio paths plus the worker would queue behind UI updates. Keep
+    `SourcePipeline`, `WhisperCppTranscriber`, `DenoisingAudioSource`
+    as plain classes; their methods run on whatever executor the
+    Swift runtime chose (cooperative pool from `withTaskGroup`).
+    Only the UI-state writes hop back to MainActor (via
+    `Task { @MainActor in ... }` or via `Pipeline.consumeSentences`
+    which is itself @MainActor).
