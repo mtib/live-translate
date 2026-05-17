@@ -51,8 +51,10 @@ final class MicrophoneSource: AudioSource {
             tapInstalled = false
         }
         if engine.isRunning { engine.stop() }
-        // Don't `finish()` listeners — Pipeline tears them down via its
-        // own task cancellation. Finishing here would race with consumers.
+        // Close every live `buffers` subscription so consumers' for-await
+        // loops exit naturally. This is the audio-side signal that drives
+        // the Pipeline's graceful drain on Stop.
+        broadcaster.finishAll()
         Log.line("Mic: stopped")
     }
 

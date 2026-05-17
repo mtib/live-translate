@@ -47,7 +47,7 @@ final class TranscriptArchive {
     func append(_ sentence: Sentence) {
         let record = Record(
             start: Self.isoFormatter.string(from: sentence.createdAt),
-            end: Self.isoFormatter.string(from: sentence.lastModified),
+            end: Self.isoFormatter.string(from: sentence.endsAt),
             transcription: sentence.text,
             translation: sentence.translation
         )

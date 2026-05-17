@@ -65,15 +65,14 @@ ScreenCaptureKit) without touching `Pipeline`.
 
 ### Key design decisions
 
-- **Always mix mic + system.** The app no longer exposes input toggles —
+- **Always mix mic + system.** The app does not expose input toggles —
   mic and system audio are always both captured and sample-summed by
-  `MixedAudioSource` before the single SFSpeechRecognizer sees them.
-  Apple Speech serializes recognition tasks per-app, so two concurrent
-  recognizers can't coexist; mixing into one stream is the workaround.
-  Both audio sources standardize on **48 kHz mono Float32** (RNNoise's
-  native rate) so the mixed stream is format-consistent and the per-
-  sample sum is meaningful. SFSpeech consumes 48 kHz fine; the AudioFile
-  WAV writer downcasts to 16-bit Int on the write path.
+  `MixedAudioSource` before the transcriber sees them. Both audio
+  sources standardize on **48 kHz mono Float32** (RNNoise's native
+  rate) so the mixed stream is format-consistent and the per-sample
+  sum is meaningful. The transcriber downsamples to 16 kHz internally
+  for whisper; the `.wav` writer downcasts to 16-bit Int on the
+  write path.
 - **RNNoise on the merged stream.** A vendored copy of xiph/rnnoise
   v0.1.1 (BSD 3-clause, GRU weights embedded in `rnn_data.c`, ~400 KB
   static, zero runtime dependencies) runs inside `MixedAudioSource`
@@ -83,54 +82,36 @@ ScreenCaptureKit) without touching `Pipeline`.
   480-sample frames at 48 kHz — the wrapper (`RNNoiseProcessor`) buffers
   arbitrary input sizes and converts to/from our ±1 normalised range.
   Algorithmic latency: 10 ms.
-- **whisper.cpp instead of Apple Speech.** The active transcriber is
-  `WhisperCppTranscriber`, which downsamples the 48 kHz post-RNNoise
-  stream to 16 kHz, accumulates samples until either silence persists
-  past `endChunkAfterSilence` (~1.6 s) or the chunk hits `maxChunkSeconds`
-  (~25 s), then runs `whisper_full()` on the buffered audio (on a
-  detached Task so the recognizer doesn't block the MainActor or the
-  audio pump). Each chunk = one `transcribe()` session from the
-  Pipeline's perspective, emitting a single `SessionSnapshot` with all
-  segments marked final before finishing. The Pipeline's existing
-  `runRecognitionCycle` loop calls `transcribe()` again for the next
-  chunk. **Trade-off vs Apple Speech:** no token-level partial results
-  during a chunk — text appears in a burst at the silence boundary.
-  In exchange we get better quality on noisy / accented speech and zero
-  reliance on Apple's per-language Dictation downloads.
+- **whisper.cpp is the transcriber.** `WhisperCppTranscriber`
+  downsamples the 48 kHz post-RNNoise stream to 16 kHz, runs an
+  RMS-based VAD to segment into chunks (silence threshold
+  `endChunkAfterSilence` ~0.7 s, hard cap `maxChunkSeconds` 5 s),
+  trims and pads each chunk, then runs `whisper_full()` against the
+  bundled GGML model. Whisper's internal segments are joined into
+  one line per chunk; the chunk's audio-stream sample positions
+  become the sentence's `startSeconds` / `endSeconds`, anchored by
+  Pipeline at `runStartedAt` so JSONL/SRT timestamps map directly to
+  positions in the paired `.wav`.
 - **GGML model file resolution.** `WhisperCppTranscriber` looks for
-  `~/Documents/LiveTranslate/models/ggml-base-q5_1.bin` first (user
-  override — drop a larger / different model there), then falls back to
-  `Bundle.main`'s `ggml-base-q5_1.bin` resource. The bundled default is
-  the multilingual base model with Q5_1 quantization (~57 MB). MIT
-  licensed (Whisper weights from OpenAI, GGML packaging by ggerganov on
-  Hugging Face). The model file is copied into the `.app`'s
-  `Contents/Resources/` by `build.sh`.
-- **AppleSpeechTranscriber is dormant on this branch.** Still
-  conforms to `Transcriber` and compiles, but Pipeline no longer
-  instantiates it. Kept for historical reference / fast bisecting if
-  whisper turns out problematic. If we merge this branch wholesale,
-  the file (and the `NSSpeechRecognitionUsageDescription` key in
-  Info.plist) can be deleted.
-- **Transcribers emit sentence snapshots, not raw text.** A `SessionSnapshot`
-  carries `[SessionSentence]` already split. The Pipeline reconciles each
-  snapshot against its own array by position — this handles "new sentence
-  appeared", "sentence text grew", and "recognizer revised away a sentence
-  boundary" uniformly. Splitting lives in the transcriber because it's
-  backend-specific.
+  `~/Documents/LiveTranslate/models/ggml-large-v3-turbo-q5_0.bin`
+  first (user override — drop a different model file there with the
+  same name), then falls back to the `.app`'s bundled copy. Bundled
+  default is large-v3-turbo Q5_0 (~570 MB). MIT licensed (Whisper
+  weights from OpenAI, GGML packaging by ggerganov on Hugging Face).
+  Copied into `Contents/Resources/` by `build.sh`.
+- **Transcribers emit one sentence per closed chunk.** The
+  transcriber owns chunk boundaries (via RMS) and the joining of
+  whisper's internal segments. Pipeline never edits a `Sentence`
+  in place; ingest just appends.
 - **Translation cache.** `Pipeline.translationCache: [String: String]`
   keyed by source text. Identical strings across sessions reuse the
   cached translation. LRU-ish eviction at 200 entries.
-- **Per-sentence, eager translation.** Translation worker sends any
-  sentence whose text differs from `lastTranslatedSource`. The cache
-  keeps duplicate strings free. `translationStabilityDelay` is `0` —
-  partials translate as soon as their text changes. (The variable
-  stays in code as a tunable in case the recognizer ever floods us.)
 - **Pruning.** Non-protected sentences whose `lastModified` is older
   than **60 s** get dropped once per second. Hard cap at **8** retained.
-  "Protected" means: the most-recent sentence overall, and the live
-  (last-active) sentence. Earlier session-active sentences are eligible
-  to drop; if the recognizer's next snapshot still references them,
-  ingest finds no matching UUID and silently skips, so the drop sticks.
+  "Protected" means: the most-recent sentence overall. `lastModified`
+  is purely an in-memory freshness signal (the translation worker
+  bumps it when the translation lands) and never written to disk —
+  the JSONL `end` field comes from `endsAt` (audio-end time).
 - **Per-run output files.** Each Start opens up to four paired files
   under one app-private root, sharing a `YYYY-MM-DD_HH-MM-SS` timestamp:
 
@@ -155,8 +136,10 @@ ScreenCaptureKit) without touching `Pipeline`.
   {"end":"2026-05-16T22:13:09.581Z","start":"2026-05-16T22:13:07.123Z","transcription":"…","translation":"…"}
   ```
   Keys sorted for grep/diff stability, ISO-8601 timestamps with
-  fractional seconds. `start` is when the sentence first appeared,
-  `end` is when its text last changed (matching the SRT cue times).
+  fractional seconds. `start` / `end` are derived from the chunk's
+  voiced span in the audio stream (anchored to `runStartedAt`), so
+  they line up sample-accurately with the matching position in the
+  paired `.wav`. The SRT cue uses the same offsets.
   `transcription` / `translation` always present; `translation` may be
   empty if the translator hadn't gotten to it yet.
 
@@ -179,9 +162,8 @@ ScreenCaptureKit) without touching `Pipeline`.
 | `MixedAudioSource.swift` | Combines two `AudioSource`s by **sample-summing** at mic's cadence (Accelerate `vDSP_vadd`), then runs the summed buffer through `RNNoiseProcessor` before broadcasting. Mic clocks the output; system samples come from a small queue. 1:1 audio-time:wall-time. |
 | `RNNoiseProcessor.swift` | Swift wrapper around the vendored RNNoise C library. Owns the `DenoiseState`, buffers arbitrary-sized input into 480-sample frames, handles ±32768 ↔ ±1 scaling, emits denoised samples via `drain(into:count:)`. |
 | `CRNNoise/` | Vendored xiph/rnnoise v0.1.1 as a SwiftPM C target. BSD 3-clause; GRU weights statically linked. See `Sources/CRNNoise/README.md`. |
-| `WhisperCppTranscriber.swift` | **Active transcriber.** Downsamples 48 kHz → 16 kHz via `AVAudioConverter`, accumulates audio, runs `whisper_full()` at chunk boundaries (silence or max-length), maps segments to `SessionSentence`s, emits one `SessionSnapshot` per chunk. Resolves the model file from `~/Documents/LiveTranslate/models/` first, then `Bundle.main`. |
+| `WhisperCppTranscriber.swift` | **The transcriber.** Two structured-concurrency child tasks via `async let`: an accumulator that pumps audio and emits closed chunks on silence/max-chunk, and a worker that runs `whisper_full()` serially on chunks pulled from the queue. Emits exactly **one** `SessionSentence` per chunk (whisper's internal segment splits are joined). Resolves the model file from `~/Documents/LiveTranslate/models/` first, then `Bundle.main`. |
 | `CWhisper/` | SwiftPM bridge target around `libwhisper.a` + `libggml*.a` produced by `tools/build-whisper.sh`. Headers (`whisper.h`, `ggml*.h`) are mirrored in by the build script and gitignored. |
-| `AppleSpeechTranscriber.swift` | **Dormant.** Apple `Speech` backend, no longer wired into Pipeline. Kept around as a reference / fallback during the whisper experiment. |
 | `AppleTranslator.swift` | Holds a `TranslationSession` that the View injects via `Pipeline.installTranslationSession(_:)`. |
 | `TranscriptArchive.swift` | One-per-run JSONL archive. Takes its file URL; doesn't know about layout. |
 | `AudioRecorder.swift` | One-per-run `.wav` writer fed by a parallel consumer of the active source's broadcaster. 16 kHz mono Int16. |
@@ -191,39 +173,83 @@ ScreenCaptureKit) without touching `Pipeline`.
 
 ## Key behaviors / non-obvious bits
 
-### Recognition cycle (the "~1 minute" problem)
-Apple's on-device `SFSpeechRecognizer` ends each session after ~60 seconds,
-either with `isFinal = true` or `kAFAssistantErrorDomain 216`. Each
-per-source recognition cycle catches that boundary, marks all current
-session sentences final, and starts a new session.
+### One chunk = one sentence
 
-**The audio engine is kept running continuously** across recognition
-restarts — only the `SFSpeechAudioBufferRecognitionRequest` and task are
-cycled. Tearing down / restarting the audio engine between sessions caused
-the original "stops after some time" bug.
+The RMS-based VAD in `WhisperCppTranscriber` already splits the audio
+at natural pauses, so each chunk fed to `whisper_full()` is, by
+construction, one utterance. Whisper's internal segmentation (it can
+emit multiple `whisper_segment`s per call when it detects sub-pauses)
+is joined into a single line before the snapshot leaves the
+transcriber. The Pipeline gets one `SessionSentence` per closed
+chunk, which lands as one `Sentence` row, which writes one JSONL line
+and one SRT cue.
+
+This also means: the transcriber owns sentence segmentation. The
+Pipeline never splits, the Pipeline never edits-in-place.
+
+### Audio-stream timing (SRT/JSONL ↔ WAV alignment)
+
+The accumulator tracks a cumulative 16 kHz sample counter
+(`samplesEverEmitted16k`) across all chunks; the chunk's own start
+offset is the counter's value at chunk-open. From there the
+sentence's `startSeconds` / `endSeconds` come from
+`(chunkStartSample16k + voiceStart) / 16_000` etc. — i.e. **seconds
+into the audio stream**.
+
+Pipeline anchors those at `runStartedAt`, so `Sentence.createdAt /
+endsAt` are wall-clock Dates but the **offsets between them and
+`runStartedAt`** match audio-stream positions. The recorder consumes
+the same audio broadcaster, so audio-stream position = WAV position.
+SRT cues therefore line up sample-accurately with the `.wav` and the
+JSONL `start`/`end` ISO timestamps are usable as audio offsets.
+
+Backends that don't report timing pass `nil` for `startSeconds` /
+`endSeconds` and Pipeline falls back to `Date()` at ingest — but
+whisper.cpp always reports timing now, and there's no other backend.
+
+### Concurrent accumulator + worker (the "second sentence dropped" bug)
+
+Whisper takes 1-3 s to process a chunk. If we ran the audio pump
+synchronously with whisper (close chunk → run whisper → resume pump),
+any utterance during whisper's processing would be lost — the
+upstream broadcaster keeps producing buffers but no one is consuming
+the AsyncStream.
+
+The fix is two structured child tasks under one `async let`:
+
+- **Accumulator** reads audio forever, emitting closed chunks into a
+  `AsyncStream<ChunkBuffer>` queue. Never blocked.
+- **Worker** drains the queue, runs whisper serially, yields
+  `SessionSnapshot`s back. Sees chunks in order.
+
+The queue is unbounded; backpressure isn't a concern at our rates.
+
+### Whisper hallucinates on silence
+
+Trained on captioned video, the model fabricates phrases like "Thanks
+for watching!" or "[Music]" given near-silent input. Three defences:
+
+1. **Skip chunks with no voice** — `firstVoiceSample16k == nil`.
+2. **Trim leading/trailing silence** off the chunk (with 100 ms of
+   padding so word edges aren't clipped).
+3. **Pad short trimmed clips with trailing zeros to ≥1.1 s.** Whisper
+   silently returns zero segments for audio under ~1 s — its
+   mel-spectrogram threshold is 100 frames at 10 ms each. Padded
+   silence at the end is fine.
+
+### `initial_prompt` continuity across chunks
+
+The transcriber stashes the last ~120 chars of the previous chunk's
+text as `previousChunkTail` and passes it as `params.initial_prompt`
+on the next chunk. Stops the (aggressive) silence cuts from breaking
+proper-noun or speaker-style continuity.
 
 ### Broadcaster pattern (the "won't restart after Stop" problem)
 `AsyncStream` is single-consumer. The previous design exposed a single
-stored AsyncStream as `buffers` — when a second `transcribe(...)` call
-tried to read from it after the first iterator was gone, it got no data
-and the recognizer hit "No speech detected" within ~50ms. Both
+stored AsyncStream as `buffers` — when a second consumer tried to read
+from it after the first iterator was gone, it got no data. Both
 `MicrophoneSource` and `SystemAudioSource` now build a fresh AsyncStream
 per `buffers` access and fan tap callbacks out to all current subscribers.
-
-### Snapshot diff (the "earlier row keeps getting more text" problem)
-The recognizer can revise its own sentence boundaries — what was two
-sentences at t=0 might be one at t=1. The previous design mapped parsed
-sentences by index and left orphan rows when the count shrank. The new
-`SessionSnapshot` API plus `Pipeline.ingest` truncate orphans:
-- snapshot grew → append new Sentence with fresh UUID
-- snapshot same size → update text/isFinal in place (UUID preserved)
-- snapshot shrank → drop the now-missing sentences
-
-### Fast-fail bail
-If a session ends in less than 1 second, that counts as a "fast fail"
-(usually means the language model isn't installed or the audio source is
-silent). After **6** in a row the Pipeline gives up with a
-`.stopped(reason:)` message pointing at System Settings.
 
 ### Translation framework quirks
 - A `TranslationSession` is **only** obtainable via SwiftUI's
@@ -249,15 +275,12 @@ settings — both are always captured.
 ### Permissions
 The bundle declares:
 - `NSMicrophoneUsageDescription`
-- `NSSpeechRecognitionUsageDescription` (legacy — no longer requested
-  at runtime, kept in Info.plist while AppleSpeechTranscriber.swift
-  still exists in the tree as dormant reference code)
 - `NSScreenCaptureUsageDescription` (for system audio via SCK)
 
 Mic prompts via `AVCaptureDevice.requestAccess`. Screen recording
-prompts when `SCStream.startCapture()` runs the first time. Speech
-recognition permission isn't requested — whisper.cpp runs locally and
-doesn't touch Apple's Speech APIs.
+prompts when `SCStream.startCapture()` runs the first time. No speech
+recognition permission — whisper.cpp runs locally against a bundled
+GGML model and doesn't touch Apple's Speech APIs.
 
 Reset stale grants with:
 ```sh

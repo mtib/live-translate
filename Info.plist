@@ -26,8 +26,6 @@
     <false/>
     <key>NSMicrophoneUsageDescription</key>
     <string>LiveTranslate needs the microphone to transcribe what you say.</string>
-    <key>NSSpeechRecognitionUsageDescription</key>
-    <string>LiveTranslate uses on-device speech recognition to turn audio into text.</string>
     <key>NSScreenCaptureUsageDescription</key>
     <string>LiveTranslate captures system audio (no video frames are kept) so it can transcribe what you're listening to without going through the microphone.</string>
 </dict>

@@ -1,6 +1,5 @@
 import Foundation
 import AVFoundation
-import Speech
 import Combine
 import Translation
 
@@ -78,7 +77,19 @@ final class Pipeline: ObservableObject {
 
     // MARK: - Available choices
 
-    let availableSources: [SourceLocale]
+    /// Curated BCP-47 locales available in the source-language picker.
+    /// whisper.cpp accepts the 2-letter prefix of any of these (e.g.
+    /// "de-DE" → "de"), so the region tag is purely for the macOS
+    /// `Locale.localizedString(forIdentifier:)` to produce a nice
+    /// display name like "German (Germany)". Reordered roughly by
+    /// expected user popularity.
+    let availableSources: [SourceLocale] = [
+        "en-US", "en-GB", "de-DE", "fr-FR", "es-ES", "it-IT",
+        "pt-PT", "pt-BR", "nl-NL", "da-DK", "sv-SE", "no-NO",
+        "fi-FI", "pl-PL", "cs-CZ", "uk-UA", "ru-RU", "tr-TR",
+        "el-GR", "he-IL", "ar-SA", "hi-IN", "th-TH", "vi-VN",
+        "ja-JP", "ko-KR", "zh-CN", "zh-TW",
+    ].map { SourceLocale(identifier: $0) }
     let availableTargets: [TargetLanguage] = [
         .init(code: "en", name: "English"), .init(code: "de", name: "German"),
         .init(code: "fr", name: "French"), .init(code: "es", name: "Spanish"),
@@ -108,6 +119,11 @@ final class Pipeline: ObservableObject {
     private var recorder: AudioRecorder?
     private var sourceSubs: SubtitleArchive?
     private var targetSubs: SubtitleArchive?
+    /// The audio source currently feeding the run. Held here so `stop()`
+    /// can end it from outside the task tree — the audio pipeline then
+    /// drains naturally rather than being aborted via cancellation, which
+    /// is what gives us trailing-audio flush on Stop.
+    private var activeAudioSource: AudioSource?
 
     /// Set by a settings-change observer; read by run()'s defer. When
     /// true after the current run winds down, defer spawns a fresh run.
@@ -147,14 +163,6 @@ final class Pipeline: ObservableObject {
         self.transcriber = transcriber ?? WhisperCppTranscriber()
         self.translator = translator ?? AppleTranslator()
 
-        // The locale list is still SFSpeechRecognizer's — it's a
-        // convenient pre-built BCP-47 set, even though the active
-        // transcriber backend (whisper.cpp) doesn't need Apple's
-        // speech models. Whisper itself accepts any 2-letter prefix.
-        self.availableSources = SFSpeechRecognizer.supportedLocales()
-            .map { SourceLocale(identifier: $0.identifier) }
-            .sorted { $0.identifier < $1.identifier }
-
         self.source = Self.load(SourceLocale.self, forKey: K.source,
                                 defaultValue: SourceLocale(identifier: "de-DE"))
         self.target = Self.load(TargetLanguage.self, forKey: K.target,
@@ -172,21 +180,31 @@ final class Pipeline: ObservableObject {
         // Explicit user stop cancels any pending auto-restart from a
         // recent settings change.
         restartRequested = false
-        runTask?.cancel()
+        // Graceful shutdown: stopping the audio source ends the
+        // broadcaster's `buffers` AsyncStreams, which lets the
+        // recognition accumulator emit any in-flight chunk and the
+        // worker drain the queue before run()'s for-await exits. Without
+        // this, cancellation would abort the pipeline mid-flight and
+        // drop trailing audio.
+        if let active = activeAudioSource {
+            Task { await active.stop() }
+        }
         // Don't nil runTask here — let run()'s defer do it after the
         // wind-down completes, so a redundant Stop press is a no-op
         // instead of starting a fresh run on top.
     }
 
-    /// Called from the source/target property observers. Cancels the
-    /// in-flight run if any, flagging that the wind-down should spawn
-    /// a fresh replacement. No-op when no run is active — the next
-    /// manual Start already picks up the new settings.
+    /// Called from the source/target property observers. Stops the audio
+    /// source so the current run drains naturally, then run()'s defer
+    /// spawns a fresh replacement. No-op when no run is active — the
+    /// next manual Start already picks up the new settings.
     private func requestRestartIfRunning() {
         guard runTask != nil else { return }
         Log.line("Pipeline.requestRestart() — settings changed mid-run")
         restartRequested = true
-        runTask?.cancel()
+        if let active = activeAudioSource {
+            Task { await active.stop() }
+        }
     }
 
     func clear() {
@@ -230,10 +248,11 @@ final class Pipeline: ObservableObject {
             recorder = nil
             sourceSubs = nil
             targetSubs = nil
+            activeAudioSource = nil
             // A settings change while we were running flagged
-            // restartRequested and cancelled us. Spawn a fresh run
-            // with a clean visible list (the just-flushed sentences
-            // are already on disk).
+            // restartRequested and stopped the audio source. Spawn a
+            // fresh run with a clean visible list (the just-flushed
+            // sentences are already on disk).
             if restartRequested {
                 restartRequested = false
                 sentences = []
@@ -241,12 +260,9 @@ final class Pipeline: ObservableObject {
             }
         }
 
-        // 1. Permissions. Mic via TCC up front; SCK prompts on its own when
-        //    the stream starts. Both are mandatory — the app always mixes
-        //    mic + system audio so the user can talk and translate ambient
-        //    audio (videos, calls) without choosing one. Speech-recognition
-        //    permission is no longer requested — whisper.cpp runs locally
-        //    against its own model and doesn't touch Apple's Speech APIs.
+        // 1. Permissions. Mic via TCC up front; SCK prompts on its own
+        //    when the stream starts. Both are mandatory — the app
+        //    always mixes mic + system audio.
         status = .requestingPermissions
         let micGranted: Bool = await withCheckedContinuation { c in
             AVCaptureDevice.requestAccess(for: .audio) { c.resume(returning: $0) }
@@ -255,6 +271,7 @@ final class Pipeline: ObservableObject {
 
         // 2. Active source is always the mixed mic+system stream.
         let active: AudioSource = MixedAudioSource(micSource, systemSource)
+        activeAudioSource = active
 
         // 3. Start audio.
         status = .starting
@@ -264,9 +281,7 @@ final class Pipeline: ObservableObject {
             status = .stopped(reason: "Audio: \(error.localizedDescription)"); return
         }
 
-        // 4. Open paired output files for this run. JSONL + WAV + two
-        //    SRT subtitle files (source and target language), all
-        //    sharing the same timestamp stem.
+        // 4. Open paired output files for this run.
         runStartedAt = Date()
         let srcLangCode = String(source.identifier.prefix(2))
         let tgtLangCode = target.code
@@ -275,7 +290,6 @@ final class Pipeline: ObservableObject {
             archive = try TranscriptArchive(at: outputs.transcript)
             recorder = try AudioRecorder(at: outputs.recording)
             sourceSubs = try SubtitleArchive(at: outputs.subtitle(srcLangCode))
-            // Skip target SRT if it would clobber the source one (same lang).
             if tgtLangCode != srcLangCode {
                 targetSubs = try SubtitleArchive(at: outputs.subtitle(tgtLangCode))
             }
@@ -290,18 +304,35 @@ final class Pipeline: ObservableObject {
 
         status = .running
 
-        // 5. Workers in a TaskGroup so cancellation cascades. Only ONE
-        //    recognition cycle — that's the whole point of mixing.
-        //    A second consumer of `active.buffers` records the mixed
-        //    audio to disk in parallel.
+        // 5. Background workers (translation + prune): infinite loops
+        //    driven by `while !Task.isCancelled`. Run as a separate
+        //    cancellable Task so stopping them doesn't disturb the
+        //    audio-path drain.
+        let backgroundTask = Task {
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { await self.runTranslationLoop() }
+                group.addTask { await self.runPruneLoop() }
+            }
+        }
+
+        // 6. Audio path: recognition + recording. Both consume
+        //    `active.buffers`; both exit naturally when the audio
+        //    source's `stop()` closes the broadcaster's streams.
+        //    No cancellation involved — that's what lets the
+        //    transcriber emit a final chunk for trailing audio.
         await withTaskGroup(of: Void.self) { group in
-            group.addTask { await self.runTranslationLoop() }
-            group.addTask { await self.runPruneLoop() }
             group.addTask { await self.runRecognitionCycle(audioSource: active) }
             group.addTask { await self.runRecordingLoop(audioSource: active) }
         }
+        Log.line("Audio path drained")
 
-        // 6. Audio cleanup. Awaited so the next Start sees a clean source.
+        // 7. Audio drained. Now cancel background workers and wait.
+        backgroundTask.cancel()
+        _ = await backgroundTask.value
+
+        // 8. Final audio cleanup. `stop()` is idempotent — running it
+        //    twice (once from Pipeline.stop, once here on natural exit)
+        //    is fine.
         await active.stop()
     }
 
@@ -346,17 +377,25 @@ final class Pipeline: ObservableObject {
     /// Append every sentence in the snapshot as a new `Sentence`. No
     /// in-place edits, no UUID reuse — every snapshot represents fresh
     /// content from a closed chunk.
+    ///
+    /// Timestamps from the transcriber are anchored against
+    /// `runStartedAt` so they map directly to positions in the paired
+    /// `.wav`. If the backend didn't report timing, we fall back to
+    /// `Date()`.
     private func ingest(_ snapshot: SessionSnapshot) {
         if snapshot.sentences.isEmpty { return }
         let now = Date()
         for ss in snapshot.sentences {
             let trimmed = ss.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
+            let startedAt = ss.startSeconds.map { runStartedAt.addingTimeInterval($0) } ?? now
+            let endedAt = ss.endSeconds.map { runStartedAt.addingTimeInterval($0) } ?? now
             sentences.append(Sentence(
                 id: UUID(),
                 text: trimmed,
                 translation: "",
-                createdAt: now,
+                createdAt: startedAt,
+                endsAt: max(startedAt, endedAt),
                 lastModified: now
             ))
         }
@@ -408,7 +447,9 @@ final class Pipeline: ObservableObject {
     /// against a sentence that was pruned between dispatch and result
     /// landing. `originalSource` defends against rare ID reuse — only
     /// applies if the sentence still has the same source text we
-    /// translated.
+    /// translated. Bumps `lastModified` (a prune-freshness signal),
+    /// but never touches `createdAt` / `endsAt` — those are anchored
+    /// to the actual audio span and must not drift.
     private func applyTranslation(_ translated: String, to id: UUID, originalSource: String) {
         guard let idx = sentences.firstIndex(where: { $0.id == id }),
               sentences[idx].text == originalSource
@@ -479,11 +520,13 @@ final class Pipeline: ObservableObject {
     /// Fan one outgoing sentence to every writer: JSONL transcript, source
     /// SRT subtitle, target SRT subtitle (if the translation is present and
     /// the languages differ). The audio recorder is fed elsewhere (it
-    /// consumes the buffer broadcaster directly).
+    /// consumes the buffer broadcaster directly). SRT cue times are
+    /// offsets from `runStartedAt` so they map straight onto the paired
+    /// `.wav`'s timeline.
     private func archiveDrop(_ s: Sentence) {
         archive?.append(s)
         let start = s.createdAt.timeIntervalSince(runStartedAt)
-        let end = max(start, s.lastModified.timeIntervalSince(runStartedAt))
+        let end = max(start, s.endsAt.timeIntervalSince(runStartedAt))
         sourceSubs?.append(text: s.text, startSeconds: start, endSeconds: end)
         if !s.translation.isEmpty {
             targetSubs?.append(text: s.translation, startSeconds: start, endSeconds: end)

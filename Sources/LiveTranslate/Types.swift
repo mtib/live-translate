@@ -32,11 +32,32 @@ struct TargetLanguage: Hashable, Identifiable, Codable {
 /// One sentence as the active recognition session currently sees it. The
 /// Transcriber owns sentence splitting — the Pipeline stays ignorant of
 /// how any particular backend formats its output.
+///
+/// **Audio-stream timing**: when the backend can locate the sentence
+/// inside the captured audio, it sets `startSeconds` / `endSeconds`
+/// — offsets in seconds from the start of the audio stream the
+/// transcriber received. Pipeline anchors those to `runStartedAt` so
+/// SRT cue times map directly to positions in the paired `.wav`
+/// (both files start at the same audio-stream sample, since the
+/// recorder and the transcriber subscribe to the same broadcaster).
+/// Backends without per-utterance timing leave them nil; Pipeline
+/// then falls back to ingest-time `Date()`.
 struct SessionSentence: Sendable, Equatable {
     let text: String
     /// True when the backend has finalized this sentence (terminator
     /// emitted, or whole session ending).
     let isFinal: Bool
+    /// Seconds from the start of the audio stream, or nil.
+    let startSeconds: Double?
+    /// Seconds from the start of the audio stream, or nil.
+    let endSeconds: Double?
+
+    init(text: String, isFinal: Bool, startSeconds: Double? = nil, endSeconds: Double? = nil) {
+        self.text = text
+        self.isFinal = isFinal
+        self.startSeconds = startSeconds
+        self.endSeconds = endSeconds
+    }
 }
 
 /// A snapshot of sentences emitted by the active transcription chunk.
@@ -65,14 +86,20 @@ struct Sentence: Identifiable, Equatable {
     let text: String
     /// Target-language text. Empty until the translator handles it.
     var translation: String
-    /// Wall-clock time the sentence was emitted. Used as the **start
-    /// time** when writing SRT subtitle cues, and as the prune cutoff.
+    /// Wall-clock time when the **audio** for this sentence began.
+    /// Anchored on `runStartedAt + startSeconds` from the transcriber,
+    /// so SRT cue start and JSONL "start" line up with the matching
+    /// position in the `.wav` (both sources subscribe to the same audio
+    /// broadcaster). Falls back to ingest-time `Date()` for backends
+    /// that don't report timing.
     let createdAt: Date
-    /// Wall-clock time the sentence was last touched. For the source
-    /// text this equals `createdAt` (text doesn't change); the
-    /// translation worker pushes it forward when the translation lands,
-    /// so the SRT cue **end time** captures "still visible at" rather
-    /// than "transcribed at".
+    /// Wall-clock time when the **audio** for this sentence ended.
+    /// Used as SRT cue end and JSONL "end". Not changed when the
+    /// translation lands (that's a separate field).
+    let endsAt: Date
+    /// Wall-clock time the sentence was last touched in memory — bumped
+    /// when the translation lands. Used by `prune()` so a freshly-
+    /// translated row gets a stay of execution. Never written to disk.
     var lastModified: Date
 }
 

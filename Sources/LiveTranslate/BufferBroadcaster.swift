@@ -43,4 +43,17 @@ final class BufferBroadcaster {
         let conts = lock.withLock { Array(listeners.values) }
         for c in conts { c.yield(buffer) }
     }
+
+    /// Close every active subscription so consumers' `for await` loops
+    /// exit naturally. Called by audio sources on stop — this is what
+    /// lets the Pipeline drain trailing audio rather than aborting
+    /// mid-flight via task cancellation.
+    func finishAll() {
+        let conts = lock.withLock { () -> [AsyncStream<AVAudioPCMBuffer>.Continuation] in
+            let cs = Array(listeners.values)
+            listeners.removeAll()
+            return cs
+        }
+        for c in conts { c.finish() }
+    }
 }

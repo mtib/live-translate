@@ -66,6 +66,9 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
         self.stream = nil
         do { try await stream.stopCapture() }
         catch { Log.line("SystemAudio: stopCapture error: \(error)") }
+        // Close every live `buffers` subscription so consumers' for-await
+        // loops exit naturally on Stop.
+        broadcaster.finishAll()
         Log.line("SystemAudio: capture stopped")
     }
 

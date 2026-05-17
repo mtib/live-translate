@@ -107,6 +107,10 @@ final class MixedAudioSource: AudioSource {
         await micSource.stop()
         await systemSource.stop()
         queueLock.withLock { systemQueue.removeAll() }
+        // Close every live `buffers` subscription so the recognition
+        // pipeline drains naturally rather than aborting via task
+        // cancellation (which would lose trailing audio).
+        broadcaster.finishAll()
         Log.line("MixedAudioSource: stopped")
     }
 
