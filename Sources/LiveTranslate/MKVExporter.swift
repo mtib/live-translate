@@ -114,6 +114,12 @@ enum MKVExporter {
         }
         args.append(contentsOf: [
             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage",
+            // `-pix_fmt yuv420p` is load-bearing — without it the
+            // ultrafast/stillimage combo leaves `pix_fmt=unknown` in
+            // the output stream metadata and VLC refuses to render
+            // the video track (treats the MKV as audio-only, hiding
+            // the subtitles too).
+            "-pix_fmt", "yuv420p",
             "-c:a", "aac",
             "-c:s", "srt",
         ])
