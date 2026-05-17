@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import Speech
+import Accelerate
 
 /// Apple Speech framework backend. One call to `transcribe(...)` runs ONE
 /// recognition session — Apple's on-device recognizer caps sessions at
@@ -40,6 +41,11 @@ final class AppleSpeechTranscriber: Transcriber {
             request.shouldReportPartialResults = true
             request.requiresOnDeviceRecognition = false  // allow cloud fallback if local model missing
             request.addsPunctuation = true
+            // .dictation tells Apple Speech to expect long-form natural
+            // speech (versus .search for short queries / .confirmation
+            // for yes-no). Biases the engine toward sentence structure
+            // and natural punctuation — closest match for our use case.
+            request.taskHint = .dictation
             Log.line("Transcriber[\(locale.identifier)]: session opened")
 
             let task = recognizer.recognitionTask(with: request) { result, error in
@@ -59,10 +65,51 @@ final class AppleSpeechTranscriber: Transcriber {
                 }
             }
 
-            // Pump audio into the recognition request from the shared stream.
+            // Pump audio into the recognition request, AND detect long
+            // silences so we can end the session early. The latter lets
+            // Apple emit a final result with real segment timestamps,
+            // which the splitter then uses to break the text on pause
+            // boundaries (Apple leaves timestamps at zero on partials,
+            // see CLAUDE.md lesson 15a). Net effect: a real-world pause
+            // produces a clean sentence break within ~1 s.
             let pump = Task {
+                let sampleRate: Float = 16_000
+                let silenceFramesForBreak = Int(sampleRate * Float(Self.endSessionAfterSilence))
+                let warmupFrames = Int(sampleRate * Float(Self.sessionWarmup))
+                var totalFrames = 0
+                var consecutiveSilentFrames = 0
+                var hadVoice = false
+
                 for await buf in audio {
                     request.append(buf)
+                    let n = Int(buf.frameLength)
+                    totalFrames += n
+
+                    // RMS of this buffer. AVAudioPCMBuffer is 16 kHz mono
+                    // Float32 by the time we get here (both audio sources
+                    // normalise to that format).
+                    guard let data = buf.floatChannelData?[0] else { continue }
+                    var ms: Float = 0
+                    vDSP_measqv(data, 1, &ms, vDSP_Length(n))
+                    let rms = sqrt(ms)
+
+                    if rms >= Self.silenceRMSThreshold {
+                        hadVoice = true
+                        consecutiveSilentFrames = 0
+                        continue
+                    }
+                    consecutiveSilentFrames += n
+
+                    // Only break sessions that have actually heard voice
+                    // and are past the warmup. Without these guards the
+                    // recognizer would be reset every second of dead air.
+                    if hadVoice
+                        && totalFrames > warmupFrames
+                        && consecutiveSilentFrames >= silenceFramesForBreak {
+                        Log.line("Transcriber[\(locale.identifier)]: silence \(String(format: "%.1f", Float(consecutiveSilentFrames) / sampleRate))s, ending session at \(String(format: "%.1f", Float(totalFrames) / sampleRate))s")
+                        request.endAudio()
+                        return  // exit pump; the recognizer will emit a final result
+                    }
                 }
                 request.endAudio()
             }
@@ -77,19 +124,37 @@ final class AppleSpeechTranscriber: Transcriber {
 
     // MARK: - Splitter
 
-    /// Pause threshold for sentence boundaries. Apple's recognizer often
-    /// omits a period when the speaker doesn't fully stop, so we *also*
-    /// split when the inter-word gap exceeds this. Tunable.
-    ///
-    /// **Important caveat:** `SFTranscriptionSegment.timestamp` / `.duration`
-    /// are **zero on partial results** on current macOS — the gap-based
-    /// split therefore only fires when the recognizer emits a final
-    /// result (session end or natural finalization). During an ongoing
-    /// session, only punctuation-based splits happen; once a session
-    /// closes (~60 s on-device, sooner on errors/restarts) Apple emits
-    /// a final result with real timestamps and we retroactively split
-    /// the text using pauses.
+    /// Pause threshold (seconds) the splitter uses on a **final** result's
+    /// segment timestamps. Partial-result segments have zero timestamps
+    /// so this only fires on session end — but we now end sessions
+    /// aggressively (see the silence detector below in `transcribe(...)`),
+    /// which makes this fire often in practice.
     static var pauseThreshold: TimeInterval = 0.5
+
+    /// RMS threshold below which we consider a buffer "silent" for the
+    /// purposes of the in-pump silence detector. Voice usually sits well
+    /// above this; background-noise floor sits below. Tunable.
+    static var silenceRMSThreshold: Float = 0.01
+
+    /// How much continuous silence (in seconds) inside one recognition
+    /// session triggers a forced `endAudio()` — which lets Apple emit
+    /// a final result with proper timestamps so the pause-aware splitter
+    /// can break the text into multiple sentences. Sized to be longer
+    /// than a "thinking pause" so we don't chop mid-thought; speaker
+    /// turn-changes typically have more dead air than that.
+    static var endSessionAfterSilence: TimeInterval = 1.8
+
+    /// Ignore the silence detector for this long after a session starts —
+    /// Apple's recognizer often opens with a brief calibration silence
+    /// that we don't want to count as a sentence break.
+    static var sessionWarmup: TimeInterval = 1.5
+
+    /// Soft cap on a running sentence's word count. When the splitter has
+    /// accumulated this many tokens and then encounters a comma, it
+    /// breaks the sentence at the comma instead of letting it grow
+    /// unbounded. Catches long run-on monologues where the recognizer
+    /// hasn't inserted a period.
+    static var maxWordsBeforeCommaBreak: Int = 14
 
     /// Split a recognition result into sentences using two signals:
     ///   1. Sentence-terminating punctuation (`.` `!` `?` `\n`).
@@ -133,11 +198,22 @@ final class AppleSpeechTranscriber: Transcriber {
             currentTokens.append(seg.substring)
             prevEnd = seg.timestamp + seg.duration
 
-            // Punctuation-based split: if this token ends with a sentence
-            // terminator, the sentence ends here.
+            // Hard split: token ends a sentence (period/!/?), or contains a newline.
             if let last = seg.substring.last, "!.?".contains(last) {
                 flush(asFinal: true)
-            } else if seg.substring.contains("\n") {
+                continue
+            }
+            if seg.substring.contains("\n") {
+                flush(asFinal: true)
+                continue
+            }
+            // Soft split: a comma in a sentence that's grown beyond the
+            // configured length cap. Stops run-on streams (long monologue,
+            // recognizer never inserted a period) from becoming one giant
+            // row that spans multiple speaker turns.
+            if let last = seg.substring.last,
+               last == ",",
+               currentTokens.count >= Self.maxWordsBeforeCommaBreak {
                 flush(asFinal: true)
             }
         }
