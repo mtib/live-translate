@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 
 /// Shell out to ffmpeg to build the per-session MKV from the work dir
 /// contents (per-source WAVs + already-merged SRTs). No SRT merging
@@ -40,11 +41,19 @@ enum MKVExporter {
             return fm.fileExists(atPath: url.path) ? (url, lang) : nil
         }
 
+        // Compute the longest audio duration so we can bound the
+        // lavfi video — otherwise `-shortest` would trim the output
+        // to the last SRT cue's end time (since subtitle streams
+        // count toward "shortest" too).
+        let micDur = haveMic ? duration(of: micWAV) : 0
+        let sysDur = haveSys ? duration(of: sysWAV) : 0
+        let videoDuration = max(micDur, sysDur, 0.5)
         let args = buildArgs(
             micWAV: haveMic ? micWAV : nil,
             sysWAV: haveSys ? sysWAV : nil,
             srts: srtFiles,
-            output: outputs.mkvOutput
+            output: outputs.mkvOutput,
+            videoDuration: videoDuration
         )
         Log.line("MKVExporter: running ffmpeg (langs=\(srtFiles.map(\.1)))")
         do {
@@ -58,12 +67,18 @@ enum MKVExporter {
     // MARK: - ffmpeg argv
 
     private static func buildArgs(
-        micWAV: URL?, sysWAV: URL?, srts: [(URL, String)], output: URL
+        micWAV: URL?, sysWAV: URL?, srts: [(URL, String)], output: URL,
+        videoDuration: Double
     ) -> [String] {
+        // `-t` before `-i` bounds the lavfi color generator to the
+        // audio's length. Combined with no `-shortest` further down,
+        // the output runs as long as the longest audio input and isn't
+        // trimmed to the last subtitle cue.
         var args: [String] = [
             "-y",
             "-loglevel", "warning",
-            "-f", "lavfi", "-i", "color=c=black:s=640x360:r=2",
+            "-f", "lavfi", "-t", String(format: "%.3f", videoDuration),
+            "-i", "color=c=black:s=640x360:r=2",
         ]
         var audioInputs: [Int] = []
         var nextIdx = 1
@@ -108,8 +123,20 @@ enum MKVExporter {
         if !srts.isEmpty {
             args.append(contentsOf: ["-disposition:s:0", "default"])
         }
-        args.append(contentsOf: ["-shortest", output.path])
+        // No `-shortest` — the lavfi `-t` above caps the video, and
+        // the audio runs as long as its WAV. Subtitle streams (whose
+        // duration is "last cue end") would otherwise force an early
+        // cut-off when speech ends before the recording does.
+        args.append(output.path)
         return args
+    }
+
+    /// AVFoundation-based WAV duration probe. `length / sampleRate` is
+    /// exact for PCM and avoids the ffprobe round-trip.
+    private static func duration(of url: URL) -> Double {
+        guard let file = try? AVAudioFile(forReading: url) else { return 0 }
+        let sr = file.processingFormat.sampleRate
+        return sr > 0 ? Double(file.length) / sr : 0
     }
 
     private static func locateFFmpeg() -> String? {
