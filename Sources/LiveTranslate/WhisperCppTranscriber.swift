@@ -425,42 +425,34 @@ final class WhisperCppTranscriber: Transcriber {
                 Log.line("accumulator[\(sourceTag)]: sampleRate=\(sampleRate) Hz from first buffer")
             }
 
-            // Per-buffer RMS first — it's what drives both the
-            // VAD decision and (for mic) the crosstalk gate.
+            // Per-buffer RMS — drives the VAD decision below. For the
+            // mic stream, the buffer arriving here may already be
+            // silenced by `DenoisingAudioSource(mic)`'s upstream
+            // crosstalk gate (which zeros the audio when system is
+            // recently voiced). That's why we don't need a separate
+            // mute branch here anymore — the RMS just falls below the
+            // threshold during system playback and the rest of the
+            // VAD logic does the right thing.
             guard let data = buf.floatChannelData?[0] else { continue }
             var ms: Float = 0
             vDSP_measqv(data, 1, &ms, vDSP_Length(n))
             let rms = sqrt(ms)
 
-            // Crosstalk suppression: when system is currently voiced
-            // (recently), mic audio is contaminated with speaker bleed.
-            // Replace this buffer's 16 kHz samples with silence and
-            // skip voiced-span bookkeeping so the chunk won't claim
-            // voice during the bleed window. The chunk timing still
-            // advances (sampleEverEmitted), so the next genuine voice
-            // segment lines up with the WAV correctly.
-            let mute = (source == .mic) && self.isSystemRecentlyVoiced()
-
             let bufStart16k = samples16k.count
-            if mute {
-                // Append the right *count* of silent samples (estimated
-                // from the rate ratio) so timestamps stay accurate.
-                let ratio = 16_000.0 / Double(buf.format.sampleRate)
-                let n16 = Int(Double(n) * ratio)
-                samples16k.append(contentsOf: repeatElement(0, count: n16))
-            } else if let resampled = converter.convert(buf) {
+            if let resampled = converter.convert(buf) {
                 samples16k.append(contentsOf: resampled)
             }
             let bufEnd16k = samples16k.count
             samplesEverEmitted16k += (bufEnd16k - bufStart16k)
 
-            // System publishes its voiced state so the mic accumulator
-            // can suppress crosstalk windows on the other side.
+            // System publishes its voiced state so the mic side's
+            // upstream gate (and any future direct consumers) can
+            // suppress crosstalk windows.
             if source == .system && rms >= Self.silenceRMSThreshold {
                 self.markSystemVoiced()
             }
 
-            if !mute && rms >= Self.silenceRMSThreshold {
+            if rms >= Self.silenceRMSThreshold {
                 hadVoice = true
                 consecutiveSilentFrames = 0
                 if firstVoiceSample16k == nil {

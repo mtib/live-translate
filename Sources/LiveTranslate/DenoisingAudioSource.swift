@@ -20,6 +20,12 @@ final class DenoisingAudioSource: AudioSource {
     private let denoiser = RNNoiseProcessor()
     private let broadcaster = BufferBroadcaster()
     private let label: String
+    /// Optional crosstalk gate. When set and returns `true`, the
+    /// outgoing buffer is replaced with silence before broadcasting —
+    /// so every downstream consumer (recorder + transcriber) sees the
+    /// same muted audio. Pipeline wires this on the mic instance to
+    /// suppress speaker bleed during system playback.
+    private let muteWhen: (@Sendable () -> Bool)?
 
     /// Pump task: pulls denoised samples through RNNoise and re-emits.
     /// Lifetime is bounded by the upstream's `buffers` stream — when
@@ -29,9 +35,10 @@ final class DenoisingAudioSource: AudioSource {
 
     var buffers: AsyncStream<AVAudioPCMBuffer> { broadcaster.stream }
 
-    init(_ upstream: AudioSource, label: String) {
+    init(_ upstream: AudioSource, label: String, muteWhen: (@Sendable () -> Bool)? = nil) {
         self.upstream = upstream
         self.label = label
+        self.muteWhen = muteWhen
     }
 
     func start() async throws {
@@ -85,6 +92,13 @@ final class DenoisingAudioSource: AudioSource {
             // latency at 48 kHz). Pad with silence rather than emit
             // garbage.
             memset(outData.advanced(by: drained), 0, (n - drained) * MemoryLayout<Float>.size)
+        }
+        // Crosstalk gate (mic only, when system is voiced) — replace
+        // the whole buffer with silence. Done AFTER denoising so the
+        // RNNoise GRU stays in a sensible state on the next non-muted
+        // buffer (feeding it zeros would skew its envelope follower).
+        if muteWhen?() == true {
+            memset(outData, 0, n * MemoryLayout<Float>.size)
         }
         return out
     }

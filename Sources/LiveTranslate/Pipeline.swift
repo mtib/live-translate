@@ -405,9 +405,20 @@ final class Pipeline: ObservableObject {
         }
         guard micGranted else { status = .stopped(reason: "Microphone permission denied"); return }
 
-        // 2. Per-stream `DenoisingAudioSource`s. Started in parallel —
-        //    mic and SCK startups are independent.
-        let micDenoised = DenoisingAudioSource(micSource, label: "mic")
+        // 2. Per-stream `DenoisingAudioSource`s. The mic instance gets
+        //    a crosstalk gate that queries the transcriber's
+        //    `lastSystemVoicedAt` and zeros the buffer when system was
+        //    recently voiced. Applied upstream of the broadcaster so
+        //    BOTH consumers (AudioRecorder + transcriber accumulator)
+        //    see the same muted audio — without this, `.mic.wav` still
+        //    had the raw speaker bleed even though the transcript
+        //    suppressed it.
+        let whisper = self.transcriber as? WhisperCppTranscriber
+        let micDenoised = DenoisingAudioSource(
+            micSource,
+            label: "mic",
+            muteWhen: { [weak whisper] in whisper?.isSystemRecentlyVoiced() ?? false }
+        )
         let systemDenoised = DenoisingAudioSource(systemSource, label: "system")
         let denoised: [SourceTag: AudioSource] = [.mic: micDenoised, .system: systemDenoised]
 
