@@ -141,7 +141,10 @@ enum MKVExporter {
         args.append(contentsOf: ["-disposition:v:0", "default"])
         args.append(contentsOf: ["-disposition:a:0", "default"])
         if !srts.isEmpty {
-            args.append(contentsOf: ["-disposition:s:0", "default"])
+            // `default+forced` — `default` picks the track on open,
+            // `forced` makes VLC actually render its cues without
+            // the user manually enabling subtitles via the menu.
+            args.append(contentsOf: ["-disposition:s:0", "default+forced"])
         }
         // No `-shortest` — the lavfi `-t` above caps the video, and
         // the audio runs as long as its WAV. Subtitle streams (whose

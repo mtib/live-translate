@@ -304,22 +304,16 @@ final class Pipeline: ObservableObject {
         enforceMaxCount()
     }
 
-    /// Write a freshly-graduated sentence to every persistent output:
-    /// shared JSONL, per-source SRTs (via `SourcePipeline.archiveSRT`),
-    /// and per-language merged SRTs (with `[Mic]` / `[Sys]` prefix).
+    /// Write a freshly-graduated sentence to disk: shared JSONL +
+    /// per-language merged SRTs (with `[Mic]` / `[Sys]` prefix).
     /// All writes are queue-backed so this returns immediately.
     private func recordSentence(_ s: Sentence) {
         archive?.append(s)
         let prefix = "[\(s.source.shortLabel)]"
         let start = s.createdAt.timeIntervalSince(runStartedAt)
         let end = max(start, s.endsAt.timeIntervalSince(runStartedAt))
-        sourcePipelines[s.source]?.archiveSRT(s)
-        // Source-language merged: always.
         let srcLang = String(source.identifier.prefix(2))
         mergedSubtitles[srcLang]?.add(text: s.text, prefix: prefix, startSeconds: start, endSeconds: end)
-        // Target-language merged: only if translation present and
-        // distinct from source. Otherwise we'd write the same text
-        // twice or write into the same file.
         let tgtLang = target.code
         if tgtLang != srcLang, !s.translation.isEmpty {
             mergedSubtitles[tgtLang]?.add(text: s.translation, prefix: prefix, startSeconds: start, endSeconds: end)
@@ -488,23 +482,17 @@ final class Pipeline: ObservableObject {
         }
         currentOutputs = outputs
 
-        // 4. Build per-source pipelines with their own recorder + SRTs.
+        // 4. Build per-source pipelines (just a recorder per stream —
+        //    SRT writing happens at the merged level in
+        //    `recordSentence`).
         for tag in SourceTag.allCases {
             guard let src = denoised[tag] else { continue }
-            let recorder = try? AudioRecorder(at: outputs.recording(tag))
-            let sourceSubs = try? SubtitleArchive(at: outputs.subtitle(tag, srcLangCode))
-            let targetSubs: SubtitleArchive? = (srcLangCode == tgtLangCode)
-                ? nil
-                : try? SubtitleArchive(at: outputs.subtitle(tag, tgtLangCode))
             sourcePipelines[tag] = SourcePipeline(
                 source: tag,
                 audioSource: src,
                 transcriber: self.transcriber,
                 locale: self.source,
-                runStartedAt: runStartedAt,
-                recorder: recorder,
-                sourceSubs: sourceSubs,
-                targetSubs: targetSubs
+                recorder: try? AudioRecorder(at: outputs.recording(tag))
             )
         }
         // 4b. Open live merged-SRT archives, one per distinct language.
