@@ -63,9 +63,12 @@ struct Sentence: Identifiable, Equatable {
     /// detect when a sentence has drifted and needs another translation
     /// pass — so the pipeline doesn't keep ballooning with repeat work.
     var lastTranslatedSource: String
+    /// Wall-clock time the sentence first appeared in the array. Used
+    /// as the **start time** when writing SRT subtitle cues.
+    let createdAt: Date
     /// Wall-clock time the source text last changed. Prune uses this to
-    /// evict sentences quiet for `maxAgeSeconds`. Translation debounce
-    /// uses this to skip partials that are still actively growing.
+    /// evict sentences quiet for `maxAgeSeconds`; SRT writer uses it as
+    /// the cue **end time**.
     var lastModified: Date
     /// True once the backend has emitted a sentence terminator. Final
     /// sentences won't be rewritten; only translation may update.

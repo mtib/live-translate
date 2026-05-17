@@ -99,6 +99,11 @@ final class Pipeline: ObservableObject {
     private var runTask: Task<Void, Never>?
     private var archive: TranscriptArchive?
     private var recorder: AudioRecorder?
+    private var sourceSubs: SubtitleArchive?
+    private var targetSubs: SubtitleArchive?
+    /// Wall-clock instant the current run's recording started. Used to
+    /// compute SRT cue offsets (`sentence.createdAt - runStartedAt`).
+    private var runStartedAt: Date = .distantPast
 
     // MARK: - Persistence
 
@@ -166,14 +171,14 @@ final class Pipeline: ObservableObject {
         (translator as? AppleTranslator)?.setSession(session)
     }
 
-    /// Flush every still-visible sentence to the JSONL archive, then
-    /// block briefly so all queued writes (transcript + audio) land on
+    /// Flush every still-visible sentence to every output, then block
+    /// briefly so queued writes (transcript + audio + SRTs) land on
     /// disk. Safe to call from `applicationWillTerminate`. Idempotent.
     func flushPendingSentences() {
-        if let archive {
-            for s in sentences { archive.append(s) }
-            archive.flush()
-        }
+        for s in sentences { archiveDrop(s) }
+        archive?.flush()
+        sourceSubs?.flush()
+        targetSubs?.flush()
         recorder?.flush()
         sentences = []
     }
@@ -183,13 +188,12 @@ final class Pipeline: ObservableObject {
     private func run() async {
         isActive = true
         defer {
-            // Flush still-visible sentences to the JSONL archive, then
-            // flush both archive + recorder so the last second of audio
-            // and the trailing sentences actually land on disk.
-            if let archive {
-                for s in sentences { archive.append(s) }
-                archive.flush()
-            }
+            // Flush still-visible sentences to every output before letting
+            // the writers drop, so a clean Stop persists in-flight content.
+            for s in sentences { archiveDrop(s) }
+            archive?.flush()
+            sourceSubs?.flush()
+            targetSubs?.flush()
             recorder?.flush()
             if case .stopped = status { } else { status = .idle }
             runTask = nil
@@ -198,6 +202,8 @@ final class Pipeline: ObservableObject {
             lastSnapshot = nil
             archive = nil
             recorder = nil
+            sourceSubs = nil
+            targetSubs = nil
         }
 
         // 1. Permissions. Mic via TCC up front; SCK prompts on its own when
@@ -225,17 +231,28 @@ final class Pipeline: ObservableObject {
             status = .stopped(reason: "Audio: \(error.localizedDescription)"); return
         }
 
-        // 4. Open paired output files for this run. Same timestamp for
-        //    both so callers can pair the JSONL and the .wav by stem.
+        // 4. Open paired output files for this run. JSONL + WAV + two
+        //    SRT subtitle files (source and target language), all
+        //    sharing the same timestamp stem.
+        runStartedAt = Date()
+        let srcLangCode = String(source.identifier.prefix(2))
+        let tgtLangCode = target.code
         do {
-            let outputs = try Paths.newRunOutputs()
+            let outputs = try Paths.newRunOutputs(now: runStartedAt)
             archive = try TranscriptArchive(at: outputs.transcript)
             recorder = try AudioRecorder(at: outputs.recording)
-            Log.line("Run outputs: \(outputs.timestamp) (transcript + recording)")
+            sourceSubs = try SubtitleArchive(at: outputs.subtitle(srcLangCode))
+            // Skip target SRT if it would clobber the source one (same lang).
+            if tgtLangCode != srcLangCode {
+                targetSubs = try SubtitleArchive(at: outputs.subtitle(tgtLangCode))
+            }
+            Log.line("Run outputs: \(outputs.timestamp) (.jsonl, .wav, .\(srcLangCode).srt\(tgtLangCode == srcLangCode ? "" : ", .\(tgtLangCode).srt"))")
         } catch {
             Log.line("Pipeline: opening output files failed: \(error.localizedDescription)")
             archive = nil
             recorder = nil
+            sourceSubs = nil
+            targetSubs = nil
         }
 
         status = .running
@@ -357,6 +374,7 @@ final class Pipeline: ObservableObject {
                     text: sessionSentence.text,
                     translation: "",
                     lastTranslatedSource: "",
+                    createdAt: now,
                     lastModified: now,
                     isFinal: sessionSentence.isFinal
                 )
@@ -494,7 +512,21 @@ final class Pipeline: ObservableObject {
     /// Single point that archives, then drops a sentence. Always use this
     /// rather than `sentences.remove(at:)` directly.
     private func dropSentence(at idx: Int) {
-        archive?.append(sentences[idx])
+        archiveDrop(sentences[idx])
         sentences.remove(at: idx)
+    }
+
+    /// Fan one outgoing sentence to every writer: JSONL transcript, source
+    /// SRT subtitle, target SRT subtitle (if the translation is present and
+    /// the languages differ). The audio recorder is fed elsewhere (it
+    /// consumes the buffer broadcaster directly).
+    private func archiveDrop(_ s: Sentence) {
+        archive?.append(s)
+        let start = s.createdAt.timeIntervalSince(runStartedAt)
+        let end = max(start, s.lastModified.timeIntervalSince(runStartedAt))
+        sourceSubs?.append(text: s.text, startSeconds: start, endSeconds: end)
+        if !s.translation.isEmpty {
+            targetSubs?.append(text: s.translation, startSeconds: start, endSeconds: end)
+        }
     }
 }

@@ -63,9 +63,15 @@ with a `.wav` of the exact mixed audio the recognizer heard:
 
 ```
 ~/Documents/LiveTranslate/
-    transcripts/<stamp>.jsonl
-    recordings/<stamp>.wav
+    transcripts/<stamp>.jsonl       (one sentence per line as JSON)
+    transcripts/<stamp>.<src>.srt   (subtitles, source language)
+    transcripts/<stamp>.<tgt>.srt   (subtitles, translated)
+    recordings/<stamp>.wav          (mixed mic+system audio, 16 kHz mono)
 ```
+
+The `.srt` files use cue times relative to the start of the matching
+`.wav`, so you can drop them straight into a video player along with
+the audio. They're also plain text — `grep -i term *.srt` works.
 
 See [CLAUDE.md](CLAUDE.md) for full architectural notes, the things
 that have bitten us, and the file-by-file map.

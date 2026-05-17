@@ -41,19 +41,38 @@ enum Paths {
         return url
     }
 
-    /// Compute the two paired output paths for a single run. They share
-    /// the same timestamp base name so post-hoc analysis can pair them
-    /// just by stem.
+    /// All output paths for a single run, sharing one timestamp stem.
+    /// Subtitle paths are computed lazily because they depend on the
+    /// language codes the user picked.
     struct Outputs {
         let timestamp: String
-        let transcript: URL
-        let recording: URL
+        let transcript: URL    // …/transcripts/<stamp>.jsonl
+        let recording: URL     // …/recordings/<stamp>.wav
+        private let transcriptsDir: URL
+
+        /// SRT path for one language. `langCode` is a 2-letter ISO code
+        /// like "de" or "en"; pass the same dir as the transcript so
+        /// players can pick subtitles up by suffix matching.
+        func subtitle(_ langCode: String) -> URL {
+            transcriptsDir.appendingPathComponent("\(timestamp).\(langCode).srt")
+        }
+
+        init(timestamp: String, transcript: URL, recording: URL, transcriptsDir: URL) {
+            self.timestamp = timestamp
+            self.transcript = transcript
+            self.recording = recording
+            self.transcriptsDir = transcriptsDir
+        }
     }
     static func newRunOutputs(now: Date = Date()) throws -> Outputs {
         let stamp = runFilenameFormatter.string(from: now)
-        let t = try transcriptsDirectory().appendingPathComponent("\(stamp).jsonl")
-        let r = try recordingsDirectory().appendingPathComponent("\(stamp).wav")
-        return Outputs(timestamp: stamp, transcript: t, recording: r)
+        let tDir = try transcriptsDirectory()
+        return Outputs(
+            timestamp: stamp,
+            transcript: tDir.appendingPathComponent("\(stamp).jsonl"),
+            recording: try recordingsDirectory().appendingPathComponent("\(stamp).wav"),
+            transcriptsDir: tDir
+        )
     }
 }
 

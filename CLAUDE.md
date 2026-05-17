@@ -79,14 +79,24 @@ ScreenCaptureKit) without touching `Pipeline`.
   (last-active) sentence. Earlier session-active sentences are eligible
   to drop; if the recognizer's next snapshot still references them,
   ingest finds no matching UUID and silently skips, so the drop sticks.
-- **Per-run output files.** Each Start opens **two** paired files under
-  one app-private root, sharing a `YYYY-MM-DD_HH-MM-SS` timestamp stem:
+- **Per-run output files.** Each Start opens up to four paired files
+  under one app-private root, sharing a `YYYY-MM-DD_HH-MM-SS` timestamp:
 
   ```
   ~/Documents/LiveTranslate/
-      transcripts/<stamp>.jsonl   ← every sentence ever dropped (prune or max-count)
-      recordings/<stamp>.wav      ← the mixed mic+system audio that fed the recognizer
+      transcripts/<stamp>.jsonl       ← every dropped sentence
+      transcripts/<stamp>.<src>.srt   ← SubRip subtitles, source language
+      transcripts/<stamp>.<tgt>.srt   ← SubRip subtitles, target language
+      recordings/<stamp>.wav          ← mixed mic+system audio
   ```
+
+  The `.srt` files use cue times measured from the start of the
+  recording (so they play in sync with the paired `.wav`) and are
+  plain text — `grep` works as a transcript search tool. Skipped when
+  source == target (no point translating into itself). SRT was chosen
+  over WebVTT / LRC / custom plaintext because every video player
+  (VLC, QuickTime, mpv, browsers via `<track>`, ffmpeg) reads it
+  natively, AND it's readable enough to cat.
 
   The transcript line shape:
   ```json
@@ -117,6 +127,7 @@ ScreenCaptureKit) without touching `Pipeline`.
 | `AppleTranslator.swift` | Holds a `TranslationSession` that the View injects via `Pipeline.installTranslationSession(_:)`. |
 | `TranscriptArchive.swift` | One-per-run JSONL archive. Takes its file URL; doesn't know about layout. |
 | `AudioRecorder.swift` | One-per-run `.wav` writer fed by a parallel consumer of the active source's broadcaster. 16 kHz mono Int16. |
+| `SubtitleArchive.swift` | One-per-language SRT writer. Cue times are offsets into the paired `.wav`. |
 | `Paths.swift` | Single source of truth for `~/Documents/LiveTranslate/{transcripts,recordings}/<stamp>.…`. |
 | `Log.swift` | Append-only file logger at `/tmp/livetranslate.log`. Truncates on launch if > 5 MB. |
 
