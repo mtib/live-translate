@@ -57,46 +57,6 @@ final class MixedAudioSource: AudioSource {
     private var systemScratch: UnsafeMutablePointer<Float>?
     private var systemScratchCapacity: Int = 0
 
-    // MARK: - Per-source AGC (automatic gain control)
-    //
-    // We track a sliding-window RMS for each input and scale each one
-    // toward `agcTargetRMS` before summing. Effect: a quiet mic next to
-    // loud system audio is boosted up; a hot mic is pulled down. Without
-    // this, whichever source is louder dominates the recognizer's input.
-    //
-    // The RMS estimate is an exponential moving average updated per
-    // buffer — fast enough to follow real-life volume changes (~1 s
-    // time constant), slow enough not to "pump" on individual peaks.
-    // Gain is clamped to a sensible range so silence isn't amplified
-    // into noise and a sudden bang isn't crushed.
-
-    /// Target RMS level (linear Float32, ≈ -26 dBFS — comfortable speech).
-    private let agcTargetRMS: Float = 0.05
-
-    /// EMA mix weight per buffer. Slow — about a 1-second time constant
-    /// at ~50 buffers/sec — so the gain doesn't chase short loud bursts
-    /// or short silences. Keeps pumping inaudible.
-    private let agcAlpha: Float = 0.03
-
-    /// Clamp the per-source gain to a *modest* range. Wider clamps
-    /// (the first version of this code used ±12 dB) amplified noise
-    /// floor far enough to confuse the recognizer. ±6 dB is plenty
-    /// to balance two sources whose levels are in the same ballpark
-    /// and stops cold any attempt to "lift" silence into hiss.
-    private let agcMinGain: Float = 0.5    // -6 dB
-    private let agcMaxGain: Float = 2.0    // +6 dB
-
-    /// Below this RMS we don't update the EMA — i.e. background noise
-    /// can't drag the running estimate down to the floor and trick the
-    /// next loud sample into being amplified. Roughly typical mic
-    /// noise-floor + headroom; speech sits well above this.
-    private let agcSilenceRMS: Float = 0.005
-
-    /// Running RMS estimate per source. Initialized to the target so the
-    /// first few buffers don't get a wild boost.
-    private var micRMSEMA: Float
-    private var systemRMSEMA: Float
-
     deinit {
         systemScratch?.deallocate()
     }
@@ -104,8 +64,6 @@ final class MixedAudioSource: AudioSource {
     init(_ mic: AudioSource, _ system: AudioSource) {
         self.micSource = mic
         self.systemSource = system
-        self.micRMSEMA = agcTargetRMS
-        self.systemRMSEMA = agcTargetRMS
     }
 
     func start() async throws {
@@ -200,41 +158,9 @@ final class MixedAudioSource: AudioSource {
             }
         }
 
-        // AGC: compute gains for each source from the running RMS estimate.
-        var micGain = gainFor(samples: micData, count: n, ema: &micRMSEMA)
-        var sysGain = gainFor(samples: scratch, count: n, ema: &systemRMSEMA)
-
-        // outData = micData * micGain
-        vDSP_vsmul(micData, 1, &micGain, outData, 1, vDSP_Length(n))
-        // outData += scratch * sysGain  (vsma: scaled multiply-add in place)
-        vDSP_vsma(scratch, 1, &sysGain, outData, 1, outData, 1, vDSP_Length(n))
+        // outData[i] = micData[i] + scratch[i], SIMD.
+        vDSP_vadd(micData, 1, scratch, 1, outData, 1, vDSP_Length(n))
 
         broadcaster.emit(out)
-    }
-
-    /// Update the EMA RMS for one source and return the gain that would
-    /// pull this buffer toward `agcTargetRMS`. Clamped; silent buffers
-    /// pass through at 1.0 so we don't amplify noise floor.
-    private func gainFor(
-        samples: UnsafePointer<Float>,
-        count: Int,
-        ema: inout Float
-    ) -> Float {
-        var ms: Float = 0
-        vDSP_measqv(samples, 1, &ms, vDSP_Length(count))
-        let rms = sqrt(ms)
-
-        // Update EMA. Skip update on near-silence so a long quiet stretch
-        // doesn't drag the EMA down to zero (which would then boost
-        // by maxGain when audio comes back).
-        if rms > agcSilenceRMS {
-            ema = agcAlpha * rms + (1 - agcAlpha) * ema
-        }
-
-        // Silence pass-through.
-        if ema < agcSilenceRMS { return 1.0 }
-
-        let raw = agcTargetRMS / ema
-        return min(agcMaxGain, max(agcMinGain, raw))
     }
 }
