@@ -22,13 +22,14 @@ final class SystemAudioSource: NSObject, AudioSource, SCStreamOutput, SCStreamDe
     private let broadcaster = BufferBroadcaster()
     var buffers: AsyncStream<AVAudioPCMBuffer> { broadcaster.stream }
 
-    /// Lazy converter: SCK source format → 16 kHz mono Float32 (what
-    /// SFSpeech expects natively and what MicrophoneSource also produces).
+    /// Lazy converter: SCK source format → 48 kHz mono Float32 to match
+    /// MicrophoneSource. The whole pipeline runs at 48 kHz because that
+    /// is RNNoise's native rate (see RNNoiseProcessor).
     private var converter: AVAudioConverter?
     private var sourceFormat: AVAudioFormat?
     private let targetFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
-        sampleRate: 16_000,
+        sampleRate: 48_000,
         channels: 1,
         interleaved: false
     )!

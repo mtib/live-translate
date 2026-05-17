@@ -42,10 +42,18 @@ final class MixedAudioSource: AudioSource {
     /// outpaces mic (different OS-side scheduling).
     private var systemQueue: [Float] = []
     private let queueLock = NSLock()
-    private let maxQueuedSamples = 16_000   // ~1 second at 16 kHz
+    private let maxQueuedSamples = 48_000   // ~1 second at 48 kHz
 
     private let broadcaster = BufferBroadcaster()
     var buffers: AsyncStream<AVAudioPCMBuffer> { broadcaster.stream }
+
+    /// Noise-suppressor that runs on the mixed (post-sum) stream. The
+    /// AudioRecorder consumes our broadcast output too, so the .wav on
+    /// disk is the post-denoise version — exactly what the recognizer
+    /// hears. See RNNoiseProcessor for the format expectations (it
+    /// requires 48 kHz mono Float32, which is what the rest of the
+    /// pipeline now standardises on).
+    private let denoiser = RNNoiseProcessor()
 
     /// Tasks driving the upstream readers. Cancelled in `stop()`.
     private var micReaderTask: Task<Void, Never>?
@@ -160,6 +168,19 @@ final class MixedAudioSource: AudioSource {
 
         // outData[i] = micData[i] + scratch[i], SIMD.
         vDSP_vadd(micData, 1, scratch, 1, outData, 1, vDSP_Length(n))
+
+        // Push the mixed buffer through RNNoise. Input is consumed
+        // greedily but output is delivered in 480-sample chunks (10 ms
+        // at 48 kHz), so for the first buffer or two we may not have
+        // enough denoised samples to fill `n` — we pad with silence.
+        // From buffer ~3 onward the queue stays steady at ≤480 samples
+        // of latency.
+        denoiser.feed(samples: outData, count: n)
+        let drained = denoiser.drain(into: outData, count: n)
+        if drained < n {
+            // Pad the tail with silence rather than emit garbage.
+            memset(outData.advanced(by: drained), 0, (n - drained) * MemoryLayout<Float>.size)
+        }
 
         broadcaster.emit(out)
     }
