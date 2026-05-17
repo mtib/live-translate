@@ -6,6 +6,12 @@ struct LiveTranslateApp: App {
 
     init() {
         Log.startup()  // truncates the log if it's grown past the cap
+        // Recover any sessions whose previous app instance died before
+        // finalize completed. Runs in the background; doesn't block
+        // the UI or interfere with new sessions.
+        Task.detached(priority: .background) {
+            await CrashRecovery.recoverPendingSessions()
+        }
     }
 
     var body: some Scene {
