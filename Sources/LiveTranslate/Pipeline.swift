@@ -546,9 +546,11 @@ final class Pipeline: ObservableObject {
             let server = LiveAudioServer(port: liveStreamPort)
             do {
                 try server.start()
-                let speaker = TTSSpeaker(voice: voice) { [weak server] pcm in
+                let speaker = TTSSpeaker(voice: voice, onPCM: { [weak server] pcm in
                     server?.append(pcm)
-                }
+                }, onActivityChanged: { [weak server] active in
+                    server?.setSpeaking(active)
+                })
                 self.liveAudioServer = server
                 self.ttsSpeaker = speaker
                 self.liveStreamURL = LiveAudioServer.streamURL(port: liveStreamPort)

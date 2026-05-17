@@ -38,6 +38,16 @@ final class LiveAudioServer: @unchecked Sendable {
     private let lock = NSLock()
     private var heartbeatTask: Task<Void, Never>?
     private var lastSendAt: Date = .distantPast
+    private var speakingActive: Bool = false
+
+    /// Called by TTSSpeaker at utterance start/end so the heartbeat
+    /// won't inject silence into the middle of real speech.
+    func setSpeaking(_ active: Bool) {
+        lock.lock()
+        speakingActive = active
+        if active { lastSendAt = Date() }
+        lock.unlock()
+    }
 
     init(port: UInt16) {
         self.port = port
@@ -141,7 +151,10 @@ final class LiveAudioServer: @unchecked Sendable {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard let self else { return }
-                if Date().timeIntervalSince(self.lastSendAt) >= 0.1 {
+                self.lock.lock()
+                let speaking = self.speakingActive
+                self.lock.unlock()
+                if !speaking && Date().timeIntervalSince(self.lastSendAt) >= 0.1 {
                     self.broadcast(silence)
                     self.lastSendAt = Date()
                 }

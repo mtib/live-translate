@@ -56,6 +56,7 @@ final class TTSSpeaker: @unchecked Sendable {
 
     private let voice: AVSpeechSynthesisVoice
     private let onPCM: (Data) -> Void
+    private let onActivityChanged: (Bool) -> Void
     private let q = DispatchQueue(label: "TTSSpeaker.queue")
     private var pending: [String] = []
     private var busy: Bool = false
@@ -71,9 +72,12 @@ final class TTSSpeaker: @unchecked Sendable {
         )!
     }()
 
-    init(voice: AVSpeechSynthesisVoice, onPCM: @escaping (Data) -> Void) {
+    init(voice: AVSpeechSynthesisVoice,
+         onPCM: @escaping (Data) -> Void,
+         onActivityChanged: @escaping (Bool) -> Void = { _ in }) {
         self.voice = voice
         self.onPCM = onPCM
+        self.onActivityChanged = onActivityChanged
         Log.line("TTSSpeaker: voice=\(voice.name) [\(voice.language)] quality=\(qualityLabel(voice.quality))")
     }
 
@@ -105,11 +109,17 @@ final class TTSSpeaker: @unchecked Sendable {
     // MARK: - Internals — `q`-isolated
 
     private func pumpLocked() {
+        // Signal idle only now — keeps speakingActive=true through the
+        // 0.5 s drain gap so the heartbeat can't inject silence while
+        // the client is still consuming buffered audio.
+        if !busy { onActivityChanged(false) }
         guard !busy, !pending.isEmpty else { return }
         let text = pending.removeFirst()
         busy = true
         speak(text) { [weak self] in
-            self?.q.async {
+            // 0.5 s gap: client has time to consume the last utterance's
+            // buffered audio before the next one starts.
+            self?.q.asyncAfter(deadline: .now() + 0.5) {
                 self?.busy = false
                 self?.pumpLocked()
             }
@@ -139,6 +149,7 @@ final class TTSSpeaker: @unchecked Sendable {
         let outFmt = self.outFormat
         let emit = self.onPCM
 
+        onActivityChanged(true)
         synth.write(utt) { buffer in
             guard let pcm = buffer as? AVAudioPCMBuffer else { return }
 
