@@ -81,7 +81,7 @@ if [[ "${SKIP_LIB_BUILD}" == "0" ]]; then
   cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$(pwd)/${PREFIX_DIR}" \
-    -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET=26.0 \
     -DBUILD_SHARED_LIBS=OFF \
     -DWHISPER_BUILD_TESTS=OFF \
     -DWHISPER_BUILD_EXAMPLES=OFF \
@@ -115,9 +115,9 @@ fi
 # and feature branches that don't carry the bridge target can wipe
 # `Sources/CWhisper/include/`, leaving the build prefix on disk but
 # the includes missing. Swift would then fail with
-//     'whisper.h' file not found
-// even though the libs are perfectly built. Re-copying every run is
-// fast and avoids the trap.
+#     'whisper.h' file not found
+# even though the libs are perfectly built. Re-copying every run is
+# fast and avoids the trap.
 cp "${PREFIX_DIR}/include/"*.h "Sources/CWhisper/include/"
 
 # Model. Prefer the repo-local `models/` cache (populated by

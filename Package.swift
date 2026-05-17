@@ -14,10 +14,13 @@ let package = Package(
             publicHeadersPath: "include",
             cSettings: [
                 .headerSearchPath("."),
-                // The vendored C uses some warnings-prone older idioms;
-                // silence them so our `-Werror`-curious eyes don't bleed
-                // when we build.
-                .unsafeFlags(["-Wno-implicit-function-declaration"]),
+                // The vendored C uses some warnings-prone older idioms.
+                .unsafeFlags([
+                    "-Wno-implicit-function-declaration",
+                    // rnn.c has intentional null-dereference patterns (upstream
+                    // xiph code uses NULL deref as a compile-time assert trick).
+                    "-Wno-null-dereference",
+                ]),
             ]
         ),
         // Thin bridge target around the externally-built whisper.cpp

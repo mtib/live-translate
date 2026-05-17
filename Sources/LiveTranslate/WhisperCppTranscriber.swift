@@ -319,6 +319,11 @@ final class WhisperCppTranscriber: Transcriber {
         let (chunkQueue, queueSink) = AsyncStream<ChunkBuffer>.makeStream()
         let langCode = String(locale.identifier.prefix(2))
         let tag = source.rawValue
+        // OpaquePointer doesn't conform to Sendable (it's a raw address),
+        // so capturing it directly in async closures produces a Swift 6
+        // warning. Round-trip through UInt — same bit pattern, no cost,
+        // and the Sendable checker is satisfied by the value type.
+        let ctxBits = UInt(bitPattern: ctx)
 
         async let accumulate: Void = {
             await self.accumulateChunks(audio: audio, sink: queueSink, sourceTag: tag, source: source)
@@ -327,13 +332,14 @@ final class WhisperCppTranscriber: Transcriber {
         }()
 
         async let process: Void = {
+            let ctxPtr = OpaquePointer(bitPattern: ctxBits)!
             Log.line("worker[\(tag)]: started")
             for await chunk in chunkQueue {
                 if Task.isCancelled { Log.line("worker[\(tag)]: cancelled"); return }
                 Log.line("worker[\(tag)]: received chunk #\(chunk.index) (\(chunk.closeReason)), samples=\(chunk.samples16k.count), voiced=\(chunk.voicedSampleCount)")
                 do {
                     if let snapshot = try await self.processChunk(
-                        ctx: ctx, chunk: chunk, languageCode: langCode, source: source
+                        ctx: ctxPtr, chunk: chunk, languageCode: langCode, source: source
                     ) {
                         continuation.yield(snapshot)
                         Log.line("worker[\(tag)]: yielded snapshot for chunk #\(chunk.index), segments=\(snapshot.sentences.count)")
@@ -676,14 +682,40 @@ final class WhisperCppTranscriber: Transcriber {
         initialPrompt: String
     ) async throws -> [String] {
         let lock = self.whisperLock
+        // Capture the opaque pointer as an UInt to cross the Sendable
+        // boundary cleanly — OpaquePointer doesn't conform to Sendable,
+        // but it is just an address value and the lock guarantees
+        // exclusive access. Task.detached runs on the cooperative thread
+        // pool (a real thread), so blocking on NSLock is safe there.
+        let ctxBits = UInt(bitPattern: ctx)
         return try await Task.detached(priority: .userInitiated) {
-            lock.lock()
-            defer { lock.unlock() }
-            return try Self.runWhisperSync(
-                ctx: ctx, samples: samples,
+            let ptr = OpaquePointer(bitPattern: ctxBits)!
+            return try Self.runWhisperUnderLock(
+                lock: lock, ctx: ptr, samples: samples,
                 languageCode: languageCode, initialPrompt: initialPrompt
             )
         }.value
+    }
+
+    /// Synchronous wrapper that acquires `lock`, runs whisper, and
+    /// releases. Kept as a plain (non-async) function so Swift's
+    /// concurrency checker doesn't flag NSLock.lock/unlock as
+    /// "unavailable from asynchronous contexts" — those calls are only
+    /// forbidden on actors/tasks that must not block a thread; here we
+    /// are already inside a Task.detached on a cooperative-pool thread.
+    private static func runWhisperUnderLock(
+        lock: NSLock,
+        ctx: OpaquePointer,
+        samples: [Float],
+        languageCode: String,
+        initialPrompt: String
+    ) throws -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return try runWhisperSync(
+            ctx: ctx, samples: samples,
+            languageCode: languageCode, initialPrompt: initialPrompt
+        )
     }
 
     /// Synchronous whisper_full invocation. Caller is expected to be

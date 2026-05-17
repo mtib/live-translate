@@ -1,0 +1,9 @@
+// Explicit module map so Swift's ClangImporter doesn't treat
+// CWhisper.h as an umbrella header and warn about the many
+// ggml backend headers (vulkan, cuda, sycl, kompute, …) that
+// exist in this directory but are irrelevant on macOS. We only
+// expose whisper.h; ggml.h is pulled in transitively via whisper.h.
+module CWhisper {
+    header "CWhisper.h"
+    export *
+}

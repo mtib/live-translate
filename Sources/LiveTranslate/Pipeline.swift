@@ -3,6 +3,11 @@ import AVFoundation
 import Combine
 import Translation
 
+/// Local port that `LiveAudioServer` listens on when a TTS voice is
+/// available for the current target language. Hard-coded — keeping it
+/// stable means listeners can bookmark `http://<host>.local:8765/`.
+private let liveStreamPort: UInt16 = 8765
+
 // MARK: - Pipeline overview
 //
 //   Mic ──▶ Denoise ──▶ SourcePipeline(mic) ──┐
@@ -49,6 +54,12 @@ final class Pipeline: ObservableObject {
     /// Drives the UI Start/Stop button.
     @Published private(set) var isActive: Bool = false
     var isRunning: Bool { isActive }
+
+    /// `http://<host>.local:8765/` when a translated-audio TTS stream
+    /// is live for the current target language; nil otherwise. The UI
+    /// shows the share icon when non-nil; clicking pops the URL + a
+    /// QR code so a phone-with-headphones can listen along.
+    @Published private(set) var liveStreamURL: String?
 
     // MARK: - User settings (persisted)
 
@@ -137,6 +148,13 @@ final class Pipeline: ObservableObject {
     /// zip lands. Captured at run start so the cleanup path can read
     /// it after `defer` clears the rest of the state.
     private var currentOutputs: Paths.Outputs?
+    /// Speaks finalized translations as 24 kHz PCM16 buffers and pushes
+    /// them into `liveAudioServer`. Created at run start only if a
+    /// voice for the target language is installed. Nil otherwise —
+    /// the whole stream feature is skipped (icon stays hidden) so we
+    /// never broadcast wrong-language audio.
+    private var ttsSpeaker: TTSSpeaker?
+    private var liveAudioServer: LiveAudioServer?
 
     /// Set by a settings-change observer; read by run()'s defer. When
     /// true after the current run winds down, defer spawns a fresh run.
@@ -301,6 +319,13 @@ final class Pipeline: ObservableObject {
         sentences.append(sentence)
         inflightChunks.removeAll { $0.id == id }
         recordSentence(sentence)
+        // Feed the translation into the live audio stream. The
+        // speaker is nil when no voice is installed for the target
+        // (or src == tgt, set up in `run()`), so this is a cheap
+        // no-op in those cases.
+        if !translation.isEmpty {
+            ttsSpeaker?.enqueue(translation)
+        }
         enforceMaxCount()
     }
 
@@ -425,6 +450,11 @@ final class Pipeline: ObservableObject {
             mergedSubtitles.removeAll()
             currentOutputs = nil
             inflightChunks.removeAll()
+            ttsSpeaker?.stop()
+            ttsSpeaker = nil
+            liveAudioServer?.stop()
+            liveAudioServer = nil
+            liveStreamURL = nil
             if restartRequested {
                 restartRequested = false
                 sentences = []
@@ -460,7 +490,7 @@ final class Pipeline: ObservableObject {
         do {
             async let m: Void = micDenoised.start()
             async let s: Void = systemDenoised.start()
-            try await (m, s)
+            _ = try await (m, s)
         } catch {
             status = .stopped(reason: "Audio: \(error.localizedDescription)"); return
         }
@@ -503,6 +533,34 @@ final class Pipeline: ObservableObject {
             }
         }
         Log.line("Run outputs: \(outputs.workDir.path) → \(outputs.zipDestination.lastPathComponent)")
+
+        // 4c. Spin up the live translated-audio stream IF
+        //     (a) src != tgt language (otherwise it's just an echo),
+        //     (b) a TTS voice for the target is actually installed.
+        //     If either fails, we leave `ttsSpeaker` and
+        //     `liveAudioServer` nil and the UI's stream icon stays
+        //     hidden. README nudges the user to install a Premium
+        //     voice for the languages they actually translate to.
+        if srcLangCode != tgtLangCode,
+           let voice = TTSSpeaker.bestVoice(forTargetCode: tgtLangCode) {
+            let server = LiveAudioServer(port: liveStreamPort)
+            do {
+                try server.start()
+                let speaker = TTSSpeaker(voice: voice) { [weak server] pcm in
+                    server?.append(pcm)
+                }
+                self.liveAudioServer = server
+                self.ttsSpeaker = speaker
+                self.liveStreamURL = LiveAudioServer.streamURL(port: liveStreamPort)
+                Log.line("Live audio stream: \(self.liveStreamURL ?? "?") (voice \(voice.name))")
+            } catch {
+                Log.line("LiveAudioServer.start failed: \(error.localizedDescription) — TTS stream disabled this run")
+            }
+        } else if srcLangCode == tgtLangCode {
+            Log.line("Live audio stream: skipped (src == tgt)")
+        } else {
+            Log.line("Live audio stream: no TTS voice installed for '\(tgtLangCode)' — feature disabled this run")
+        }
 
         status = .running
 

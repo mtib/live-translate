@@ -180,6 +180,19 @@ identity stays stable across the lifecycle.
 - **Translation cache.** `Pipeline.translationCache: [String: String]`
   keyed by source text. Identical strings during a run reuse the
   cached translation. LRU-ish eviction at 200 entries.
+- **Live translated-audio HTTP stream (optional, opt-in by capability).**
+  When the run starts, Pipeline checks `TTSSpeaker.bestVoice(forTargetCode:)`.
+  If a voice is installed for the target and src != tgt language, it
+  spins up `LiveAudioServer` on port 8765 and a `TTSSpeaker` that
+  speaks each graduated sentence's translation into the stream. The
+  UI shows a small share icon (radio-waves SF Symbol) in the bar
+  while this is active; clicking it pops a panel with the URL and a
+  QR code so a phone on the same Wi-Fi can listen. If no voice is
+  installed for that language, the whole feature is skipped silently
+  (icon stays hidden) — we never play wrong-language audio. Wire
+  format: 24 kHz mono PCM16 LE, served as an open-ended WAV
+  (`0xFFFFFFFF` chunk sizes). 200 ms heartbeat broadcasts 50 ms of
+  silence when idle so VLC doesn't tear the socket down.
 - **Pruning.** Non-protected sentences whose `lastModified` is older
   than 5 minutes get dropped once per second. Hard cap at **50**
   retained — generous so the user can scroll back through history.
@@ -254,6 +267,8 @@ identity stays stable across the lifecycle.
 | `SubtitleArchive.swift` | One-per-`(source,language)` SRT writer. Cue times are offsets into the matching `<stamp>.<source>.wav`. |
 | `Paths.swift` | Single source of truth for `~/Documents/LiveTranslate/{transcripts,recordings}/<stamp>.<source>[.<lang>].{wav,srt}` plus the shared `<stamp>.jsonl`. |
 | `Log.swift` | Append-only file logger at `/tmp/livetranslate.log`. Truncates on launch if > 5 MB. |
+| `TTSSpeaker.swift` | Synthesizes finalized translations to 24 kHz PCM16 LE buffers via `AVSpeechSynthesizer.write(_:toBufferCallback:)` (never plays through local speakers). Serial queue — one utterance fully before the next; drops oldest pending past 5. `bestVoice(forTargetCode:)` picks the highest-quality installed voice for the target's primary subtag, or nil. |
+| `LiveAudioServer.swift` | Hand-rolled HTTP/1.1 server on a `NWListener` that streams 24 kHz mono PCM16 LE WAV to any client. Header advertises `0xFFFFFFFF` data size → "read until close" (works in VLC / mpv / iOS Safari / Chrome). 200 ms heartbeat task pushes 50 ms of silence when idle to keep VLC's socket alive. |
 
 ## Key behaviors / non-obvious bits
 

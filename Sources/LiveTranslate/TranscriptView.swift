@@ -1,5 +1,8 @@
 import SwiftUI
 import Translation
+import AppKit
+import CoreImage
+import CoreImage.CIFilterBuiltins
 
 /// Main UI surface. Two layouts:
 ///   - Full mode (`!compactMode`): one-row control bar (Start/Stop,
@@ -90,6 +93,7 @@ struct TranscriptView: View {
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
             Spacer(minLength: 4)
+            streamShareButton
             iconButton("chevron.down", help: "Show controls") {
                 compactMode = false
             }
@@ -109,8 +113,34 @@ struct TranscriptView: View {
                 .foregroundStyle(.tertiary)
             targetPicker
             Spacer(minLength: 6)
+            streamShareButton
             iconButton("chevron.up", help: "Compact view") {
                 compactMode = true
+            }
+        }
+    }
+
+    /// Stream share button — visible only when a TTS audio stream is
+    /// live (i.e. the target language has a voice installed and
+    /// src != tgt). Click pops a small panel with the stream URL
+    /// (copyable) and a QR code of the same URL for phone listeners.
+    @State private var streamShareShown: Bool = false
+    @ViewBuilder
+    private var streamShareButton: some View {
+        if let url = pipeline.liveStreamURL {
+            Button {
+                streamShareShown.toggle()
+            } label: {
+                Image(systemName: "dot.radiowaves.left.and.right")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Live translated-audio stream")
+            .popover(isPresented: $streamShareShown, arrowEdge: .bottom) {
+                StreamShareView(url: url)
+                    .padding(16)
+                    .frame(width: 240)
             }
         }
     }
@@ -321,5 +351,66 @@ private struct InflightRow: View {
         case .transcribing: return "transcribing"
         case .translating: return "translating"
         }
+    }
+}
+
+/// Popover content for the stream share icon. Renders the URL as
+/// selectable text (with a copy button) and a QR code generated via
+/// CoreImage's `CIQRCodeGenerator`. The QR is regenerated each time
+/// the URL changes — cheap, no caching needed for a 240×240 image.
+private struct StreamShareView: View {
+    let url: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Live translated audio")
+                .font(.headline)
+            Text("Open this URL on a phone with headphones to hear translations in near-real time.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 6) {
+                Text(url)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Button {
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    pb.setString(url, forType: .string)
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(.system(size: 11))
+                }
+                .buttonStyle(.borderless)
+                .help("Copy URL")
+            }
+            if let img = qrImage(for: url) {
+                Image(nsImage: img)
+                    .interpolation(.none)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 200, height: 200)
+                    .frame(maxWidth: .infinity)
+                    .padding(.top, 2)
+            }
+        }
+    }
+
+    /// Pure CoreImage QR generator. Scales up 8× so the matrix
+    /// renders sharp at 200×200 instead of being interpolated from
+    /// the module-sized native output.
+    private func qrImage(for string: String) -> NSImage? {
+        let filter = CIFilter.qrCodeGenerator()
+        filter.message = Data(string.utf8)
+        filter.correctionLevel = "M"
+        guard let out = filter.outputImage?.transformed(by: CGAffineTransform(scaleX: 8, y: 8)) else {
+            return nil
+        }
+        let ctx = CIContext()
+        guard let cg = ctx.createCGImage(out, from: out.extent) else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: out.extent.width, height: out.extent.height))
     }
 }
