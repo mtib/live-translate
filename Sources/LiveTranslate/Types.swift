@@ -39,40 +39,41 @@ struct SessionSentence: Sendable, Equatable {
     let isFinal: Bool
 }
 
-/// A snapshot of the active session's sentences in order. The Pipeline
-/// reconciles this against its own array by position:
-///   - new entries → new `Sentence` with a fresh UUID
-///   - existing entries → text/isFinal updated in place (UUID preserved)
-///   - missing entries (snapshot shrank) → those `Sentence`s are removed
+/// A snapshot of sentences emitted by the active transcription chunk.
+/// With the whisper.cpp backend each `transcribe()` call yields exactly
+/// one snapshot at chunk close, all sentences `isFinal: true`, and then
+/// the stream finishes. The Pipeline appends every snapshot sentence
+/// to its rolling array — no in-place edits, no retroactive
+/// reconciliation. (The dormant Apple Speech backend assumed the
+/// opposite shape; if it's ever revived, the Pipeline-side append
+/// logic needs to grow snapshot-diffing back.)
 struct SessionSnapshot: Sendable, Equatable {
     let sentences: [SessionSentence]
 }
 
 // MARK: - Sentence (UI-facing data model)
 
-/// One sentence in the rolling transcript. The Pipeline maintains an
-/// array of these; the UI renders one row per sentence with the most
-/// recent at full opacity and older ones fading out.
+/// One sentence in the rolling transcript. With chunk-based whisper
+/// the source text is immutable once a sentence is emitted — only the
+/// `translation` field gets written later, when the translation worker
+/// catches up. The Pipeline maintains an array of these; the UI renders
+/// one row per sentence with the most recent at full opacity and older
+/// ones fading out.
 struct Sentence: Identifiable, Equatable {
     let id: UUID
-    /// Source-language text. Updated in place as the live partial grows.
-    var text: String
+    /// Source-language text. Immutable post-emission.
+    let text: String
     /// Target-language text. Empty until the translator handles it.
     var translation: String
-    /// What `text` was when we last successfully translated. Used to
-    /// detect when a sentence has drifted and needs another translation
-    /// pass — so the pipeline doesn't keep ballooning with repeat work.
-    var lastTranslatedSource: String
-    /// Wall-clock time the sentence first appeared in the array. Used
-    /// as the **start time** when writing SRT subtitle cues.
+    /// Wall-clock time the sentence was emitted. Used as the **start
+    /// time** when writing SRT subtitle cues, and as the prune cutoff.
     let createdAt: Date
-    /// Wall-clock time the source text last changed. Prune uses this to
-    /// evict sentences quiet for `maxAgeSeconds`; SRT writer uses it as
-    /// the cue **end time**.
+    /// Wall-clock time the sentence was last touched. For the source
+    /// text this equals `createdAt` (text doesn't change); the
+    /// translation worker pushes it forward when the translation lands,
+    /// so the SRT cue **end time** captures "still visible at" rather
+    /// than "transcribed at".
     var lastModified: Date
-    /// True once the backend has emitted a sentence terminator. Final
-    /// sentences won't be rewritten; only translation may update.
-    var isFinal: Bool
 }
 
 /// Pipeline status — drives the UI status line. Kept simple on purpose:

@@ -3,6 +3,17 @@
 build/
 Package.resolved
 
+# whisper.cpp source — cloned by tools/build-whisper.sh, pinned by tag.
+# Not vendored to keep the repo lean; recreated on every fresh checkout.
+external/
+
+# whisper.cpp public headers — mirrored into the bridge target by
+# tools/build-whisper.sh so SwiftPM's clang-module sandbox can find them
+# at `import CWhisper` time. Kept out of git: the build script
+# re-installs them and they shouldn't drift independently of the libs.
+Sources/CWhisper/include/whisper.h
+Sources/CWhisper/include/ggml*.h
+
 # macOS
 .DS_Store
 
