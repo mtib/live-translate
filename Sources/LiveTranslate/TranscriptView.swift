@@ -154,7 +154,7 @@ struct TranscriptView: View {
                 HStack(spacing: 5) {
                     if finalizing {
                         ProgressView().controlSize(.small)
-                        Text("Finalizing…")
+                        Text("Stopping…")
                     } else {
                         Image(systemName: pipeline.isRunning ? "stop.fill" : "play.fill")
                             .font(.system(size: 10, weight: .semibold))

@@ -335,6 +335,15 @@ final class Pipeline: ObservableObject {
     func stop() {
         Log.line("Pipeline.stop()")
         restartRequested = false
+        // Flip to `.finalizing` immediately so the UI shows the
+        // spinner + "Stopping…" the moment the button is pressed.
+        // run()'s end-of-session path will also set this, but by the
+        // time it does (audio drain + background cancel) seconds may
+        // have passed; the user would see "Stop" the whole time
+        // without this.
+        if isActive {
+            status = .finalizing
+        }
         stopActiveSources()
     }
 
