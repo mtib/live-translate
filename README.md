@@ -24,11 +24,11 @@ open build/LiveTranslate.app
 The build clones `whisper.cpp` v1.7.4 into `external/`, compiles it
 to static archives, picks the GGML model from `models/` (or downloads
 into `build/whisper-models/`), and bundles it into the `.app`. Default
-bundled model is `ggml-small-q5_1.bin` (~190 MB). Set
-`WHISPER_MODEL=ggml-tiny-q5_1.bin` (or another file from `models/`)
-before `./build.sh` and update
-`WhisperCppTranscriber.bundledModelName` to match if you want a
-different one.
+bundled model is `ggml-large-v3-turbo-q5_0.bin` (~570 MB) — distilled
+large-v3 with 4 decoder layers, large-class quality at ~3× realtime
+on Apple Silicon. Set `WHISPER_MODEL=…` before `./build.sh` and
+update `WhisperCppTranscriber.bundledModelName` to match if you want
+a different one.
 
 ## One-time macOS setup
 

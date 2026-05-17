@@ -14,10 +14,12 @@ import Foundation
 /// session output (WAVs, SRTs, JSONL) still ends up in the zip.
 enum MKVExporter {
 
-    /// Build the MKV at `outputs.mkvOutput`. `langs` lists the
-    /// language codes (e.g. `["de", "en"]`) that the live merged-SRT
-    /// archives already wrote to; we pass each existing one to ffmpeg
-    /// as a subtitle input.
+    /// Build the MKV at `outputs.mkvOutput`. `langs` is the list of
+    /// language codes (e.g. `["de", "en"]`) whose **merged** SRT
+    /// files we expect to embed. Per-source SRTs
+    /// (`<stamp>.mic.<lang>.srt`, `<stamp>.system.<lang>.srt`) are
+    /// deliberately NOT passed to ffmpeg — they're for debugging /
+    /// post-hoc inspection only.
     static func export(outputs: Paths.Outputs, langs: [String]) async {
         guard let ffmpeg = locateFFmpeg() else {
             Log.line("MKVExporter: ffmpeg not found (looked in /opt/homebrew/bin, /usr/local/bin, /usr/bin); skipping MKV. Install via `brew install ffmpeg`.")

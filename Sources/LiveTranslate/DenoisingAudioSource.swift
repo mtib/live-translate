@@ -77,27 +77,36 @@ final class DenoisingAudioSource: AudioSource {
         pumpTask = Task { [weak self] in
             guard let self else { return }
             Log.line("Denoise[\(self.label)]: pump started")
+            // Deliberately no `Task.isCancelled` check here — we drain
+            // the upstream buffers until its broadcaster signals end.
+            // Premature cancellation drops trailing buffers and
+            // shortens the recorded WAV / final MKV by a few hundred
+            // ms; let `stop()` below drive the natural drain instead.
             for await buf in self.upstream.buffers {
-                if Task.isCancelled { break }
                 if let out = self.denoise(buf) {
                     self.broadcaster.emit(out)
                 }
             }
-            // Upstream's broadcaster ended (its `stop()` called
-            // `finishAll`). Propagate the close down to our subscribers
-            // so the recognition pipeline can drain.
             self.broadcaster.finishAll()
             Log.line("Denoise[\(self.label)]: pump exited")
         }
     }
 
     func stop() async {
-        // Cancel the pump as belt-and-suspenders; upstream.stop()
-        // ending the for-await is the primary mechanism, but if
-        // someone calls stop() out-of-order we still want to wind down.
-        pumpTask?.cancel()
-        pumpTask = nil
+        // Stop upstream first — its broadcaster's `finishAll()` makes
+        // the pump's `for-await` return cleanly after every queued
+        // upstream buffer has been processed. Then await the pump
+        // task to be sure those trailing buffers have actually been
+        // re-emitted to our broadcaster before subscribers see the
+        // closing signal.
         await upstream.stop()
+        if let pump = pumpTask {
+            pumpTask = nil
+            _ = await pump.value
+        }
+        // Belt-and-suspenders: the pump's exit path already called
+        // this, but if start() never ran (e.g. upstream errored),
+        // make sure our broadcaster is sealed.
         broadcaster.finishAll()
     }
 

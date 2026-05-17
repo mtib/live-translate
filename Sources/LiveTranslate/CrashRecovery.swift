@@ -72,15 +72,18 @@ enum CrashRecovery {
         await ZipArchiver.zipAndCleanup(directory: workDir, into: outputs.zipDestination)
     }
 
-    private static func discoverLanguages(in dir: URL, stamp: String) -> [String] {
+    /// Scan `<workDir>/transcripts/` for merged SRT files
+    /// (`<stamp>.<lang>.srt` — no extra dot before `.srt`).
+    private static func discoverLanguages(in workDir: URL, stamp: String) -> [String] {
         let fm = FileManager.default
+        let dir = workDir.appendingPathComponent("transcripts", isDirectory: true)
         guard let entries = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return [] }
         let merged = entries.compactMap { url -> String? in
             let n = url.lastPathComponent
             guard n.hasPrefix("\(stamp).") && n.hasSuffix(".srt") else { return nil }
             let middle = n.dropFirst("\(stamp).".count).dropLast(".srt".count)
-            // Per-source files have form `<source>.<lang>` — two parts.
-            // Merged files are just `<lang>` — one part, no dot.
+            // Per-source: `<source>.<lang>` — contains a dot.
+            // Merged: `<lang>` — no dot.
             return middle.contains(".") ? nil : String(middle)
         }
         return Array(Set(merged)).sorted()

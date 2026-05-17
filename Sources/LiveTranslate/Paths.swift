@@ -33,10 +33,11 @@ enum Paths {
         return url
     }
 
-    /// All output paths for one in-progress session — files inside a
-    /// temp work directory, named `<stamp>.<…>.<…>`. The merged-per-
-    /// language SRT is maintained live during the session, not just at
-    /// end.
+    /// All output paths for one in-progress session. Files inside the
+    /// work directory are organised into subdirs (`audio/`,
+    /// `transcripts/`, `logs/`, `recordings/`) so when the zip is
+    /// extracted, VLC opening the MKV doesn't pick up the per-source
+    /// SRTs as sidecar tracks (it only scans its own directory).
     struct Outputs {
         /// `<stamp>` — e.g. `2026-05-17_15-42-10`.
         let timestamp: String
@@ -46,46 +47,72 @@ enum Paths {
         /// Final per-session zip in `~/Documents/LiveTranslate/`.
         let zipDestination: URL
 
-        /// `<workDir>/<stamp>.jsonl` — one JSON object per emitted
-        /// sentence, with `source` field.
+        /// `<workDir>/logs/<stamp>.jsonl` — one JSON object per
+        /// emitted sentence, with `source` field.
         var transcript: URL {
-            workDir.appendingPathComponent("\(timestamp).jsonl")
+            workDir.appendingPathComponent("logs", isDirectory: true)
+                   .appendingPathComponent("\(timestamp).jsonl")
         }
 
-        /// `<workDir>/<stamp>.<source>.wav` — per-source post-denoise
-        /// + AGC audio.
+        /// `<workDir>/audio/<stamp>.<source>.wav` — per-source
+        /// post-denoise + AGC audio.
         func recording(_ source: SourceTag) -> URL {
-            workDir.appendingPathComponent("\(timestamp).\(source.rawValue).wav")
+            workDir.appendingPathComponent("audio", isDirectory: true)
+                   .appendingPathComponent("\(timestamp).\(source.rawValue).wav")
         }
 
-        /// `<workDir>/<stamp>.<source>.<lang>.srt` — per-source SRT.
+        /// `<workDir>/transcripts/<stamp>.<source>.<lang>.srt` —
+        /// per-source SRT (kept for debugging / inspection; *not*
+        /// embedded in the MKV).
         func subtitle(_ source: SourceTag, _ langCode: String) -> URL {
-            workDir.appendingPathComponent("\(timestamp).\(source.rawValue).\(langCode).srt")
+            workDir.appendingPathComponent("transcripts", isDirectory: true)
+                   .appendingPathComponent("\(timestamp).\(source.rawValue).\(langCode).srt")
         }
 
-        /// `<workDir>/<stamp>.<lang>.srt` — merged SRT for a language,
-        /// both sources interleaved with `[Mic]` / `[Sys]` prefixes.
-        /// Maintained live as sentences graduate; final ffmpeg pass
-        /// reads from it.
+        /// `<workDir>/transcripts/<stamp>.<lang>.srt` — merged SRT,
+        /// `[Mic]` / `[Sys]` prefixed. The MKV embeds this; VLC sees
+        /// it as an embedded track, not a sidecar.
         func mergedSubtitle(_ langCode: String) -> URL {
-            workDir.appendingPathComponent("\(timestamp).\(langCode).srt")
+            workDir.appendingPathComponent("transcripts", isDirectory: true)
+                   .appendingPathComponent("\(timestamp).\(langCode).srt")
         }
 
-        /// `<workDir>/<stamp>.mkv` — built by `MKVExporter` after the
-        /// audio path drains and before zipping.
+        /// `<workDir>/recordings/<stamp>.mkv` — built by
+        /// `MKVExporter`. In its own subdir so it doesn't share a
+        /// directory with the SRTs (VLC sidecar auto-load).
         var mkvOutput: URL {
-            workDir.appendingPathComponent("\(timestamp).mkv")
+            workDir.appendingPathComponent("recordings", isDirectory: true)
+                   .appendingPathComponent("\(timestamp).mkv")
+        }
+
+        /// Internal helper — list every per-run subdir that must
+        /// exist before writers open their files.
+        var allSubdirs: [URL] {
+            ["audio", "transcripts", "logs", "recordings"].map {
+                workDir.appendingPathComponent($0, isDirectory: true)
+            }
         }
     }
 
-    /// Allocate a fresh work directory for a new session.
+    /// Allocate a fresh work directory + per-run subdirs for a new
+    /// session.
     static func newRunOutputs(now: Date = Date()) throws -> Outputs {
         let stamp = runFilenameFormatter.string(from: now)
-        let work = NSTemporaryDirectory().appendingPathComponent("livetranslate-\(stamp)", isDirectory: true)
-        let workURL = URL(fileURLWithPath: work, isDirectory: true)
-        try FileManager.default.createDirectory(at: workURL, withIntermediateDirectories: true)
-        let zip = try documentsRoot().appendingPathComponent("\(stamp).zip")
-        return Outputs(timestamp: stamp, workDir: workURL, zipDestination: zip)
+        let workURL = URL(
+            fileURLWithPath: NSTemporaryDirectory().appendingPathComponent("livetranslate-\(stamp)", isDirectory: true),
+            isDirectory: true
+        )
+        let fm = FileManager.default
+        try fm.createDirectory(at: workURL, withIntermediateDirectories: true)
+        let outputs = Outputs(
+            timestamp: stamp,
+            workDir: workURL,
+            zipDestination: try documentsRoot().appendingPathComponent("\(stamp).zip")
+        )
+        for sub in outputs.allSubdirs {
+            try fm.createDirectory(at: sub, withIntermediateDirectories: true)
+        }
+        return outputs
     }
 }
 
