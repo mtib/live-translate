@@ -108,14 +108,17 @@ if [[ "${SKIP_LIB_BUILD}" == "0" ]]; then
   echo "✓ whisper.cpp built and installed to ${PREFIX_DIR}"
   echo "  libs: $(ls "${PREFIX_DIR}/lib"/*.a | tr '\n' ' ')"
 
-  # Mirror the public headers into the SwiftPM bridge target. This is the
-  # version Swift's clang-module sandbox can find at `import CWhisper`
-  # time. See Sources/CWhisper/include/CWhisper.h for the rationale.
-  # whisper.h includes ggml.h / ggml-cpu.h / ggml-backend.h transitively,
-  # so we copy the whole include directory rather than hand-track the
-  # transitive set as upstream evolves.
-  cp "${PREFIX_DIR}/include/"*.h "Sources/CWhisper/include/"
 fi
+
+# Always mirror the public headers into the SwiftPM bridge target —
+# outside the SKIP_LIB_BUILD guard. Branch-switching between `main`
+# and feature branches that don't carry the bridge target can wipe
+# `Sources/CWhisper/include/`, leaving the build prefix on disk but
+# the includes missing. Swift would then fail with
+//     'whisper.h' file not found
+// even though the libs are perfectly built. Re-copying every run is
+// fast and avoids the trap.
+cp "${PREFIX_DIR}/include/"*.h "Sources/CWhisper/include/"
 
 # Model. Prefer the repo-local `models/` cache (populated by
 # `./dev-setup.sh` so switching `WHISPER_MODEL` between builds doesn't

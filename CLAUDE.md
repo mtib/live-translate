@@ -614,3 +614,15 @@ pkill -f LiveTranslate                           # kill all instances
     Only the UI-state writes hop back to MainActor (via
     `Task { @MainActor in ... }` or via `Pipeline.consumeSentences`
     which is itself @MainActor).
+22. **`tools/build-whisper.sh` skipped header mirroring when the prefix
+    was already on disk.** Symptom after switching from a feature
+    branch that didn't carry `Sources/CWhisper/` back to `main`:
+    `swift build` fails with `'whisper.h' file not found` despite
+    `build/whisper-prefix/lib/libwhisper.a` being right there. Cause:
+    the script's idempotency guard (`SKIP_LIB_BUILD=1`) wrapped the
+    `cp …/include/*.h Sources/CWhisper/include/` step as well as the
+    cmake build, so a branch-switch that wiped the bridge target's
+    include dir wasn't re-populated on the next build. Fix: the
+    header mirror runs unconditionally now — it's a fast `cp` and
+    keeps the bridge in sync with whatever prefix is currently
+    installed.
