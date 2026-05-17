@@ -23,29 +23,6 @@ final class MicrophoneSource: AudioSource {
     func start() async throws {
         guard !engine.isRunning else { return }
         let input = engine.inputNode
-
-        // Apple's voice-processing audio unit: AEC + noise suppression
-        // + AGC, in one OS-level filter. Same chain FaceTime / Voice
-        // Memos / Continuity Camera use. Free, tuned for speech, runs
-        // on the audio thread with no latency we have to budget for.
-        // AEC is the biggest win here — it cancels the speaker bleed
-        // of the system audio that's playing while we're recording, so
-        // the mixed stream isn't double-counting the same content
-        // through both the SCK tap and the mic.
-        //
-        // Must be called before installTap / engine.start(); flipping
-        // the flag at runtime may reset the input node's format.
-        do {
-            try input.setVoiceProcessingEnabled(true)
-            Log.line("Mic: voice processing enabled (AEC + NS + AGC)")
-        } catch {
-            // Some configurations (USB interfaces, virtual audio
-            // drivers) don't expose the VP unit — fall back to raw
-            // mic input. Recognition still works, just without the
-            // aggressive cleanup.
-            Log.line("Mic: voice processing unavailable (\(error.localizedDescription)) — continuing without it")
-        }
-
         if tapInstalled {
             input.removeTap(onBus: 0)
             tapInstalled = false
