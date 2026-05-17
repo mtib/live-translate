@@ -1,29 +1,24 @@
 import Foundation
 
 /// Per-run archive file that captures every sentence the Pipeline drops
-/// (pruned or evicted by the max-count cap). Lives at
-/// `~/Documents/transcripts/<timestamp>.jsonl` — one JSON object per line:
+/// (pruned or evicted by the max-count cap). Paths are owned by `Paths`;
+/// this class just writes JSON Lines to whichever URL it's given.
+///
+/// One JSON object per line:
 ///
 ///     {"time":"2026-05-16T22:13:07.123Z","transcription":"…","translation":"…"}
 ///
 /// `time` is ISO-8601 with fractional seconds. Both `transcription` and
 /// `translation` are always present (empty strings allowed). Schema is
-/// intentionally stable so consumers (`jq`, pandas, etc.) can load files
+/// intentionally stable so consumers (`jq`, pandas, etc.) can load
 /// without surprises.
 ///
-/// One `TranscriptArchive` belongs to one run. The Pipeline creates one on
-/// Start and lets it drop on Stop. Writes go through a serial queue so the
-/// MainActor (where prune runs) never blocks on disk IO.
+/// Writes go through a serial queue so the MainActor (where prune runs)
+/// never blocks on disk IO.
 final class TranscriptArchive {
     let url: URL
     private let queue = DispatchQueue(label: "TranscriptArchive.write", qos: .utility)
 
-    // Date formatters are expensive to build — cache on the type.
-    private static let filenameFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        return f
-    }()
     private static let isoFormatter: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -31,25 +26,13 @@ final class TranscriptArchive {
     }()
     private static let encoder: JSONEncoder = {
         let e = JSONEncoder()
-        // Sorted keys for grep/diff stability across runs.
-        e.outputFormatting = [.sortedKeys]
+        e.outputFormatting = [.sortedKeys]   // grep/diff-stable keys
         return e
     }()
 
-    /// Create a new archive file in `~/Documents/transcripts/`. Throws if
-    /// the directory can't be created or the file can't be opened for
-    /// writing — both extremely rare on macOS without sandboxing.
-    init() throws {
-        let fm = FileManager.default
-        guard let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first else {
-            throw ArchiveError.noDocumentsDirectory
-        }
-        let dir = docs.appendingPathComponent("transcripts", isDirectory: true)
-        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        let name = Self.filenameFormatter.string(from: Date()) + ".jsonl"
-        let url = dir.appendingPathComponent(name)
-        // Empty file — JSONL has no header.
-        try Data().write(to: url, options: .atomic)
+    /// Create (or truncate) the JSONL file at the given URL.
+    init(at url: URL) throws {
+        try Data().write(to: url, options: .atomic)   // empty file; JSONL has no header
         self.url = url
     }
 
@@ -59,7 +42,7 @@ final class TranscriptArchive {
         queue.sync {}
     }
 
-    /// Append one sentence record. Returns immediately — actual disk IO
+    /// Append one sentence record. Returns immediately; actual disk IO
     /// happens asynchronously on the archive's queue.
     func append(_ sentence: Sentence) {
         let record = Record(
@@ -86,14 +69,5 @@ final class TranscriptArchive {
         let time: String
         let transcription: String
         let translation: String
-    }
-}
-
-enum ArchiveError: LocalizedError {
-    case noDocumentsDirectory
-    var errorDescription: String? {
-        switch self {
-        case .noDocumentsDirectory: return "No Documents directory available."
-        }
     }
 }

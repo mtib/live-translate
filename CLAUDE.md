@@ -79,18 +79,27 @@ ScreenCaptureKit) without touching `Pipeline`.
   (last-active) sentence. Earlier session-active sentences are eligible
   to drop; if the recognizer's next snapshot still references them,
   ingest finds no matching UUID and silently skips, so the drop sticks.
-- **Transcript archive (JSON Lines).** Whenever a sentence is dropped
-  (prune or max-count enforcement), it's appended to a per-run file at
-  `~/Documents/transcripts/<timestamp>.jsonl`. One JSON object per line:
+- **Per-run output files.** Each Start opens **two** paired files under
+  one app-private root, sharing a `YYYY-MM-DD_HH-MM-SS` timestamp stem:
+
+  ```
+  ~/Documents/LiveTranslate/
+      transcripts/<stamp>.jsonl   ← every sentence ever dropped (prune or max-count)
+      recordings/<stamp>.wav      ← the mixed mic+system audio that fed the recognizer
+  ```
+
+  The transcript line shape:
   ```json
   {"time":"2026-05-16T22:13:07.123Z","transcription":"…","translation":"…"}
   ```
-  Keys are sorted for grep/diff stability. ISO-8601 timestamps.
-  `translation` may be the empty string if translation was disabled or
-  hadn't completed before the sentence was pruned. File is created on
-  Start; no header (JSONL has no header concept). The visible list is
-  the rolling view; the file is the running history. Load it with
-  `jq -c . file.jsonl`, pandas `read_json(..., lines=True)`, etc.
+  Keys sorted for grep/diff stability, ISO-8601 timestamps,
+  `transcription` and `translation` always present (translation may be
+  empty if the recognizer hadn't translated it yet).
+
+  The `.wav` is 16 kHz mono signed-16-bit linear PCM (AVAudioFile auto-
+  converts our Float32 buffers on the write path). One sample = exactly
+  what the recognizer heard, so audio and transcript line up. Paths
+  are centralised in `Paths.swift`.
 
 ### Files
 
@@ -106,7 +115,9 @@ ScreenCaptureKit) without touching `Pipeline`.
 | `MixedAudioSource.swift` | Combines two `AudioSource`s by **sample-summing** at mic's cadence. Mic clocks the output; system samples are pulled from a small queue and added per-sample. Keeps audio-time : wall-time at 1:1 so the recognizer doesn't lag. |
 | `AppleSpeechTranscriber.swift` | Apple `Speech` framework. Owns the sentence splitter (`splitIntoSentences`). |
 | `AppleTranslator.swift` | Holds a `TranslationSession` that the View injects via `Pipeline.installTranslationSession(_:)`. |
-| `TranscriptArchive.swift` | One-per-run JSONL archive file. Writes go through a serial queue so MainActor never blocks on disk. |
+| `TranscriptArchive.swift` | One-per-run JSONL archive. Takes its file URL; doesn't know about layout. |
+| `AudioRecorder.swift` | One-per-run `.wav` writer fed by a parallel consumer of the active source's broadcaster. 16 kHz mono Int16. |
+| `Paths.swift` | Single source of truth for `~/Documents/LiveTranslate/{transcripts,recordings}/<stamp>.…`. |
 | `Log.swift` | Append-only file logger at `/tmp/livetranslate.log`. Truncates on launch if > 5 MB. |
 
 ## Key behaviors / non-obvious bits
@@ -295,6 +306,16 @@ pkill -f LiveTranslate                           # kill all instances
     audio stream to one recognizer**. We did that via `MixedAudioSource`.
     Trade-off: source attribution is lost (we removed `SentenceKind`
     and color-coding from the UI as part of this).
+15a. **`SFTranscriptionSegment.timestamp` / `.duration` are zero on
+    partial results.** Apple only populates them on final results.
+    Pause-based sentence splitting in `splitIntoSentences` therefore
+    only fires when a recognition session ends (~60 s on-device, sooner
+    on errors/restarts) — at that point the text gets retroactively
+    re-split using the gaps. During a live session only punctuation
+    splits fire. Confirmed by dumping `[timestamp+duration substring]`
+    for every snapshot; partials looked like
+    `[0.00+0.00 Hello] [0.00+0.00 world]…` until the final result came
+    in with real timings. No fix from our side; just a known limit.
 15. **Naive "interleave buffer streams" mixing tanked recognition
     latency.** Forwarding every upstream buffer as it arrived doubled
     the recognizer's audio-time-to-wall-time ratio (it received ~2 s of

@@ -79,9 +79,16 @@ final class AppleSpeechTranscriber: Transcriber {
 
     /// Pause threshold for sentence boundaries. Apple's recognizer often
     /// omits a period when the speaker doesn't fully stop, so we *also*
-    /// split when the inter-word gap exceeds this — that catches real-
-    /// world dialog where sentences run on. Tunable; 0.5 s is a comma-
-    /// like beat, longer than that is a clean break.
+    /// split when the inter-word gap exceeds this. Tunable.
+    ///
+    /// **Important caveat:** `SFTranscriptionSegment.timestamp` / `.duration`
+    /// are **zero on partial results** on current macOS — the gap-based
+    /// split therefore only fires when the recognizer emits a final
+    /// result (session end or natural finalization). During an ongoing
+    /// session, only punctuation-based splits happen; once a session
+    /// closes (~60 s on-device, sooner on errors/restarts) Apple emits
+    /// a final result with real timestamps and we retroactively split
+    /// the text using pauses.
     static var pauseThreshold: TimeInterval = 0.5
 
     /// Split a recognition result into sentences using two signals:
@@ -117,7 +124,8 @@ final class AppleSpeechTranscriber: Transcriber {
             // previous sentence (even with no terminator).
             if i > 0 {
                 let gap = seg.timestamp - prevEnd
-                if gap >= pauseThreshold && !currentTokens.isEmpty {
+                if gap >= Self.pauseThreshold && !currentTokens.isEmpty {
+                    Log.line("Splitter: pause gap=\(String(format: "%.2f", gap))s before '\(seg.substring)'")
                     flush(asFinal: true)
                 }
             }

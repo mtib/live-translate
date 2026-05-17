@@ -58,8 +58,14 @@ The mic feeds an `AVAudioEngine` tap; system audio comes from
 `vDSP_vadd` so that one continuous audio stream reaches Apple's
 `SFSpeechRecognizer`. Recognized sentences are translated per-sentence
 via the `Translation` framework (cached by source text). Old sentences
-fade out and eventually drop into a per-run JSONL archive at
-`~/Documents/transcripts/<timestamp>.jsonl`.
+fade out and eventually drop into a per-run JSONL archive — paired
+with a `.wav` of the exact mixed audio the recognizer heard:
+
+```
+~/Documents/LiveTranslate/
+    transcripts/<stamp>.jsonl
+    recordings/<stamp>.wav
+```
 
 See [CLAUDE.md](CLAUDE.md) for full architectural notes, the things
 that have bitten us, and the file-by-file map.

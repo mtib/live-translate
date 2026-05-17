@@ -98,6 +98,7 @@ final class Pipeline: ObservableObject {
 
     private var runTask: Task<Void, Never>?
     private var archive: TranscriptArchive?
+    private var recorder: AudioRecorder?
 
     // MARK: - Persistence
 
@@ -165,14 +166,15 @@ final class Pipeline: ObservableObject {
         (translator as? AppleTranslator)?.setSession(session)
     }
 
-    /// Flush every still-visible sentence to the JSONL archive, then wait
-    /// until disk writes complete. Safe to call from `applicationWill-
-    /// Terminate` — blocks the main thread briefly so the file lands.
-    /// Idempotent: no-op when there's no active archive.
+    /// Flush every still-visible sentence to the JSONL archive, then
+    /// block briefly so all queued writes (transcript + audio) land on
+    /// disk. Safe to call from `applicationWillTerminate`. Idempotent.
     func flushPendingSentences() {
-        guard let archive else { return }
-        for s in sentences { archive.append(s) }
-        archive.flush()
+        if let archive {
+            for s in sentences { archive.append(s) }
+            archive.flush()
+        }
+        recorder?.flush()
         sentences = []
     }
 
@@ -181,18 +183,21 @@ final class Pipeline: ObservableObject {
     private func run() async {
         isActive = true
         defer {
-            // Flush any still-visible sentences before letting the archive
-            // drop so a normal Stop doesn't lose live content.
+            // Flush still-visible sentences to the JSONL archive, then
+            // flush both archive + recorder so the last second of audio
+            // and the trailing sentences actually land on disk.
             if let archive {
                 for s in sentences { archive.append(s) }
                 archive.flush()
             }
+            recorder?.flush()
             if case .stopped = status { } else { status = .idle }
             runTask = nil
             isActive = false
             activeIDs = []
             lastSnapshot = nil
             archive = nil
+            recorder = nil
         }
 
         // 1. Permissions. Mic via TCC up front; SCK prompts on its own when
@@ -220,18 +225,30 @@ final class Pipeline: ObservableObject {
             status = .stopped(reason: "Audio: \(error.localizedDescription)"); return
         }
 
-        // 4. Archive file for this run.
-        do { archive = try TranscriptArchive() }
-        catch { Log.line("Pipeline: archive open failed: \(error.localizedDescription)") }
+        // 4. Open paired output files for this run. Same timestamp for
+        //    both so callers can pair the JSONL and the .wav by stem.
+        do {
+            let outputs = try Paths.newRunOutputs()
+            archive = try TranscriptArchive(at: outputs.transcript)
+            recorder = try AudioRecorder(at: outputs.recording)
+            Log.line("Run outputs: \(outputs.timestamp) (transcript + recording)")
+        } catch {
+            Log.line("Pipeline: opening output files failed: \(error.localizedDescription)")
+            archive = nil
+            recorder = nil
+        }
 
         status = .running
 
         // 5. Workers in a TaskGroup so cancellation cascades. Only ONE
         //    recognition cycle — that's the whole point of mixing.
+        //    A second consumer of `active.buffers` records the mixed
+        //    audio to disk in parallel.
         await withTaskGroup(of: Void.self) { group in
             group.addTask { await self.runTranslationLoop() }
             group.addTask { await self.runPruneLoop() }
             group.addTask { await self.runRecognitionCycle(audioSource: active) }
+            group.addTask { await self.runRecordingLoop(audioSource: active) }
         }
 
         // 6. Audio cleanup. Awaited so the next Start sees a clean source.
@@ -241,6 +258,20 @@ final class Pipeline: ObservableObject {
     /// One recognition cycle, restarting sessions as they end. Bails after
     /// 6 consecutive fast-fails (typically the language model isn't installed,
     /// or no audio is reaching the recognizer).
+    /// Subscribes to the active audio source as a second consumer of its
+    /// broadcaster and forwards every PCM buffer to `AudioRecorder`. The
+    /// MixedAudioSource sample-sums mic + system, so what we write is the
+    /// exact audio the recognizer sees — the .wav pairs 1:1 with the
+    /// JSONL transcript by timestamp. Exits when the buffer stream ends.
+    private func runRecordingLoop(audioSource: AudioSource) async {
+        guard recorder != nil else { return }
+        Log.line("Recording loop started")
+        for await buf in audioSource.buffers {
+            recorder?.append(buf)
+        }
+        Log.line("Recording loop exited")
+    }
+
     private func runRecognitionCycle(audioSource: AudioSource) async {
         var sessionIndex = 0
         var consecutiveFastFails = 0
