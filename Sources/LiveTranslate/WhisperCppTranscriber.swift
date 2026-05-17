@@ -86,15 +86,15 @@ final class WhisperCppTranscriber: Transcriber {
     static var voicePaddingSeconds: TimeInterval = 0.1
 
     /// Minimum voiced duration in a chunk before we run whisper at all.
-    /// Whisper hallucinates aggressively on near-silent audio (the model
-    /// has been trained on captioned video and will manufacture phrases
-    /// like "Thanks for watching!" or "[Music]" given enough silence).
-    /// Tuned for short utterances ("yes" / "ok" / "no" are typically
-    /// 200-300 ms) to actually get through — the worker still pads the
-    /// trimmed clip to 1.1 s so whisper sees enough context, and the
-    /// padding tail (silence) doesn't trigger hallucinations when the
-    /// voiced prefix is real.
-    static var minVoicedSeconds: TimeInterval = 0.2
+    /// Tuned aggressively low (100 ms) so single-syllable utterances
+    /// like "Ja" / "yes" — which often register 150–250 ms of voiced
+    /// audio after RMS thresholding — make it through. Anything below
+    /// is too short to be a meaningful word and risks whisper's
+    /// "Thanks for watching!" / "[Music]" hallucinations.
+    /// The pad-to-1.1s step in `processChunk` is what makes this safe:
+    /// whisper sees a real voiced prefix followed by silence, not
+    /// silence on its own.
+    static var minVoicedSeconds: TimeInterval = 0.1
 
     /// Lower bound on the audio length fed to `whisper_full()`. whisper.cpp
     /// silently returns zero segments for audio shorter than ~1 second
@@ -604,10 +604,14 @@ final class WhisperCppTranscriber: Transcriber {
             trimmed = Array(chunk.samples16k[trimStart..<trimEnd])
         }
 
+        // Only gate on voiced-sample count. Trim length is irrelevant
+        // here because `processChunk` pads short clips to 1.1 s before
+        // whisper runs — gating on trim length was filtering out chunks
+        // like "Ja" where 200-300 ms of voice + 100 ms padding stays
+        // well below `minChunkSeconds`.
         let minVoicedSamples = Int(16_000 * Self.minVoicedSeconds)
-        if chunk.voicedSampleCount < minVoicedSamples
-            || trimmed.count < Int(16_000 * Self.minChunkSeconds) {
-            Log.line("worker[\(tag)]: chunk #\(chunk.index) too short (voiced=\(chunk.voicedSampleCount), trimmed=\(trimmed.count)), skipping")
+        if chunk.voicedSampleCount < minVoicedSamples {
+            Log.line("worker[\(tag)]: chunk #\(chunk.index) too short (voiced=\(chunk.voicedSampleCount) < \(minVoicedSamples)), skipping")
             self.onChunkLifecycle?(chunk.chunkID, source, .dropped)
             return nil
         }

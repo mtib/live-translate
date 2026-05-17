@@ -205,12 +205,12 @@ struct TranscriptView: View {
                     ForEach(pipeline.sentences) { sentence in
                         SentenceRow(sentence: sentence, compact: compact)
                             .id(sentence.id)
-                            .transition(.opacity.combined(with: .move(edge: .bottom)))
+                            .transition(.opacity)
                     }
                     ForEach(pipeline.inflightChunks) { chunk in
                         InflightRow(chunk: chunk, compact: compact)
                             .id(chunk.id)
-                            .transition(.opacity.combined(with: .move(edge: .bottom)))
+                            .transition(.opacity)
                     }
                     Color.clear.frame(height: 1).id("BOTTOM")
                 }
