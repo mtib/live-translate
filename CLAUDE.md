@@ -17,19 +17,33 @@ clone of [transcrybe.app](https://transcrybe.app).
 > is shaped this way* and *what to never do again*. Future sessions read
 > this first.
 
+> **Eagerly load the Swift sources at session start**
+>
+> Before changing any code in this project, read **all** of
+> `Sources/LiveTranslate/*.swift` and the relevant bridge headers. The
+> data flow crosses several files (audio source → mixer → denoiser →
+> transcriber → pipeline → translator → archives + UI), and surprising
+> interactions live at the boundaries. Skimming or grepping for one
+> symbol misses the patterns. Read everything first, *then* edit.
+
 ## How it's built
 
-- **No `.xcodeproj`.** Pure SwiftPM. Built with Command Line Tools only
-  (`/Library/Developer/CommandLineTools`). No Xcode required.
+- **No `.xcodeproj`.** Pure SwiftPM plus a CMake-driven build step for
+  whisper.cpp. Built with Command Line Tools (`/Library/Developer/CommandLineTools`)
+  and Homebrew CMake (`brew install cmake`). No Xcode required.
 - `swift-tools-version: 6.0`, but the executable target is pinned to
-  `.swiftLanguageMode(.v5)` because the Translation / Speech APIs are awkward
+  `.swiftLanguageMode(.v5)` because the Translation APIs are awkward
   under Swift 6 strict concurrency.
-- `./build.sh` compiles via `swift build -c release` and wraps the binary
-  into `build/LiveTranslate.app/` with `Info.plist` + ad-hoc codesign.
-  **Always launch via `open build/LiveTranslate.app`** — never run the binary
-  directly. TCC associates permission grants with the bundle, not the
-  executable path; direct exec leads to the system thinking
-  `NSSpeechRecognitionUsageDescription` is missing.
+- `./build.sh` first runs `tools/build-whisper.sh` (idempotent — clones
+  whisper.cpp v1.7.4 into `external/`, builds static libraries into
+  `build/whisper-prefix/`, downloads `ggml-base-q5_1.bin` into
+  `build/whisper-models/`), then `swift build -c release`, then wraps
+  the binary into `build/LiveTranslate.app/` with `Info.plist`, the
+  GGML model copied into Resources, and ad-hoc codesign.
+- **Always launch via `open build/LiveTranslate.app`** — never run the
+  binary directly. TCC associates permission grants with the bundle,
+  not the executable path; direct exec leads to the system thinking
+  the usage-description keys are missing.
 
 ## Architecture
 
@@ -69,6 +83,34 @@ ScreenCaptureKit) without touching `Pipeline`.
   480-sample frames at 48 kHz — the wrapper (`RNNoiseProcessor`) buffers
   arbitrary input sizes and converts to/from our ±1 normalised range.
   Algorithmic latency: 10 ms.
+- **whisper.cpp instead of Apple Speech.** The active transcriber is
+  `WhisperCppTranscriber`, which downsamples the 48 kHz post-RNNoise
+  stream to 16 kHz, accumulates samples until either silence persists
+  past `endChunkAfterSilence` (~1.6 s) or the chunk hits `maxChunkSeconds`
+  (~25 s), then runs `whisper_full()` on the buffered audio (on a
+  detached Task so the recognizer doesn't block the MainActor or the
+  audio pump). Each chunk = one `transcribe()` session from the
+  Pipeline's perspective, emitting a single `SessionSnapshot` with all
+  segments marked final before finishing. The Pipeline's existing
+  `runRecognitionCycle` loop calls `transcribe()` again for the next
+  chunk. **Trade-off vs Apple Speech:** no token-level partial results
+  during a chunk — text appears in a burst at the silence boundary.
+  In exchange we get better quality on noisy / accented speech and zero
+  reliance on Apple's per-language Dictation downloads.
+- **GGML model file resolution.** `WhisperCppTranscriber` looks for
+  `~/Documents/LiveTranslate/models/ggml-base-q5_1.bin` first (user
+  override — drop a larger / different model there), then falls back to
+  `Bundle.main`'s `ggml-base-q5_1.bin` resource. The bundled default is
+  the multilingual base model with Q5_1 quantization (~57 MB). MIT
+  licensed (Whisper weights from OpenAI, GGML packaging by ggerganov on
+  Hugging Face). The model file is copied into the `.app`'s
+  `Contents/Resources/` by `build.sh`.
+- **AppleSpeechTranscriber is dormant on this branch.** Still
+  conforms to `Transcriber` and compiles, but Pipeline no longer
+  instantiates it. Kept for historical reference / fast bisecting if
+  whisper turns out problematic. If we merge this branch wholesale,
+  the file (and the `NSSpeechRecognitionUsageDescription` key in
+  Info.plist) can be deleted.
 - **Transcribers emit sentence snapshots, not raw text.** A `SessionSnapshot`
   carries `[SessionSentence]` already split. The Pipeline reconciles each
   snapshot against its own array by position — this handles "new sentence
@@ -137,7 +179,9 @@ ScreenCaptureKit) without touching `Pipeline`.
 | `MixedAudioSource.swift` | Combines two `AudioSource`s by **sample-summing** at mic's cadence (Accelerate `vDSP_vadd`), then runs the summed buffer through `RNNoiseProcessor` before broadcasting. Mic clocks the output; system samples come from a small queue. 1:1 audio-time:wall-time. |
 | `RNNoiseProcessor.swift` | Swift wrapper around the vendored RNNoise C library. Owns the `DenoiseState`, buffers arbitrary-sized input into 480-sample frames, handles ±32768 ↔ ±1 scaling, emits denoised samples via `drain(into:count:)`. |
 | `CRNNoise/` | Vendored xiph/rnnoise v0.1.1 as a SwiftPM C target. BSD 3-clause; GRU weights statically linked. See `Sources/CRNNoise/README.md`. |
-| `AppleSpeechTranscriber.swift` | Apple `Speech` framework. Owns the sentence splitter (`splitIntoSentences`). |
+| `WhisperCppTranscriber.swift` | **Active transcriber.** Downsamples 48 kHz → 16 kHz via `AVAudioConverter`, accumulates audio, runs `whisper_full()` at chunk boundaries (silence or max-length), maps segments to `SessionSentence`s, emits one `SessionSnapshot` per chunk. Resolves the model file from `~/Documents/LiveTranslate/models/` first, then `Bundle.main`. |
+| `CWhisper/` | SwiftPM bridge target around `libwhisper.a` + `libggml*.a` produced by `tools/build-whisper.sh`. Headers (`whisper.h`, `ggml*.h`) are mirrored in by the build script and gitignored. |
+| `AppleSpeechTranscriber.swift` | **Dormant.** Apple `Speech` backend, no longer wired into Pipeline. Kept around as a reference / fallback during the whisper experiment. |
 | `AppleTranslator.swift` | Holds a `TranslationSession` that the View injects via `Pipeline.installTranslationSession(_:)`. |
 | `TranscriptArchive.swift` | One-per-run JSONL archive. Takes its file URL; doesn't know about layout. |
 | `AudioRecorder.swift` | One-per-run `.wav` writer fed by a parallel consumer of the active source's broadcaster. 16 kHz mono Int16. |
@@ -205,17 +249,19 @@ settings — both are always captured.
 ### Permissions
 The bundle declares:
 - `NSMicrophoneUsageDescription`
-- `NSSpeechRecognitionUsageDescription`
+- `NSSpeechRecognitionUsageDescription` (legacy — no longer requested
+  at runtime, kept in Info.plist while AppleSpeechTranscriber.swift
+  still exists in the tree as dormant reference code)
 - `NSScreenCaptureUsageDescription` (for system audio via SCK)
 
-Mic prompts via `AVCaptureDevice.requestAccess`. Speech prompts via
-`SFSpeechRecognizer.requestAuthorization`. Screen recording prompts when
-`SCStream.startCapture()` runs the first time.
+Mic prompts via `AVCaptureDevice.requestAccess`. Screen recording
+prompts when `SCStream.startCapture()` runs the first time. Speech
+recognition permission isn't requested — whisper.cpp runs locally and
+doesn't touch Apple's Speech APIs.
 
 Reset stale grants with:
 ```sh
 tccutil reset Microphone local.mtib.livetranslate
-tccutil reset SpeechRecognition local.mtib.livetranslate
 tccutil reset ScreenCapture local.mtib.livetranslate
 ```
 

@@ -5,7 +5,8 @@ audio your Mac is playing** at the same time, transcribes them on-device
 (or via Apple's server fallback), and translates the result into the
 target language of your choice — all in one rolling, hover-able window.
 
-Built with SwiftPM only — no Xcode project, no third-party dependencies.
+Built with SwiftPM and a CMake-driven dependency on
+[whisper.cpp](https://github.com/ggerganov/whisper.cpp) — no Xcode project required.
 
 ![Stopped](docs/stopped.png)
 
@@ -18,37 +19,49 @@ Built with SwiftPM only — no Xcode project, no third-party dependencies.
 open build/LiveTranslate.app
 ```
 
-You need only the Command Line Tools (`xcode-select --install`); no
-full Xcode required.
+Prerequisites:
+- Apple Command Line Tools (`xcode-select --install`).
+- CMake (`brew install cmake`). Used once on first build to compile
+  whisper.cpp; cached after.
 
-## ⚠️ One-time setup: download languages
+The first run of `./build.sh` clones whisper.cpp v1.7.4 into `external/`,
+builds it into static libraries under `build/whisper-prefix/`, and
+downloads the bundled `ggml-base-q5_1.bin` model (~57 MB) into
+`build/whisper-models/`. The model is then copied into the `.app`'s
+`Contents/Resources/` so the user doesn't need to fetch it separately.
+The first build takes ~60-90 seconds. Subsequent builds skip these
+steps and complete in a few seconds.
 
-Both transcription and translation rely on language packs that macOS
-**only downloads on demand**. Do this *before* the first run or the app
-will sit there silently:
+## ⚠️ One-time setup: translation language pack
 
-1. **Speech recognition language** (e.g. German for transcribing German
-   speech). Open
-   **System Settings → Keyboard → Dictation**, click the **Edit…** button
-   next to *Languages*, and add the source language. macOS downloads the
-   on-device model in the background.
+Apple's `Translation` framework only downloads language pairs **on
+demand**. Do this *before* the first run or the translation panel will
+stay empty:
 
-2. **Translation language pair** (e.g. German → English). Open
-   **System Settings → Apple Intelligence & Siri → Translation Languages**
-   (or, on slightly older macOS, **System Settings → General → Language &
-   Region → Translation Languages**) and add both the source and target
-   languages.
+Open **System Settings → Apple Intelligence & Siri → Translation
+Languages** (or, on slightly older macOS, **System Settings → General →
+Language & Region → Translation Languages**) and add both your source
+and target languages.
 
-Without these downloads the recognizer will hit "No speech detected"
-within a fraction of a second and the translation panel stays empty.
+Transcription itself doesn't need any system download — whisper.cpp
+runs against a model bundled inside the app. Just pick the source
+language in the UI and start talking.
+
+To use a larger / different whisper model, drop a GGML `.bin` named
+`ggml-base-q5_1.bin` into `~/Documents/LiveTranslate/models/` — the app
+picks that up in preference to the bundled default. Grab alternatives
+(tiny, small, medium, large variants — quantized or full-precision)
+from <https://huggingface.co/ggerganov/whisper.cpp>.
 
 ## Permissions
 
-First launch prompts for, in order:
+First launch prompts for:
 - **Microphone** — to capture your voice.
-- **Speech Recognition** — to transcribe captured audio.
 - **Screen Recording** — required by `ScreenCaptureKit` to access system
   audio. No screen frames are kept; only the audio stream is used.
+
+(Speech Recognition permission is no longer needed — Apple's Speech
+framework isn't in the pipeline anymore.)
 
 ## How it works (one-paragraph version)
 
@@ -57,11 +70,14 @@ The mic feeds an `AVAudioEngine` tap; system audio comes from
 48 kHz mono Float32 and **sample-summed** with hardware-accelerated
 `vDSP_vadd`, then the summed stream is passed through a vendored
 copy of [xiph/rnnoise](https://github.com/xiph/rnnoise) (a tiny
-GRU-based denoiser, BSD 3-clause) before reaching Apple's
-`SFSpeechRecognizer`. Recognized sentences are translated per-sentence
-via the `Translation` framework (cached by source text). Old sentences
-fade out and eventually drop into a per-run JSONL archive — paired
-with a `.wav` of the exact denoised audio the recognizer heard:
+GRU-based denoiser, BSD 3-clause). The denoised stream is then
+downsampled to 16 kHz mono and fed to
+[whisper.cpp](https://github.com/ggerganov/whisper.cpp) in chunks
+(closed when the user pauses or after ~25 s of continuous speech).
+Recognized sentences are translated per-sentence via Apple's
+`Translation` framework (cached by source text). Old sentences fade out
+and eventually drop into a per-run JSONL archive — paired with a `.wav`
+of the exact denoised audio whisper saw:
 
 ```
 ~/Documents/LiveTranslate/

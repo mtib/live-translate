@@ -99,14 +99,6 @@ final class Pipeline: ObservableObject {
 
     // MARK: - Internal state
 
-    /// IDs of sentences currently "owned" by the active recognition session.
-    /// Snapshot diffs reconcile against this list.
-    private var activeIDs: [UUID] = []
-
-    /// Last snapshot seen — used to short-circuit ingest when the
-    /// recognizer emits an identical snapshot back-to-back.
-    private var lastSnapshot: SessionSnapshot?
-
     /// Translation cache keyed by source text. Bounded.
     private var translationCache: [String: String] = [:]
     private let maxCacheEntries: Int = 200
@@ -152,9 +144,13 @@ final class Pipeline: ObservableObject {
     ) {
         self.micSource = micSource ?? MicrophoneSource()
         self.systemSource = systemSource ?? SystemAudioSource()
-        self.transcriber = transcriber ?? AppleSpeechTranscriber()
+        self.transcriber = transcriber ?? WhisperCppTranscriber()
         self.translator = translator ?? AppleTranslator()
 
+        // The locale list is still SFSpeechRecognizer's — it's a
+        // convenient pre-built BCP-47 set, even though the active
+        // transcriber backend (whisper.cpp) doesn't need Apple's
+        // speech models. Whisper itself accepts any 2-letter prefix.
         self.availableSources = SFSpeechRecognizer.supportedLocales()
             .map { SourceLocale(identifier: $0.identifier) }
             .sorted { $0.identifier < $1.identifier }
@@ -195,8 +191,6 @@ final class Pipeline: ObservableObject {
 
     func clear() {
         sentences = []
-        activeIDs = []
-        lastSnapshot = nil
     }
 
     /// The View calls this from `.translationTask` to hand us a fresh
@@ -232,8 +226,6 @@ final class Pipeline: ObservableObject {
             if case .stopped = status { } else { status = .idle }
             runTask = nil
             isActive = false
-            activeIDs = []
-            lastSnapshot = nil
             archive = nil
             recorder = nil
             sourceSubs = nil
@@ -252,16 +244,14 @@ final class Pipeline: ObservableObject {
         // 1. Permissions. Mic via TCC up front; SCK prompts on its own when
         //    the stream starts. Both are mandatory — the app always mixes
         //    mic + system audio so the user can talk and translate ambient
-        //    audio (videos, calls) without choosing one.
+        //    audio (videos, calls) without choosing one. Speech-recognition
+        //    permission is no longer requested — whisper.cpp runs locally
+        //    against its own model and doesn't touch Apple's Speech APIs.
         status = .requestingPermissions
         let micGranted: Bool = await withCheckedContinuation { c in
             AVCaptureDevice.requestAccess(for: .audio) { c.resume(returning: $0) }
         }
         guard micGranted else { status = .stopped(reason: "Microphone permission denied"); return }
-        let speechAuth = await AppleSpeechTranscriber.requestAuthorization()
-        guard speechAuth == .authorized else {
-            status = .stopped(reason: "Speech recognition not authorized"); return
-        }
 
         // 2. Active source is always the mixed mic+system stream.
         let active: AudioSource = MixedAudioSource(micSource, systemSource)
@@ -332,126 +322,57 @@ final class Pipeline: ObservableObject {
         Log.line("Recording loop exited")
     }
 
+    /// Run one continuous transcription session for the lifetime of
+    /// the audio source. The whisper.cpp backend's `transcribe()` is
+    /// itself a long-lived call that internally pumps audio without
+    /// pause and yields one snapshot per closed chunk, so the Pipeline
+    /// just consumes that stream straight through. No outer loop is
+    /// needed — re-subscribing would risk dropping audio while the
+    /// previous subscription was being torn down.
     private func runRecognitionCycle(audioSource: AudioSource) async {
-        var sessionIndex = 0
-        var consecutiveFastFails = 0
-        let maxFastFails = 6
-        let fastFailThreshold: TimeInterval = 1.0
-
-        while !Task.isCancelled {
-            sessionIndex += 1
-            activeIDs = []
-            lastSnapshot = nil
-            let started = Date()
-            Log.line("Session #\(sessionIndex) starting locale=\(source.identifier)")
-
-            // CRITICAL: fresh buffer subscription per session. `.buffers`
-            // is a fresh-subscription factory; AsyncStream is single-
-            // consumer, so caching across sessions silently breaks restarts.
-            let audio = audioSource.buffers
-
-            do {
-                for try await snapshot in transcriber.transcribe(audio: audio, locale: source) {
-                    if Task.isCancelled { break }
-                    ingest(snapshot)
-                }
-            } catch is CancellationError {
-                // Expected on Stop — fall through to cleanup.
-            } catch {
-                Log.line("Session #\(sessionIndex) error: \(error.localizedDescription)")
+        let audio = audioSource.buffers
+        do {
+            for try await snapshot in transcriber.transcribe(audio: audio, locale: source) {
+                if Task.isCancelled { break }
+                ingest(snapshot)
             }
-
-            // Mark this session's sentences final.
-            for id in activeIDs {
-                if let idx = sentences.firstIndex(where: { $0.id == id }) {
-                    sentences[idx].isFinal = true
-                }
-            }
-            activeIDs = []
-
-            let lifetime = Date().timeIntervalSince(started)
-            consecutiveFastFails = (lifetime < fastFailThreshold) ? consecutiveFastFails + 1 : 0
-            Log.line("Session #\(sessionIndex) ended after \(String(format: "%.2f", lifetime))s, fastFails=\(consecutiveFastFails)")
-
-            if consecutiveFastFails >= maxFastFails {
-                status = .stopped(reason: "Recognizer keeps failing — check Dictation install or input audio.")
-                return
-            }
-            if Task.isCancelled { return }
-            try? await Task.sleep(nanoseconds: 250_000_000)
+        } catch is CancellationError {
+            // Expected on Stop — fall through to outer cleanup.
+        } catch {
+            Log.line("Transcribe error: \(error.localizedDescription)")
         }
     }
 
-    /// Reconcile a snapshot against `sentences`:
-    /// new entries → new Sentence with fresh UUID;
-    /// existing entries → text/isFinal updated in place (stable UUID);
-    /// missing entries (snapshot shrank) → those Sentences are removed.
+    /// Append every sentence in the snapshot as a new `Sentence`. No
+    /// in-place edits, no UUID reuse — every snapshot represents fresh
+    /// content from a closed chunk.
     private func ingest(_ snapshot: SessionSnapshot) {
-        if snapshot == lastSnapshot { return }
-        lastSnapshot = snapshot
-
-        var active = activeIDs
+        if snapshot.sentences.isEmpty { return }
         let now = Date()
-
-        // 1. Truncate orphaned sentences (snapshot shrank).
-        if snapshot.sentences.count < active.count {
-            let dropping = Set(active[snapshot.sentences.count...])
-            sentences.removeAll { dropping.contains($0.id) }
-            active = Array(active.prefix(snapshot.sentences.count))
+        for ss in snapshot.sentences {
+            let trimmed = ss.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            sentences.append(Sentence(
+                id: UUID(),
+                text: trimmed,
+                translation: "",
+                createdAt: now,
+                lastModified: now
+            ))
         }
-
-        // 2. Update or append for each snapshot entry.
-        for (i, sessionSentence) in snapshot.sentences.enumerated() {
-            if i < active.count {
-                let id = active[i]
-                if let idx = sentences.firstIndex(where: { $0.id == id }) {
-                    if sentences[idx].text != sessionSentence.text {
-                        sentences[idx].text = sessionSentence.text
-                        sentences[idx].lastModified = now
-                    }
-                    sentences[idx].isFinal = sessionSentence.isFinal
-                }
-            } else {
-                let new = Sentence(
-                    id: UUID(),
-                    text: sessionSentence.text,
-                    translation: "",
-                    lastTranslatedSource: "",
-                    createdAt: now,
-                    lastModified: now,
-                    isFinal: sessionSentence.isFinal
-                )
-                sentences.append(new)
-                active.append(new.id)
-            }
-        }
-
-        activeIDs = active
         enforceMaxCount()
     }
 
     // MARK: - Translation worker
 
-    /// Greedy translation loop that always works on the most recent
-    /// outstanding sentence. Two priority tiers:
-    ///
-    ///   1. **Untranslated** sentences (no translation yet) — newest first.
-    ///   2. **Stale** sentences (text drifted since last translation) —
-    ///      newest first.
-    ///
-    /// After each successful translate the loop picks the *current* best
-    /// candidate again — so if the user has spoken more in the meantime,
-    /// the new live partial jumps the queue. Older dirty sentences that
-    /// already have *some* translation keep their last value during heavy
-    /// load; the loop catches up on them once the live row stabilises.
-    ///
-    /// This is the "skip ahead if we're falling behind real-time"
-    /// behavior — the freshest content always wins the next translator
-    /// slot, the older lines can lag without blocking it.
+    /// Translation worker. Each sentence's source text is immutable
+    /// (whisper emits finals only), so each row needs exactly one
+    /// translation pass. We walk newest-first so the freshest line on
+    /// screen gets its translation first — older lines lag without
+    /// blocking the live row.
     private func runTranslationLoop() async {
         Log.line("Translation loop started")
         while !Task.isCancelled {
-            // Drain whatever's currently dirty before sleeping.
             while !Task.isCancelled, let item = nextTranslationCandidate() {
                 if let cached = translationCache[item.text] {
                     applyTranslation(cached, to: item.id, originalSource: item.text)
@@ -473,30 +394,27 @@ final class Pipeline: ObservableObject {
         Log.line("Translation loop exited")
     }
 
-    /// Pick the next sentence to translate. Untranslated beats stale across
-    /// tiers; newest beats oldest within each tier.
+    /// Newest untranslated sentence, or nil if everything is done.
     private func nextTranslationCandidate() -> (id: UUID, text: String)? {
-        // Tier 1: anything without a translation yet, walking newest → oldest.
         for s in sentences.reversed() {
             if !s.text.isEmpty && s.translation.isEmpty {
-                return (s.id, s.text)
-            }
-        }
-        // Tier 2: dirty but already-translated, newest → oldest.
-        for s in sentences.reversed() {
-            if !s.text.isEmpty && s.text != s.lastTranslatedSource {
                 return (s.id, s.text)
             }
         }
         return nil
     }
 
+    /// Apply a translation result to the sentence with `id`. Guards
+    /// against a sentence that was pruned between dispatch and result
+    /// landing. `originalSource` defends against rare ID reuse — only
+    /// applies if the sentence still has the same source text we
+    /// translated.
     private func applyTranslation(_ translated: String, to id: UUID, originalSource: String) {
         guard let idx = sentences.firstIndex(where: { $0.id == id }),
               sentences[idx].text == originalSource
         else { return }
         sentences[idx].translation = translated
-        sentences[idx].lastTranslatedSource = originalSource
+        sentences[idx].lastModified = Date()
     }
 
     private func cacheTranslation(source: String, translated: String) {
@@ -519,14 +437,13 @@ final class Pipeline: ObservableObject {
         }
     }
 
-    /// Sentences we never drop:
-    ///   - the most-recent sentence overall
-    ///   - the live (last-active) sentence
+    /// We never drop the most-recent sentence. There's no separate
+    /// "live" concept anymore — every sentence is final the moment it
+    /// arrives, so age + cap is the only signal for eviction, with the
+    /// newest entry held back so the UI is never empty mid-stream.
     private func protectedIDs() -> Set<UUID> {
-        var s = Set<UUID>()
-        if let id = sentences.last?.id { s.insert(id) }
-        if let id = activeIDs.last { s.insert(id) }
-        return s
+        guard let id = sentences.last?.id else { return [] }
+        return [id]
     }
 
     private func prune() {

@@ -41,6 +41,25 @@ enum Paths {
         return url
     }
 
+    /// `models/` subdir for user-supplied GGML weights. Read-only from
+    /// the app's perspective — the user drops files in here themselves
+    /// (e.g. a larger whisper model) to override the bundled default.
+    /// Not auto-created: if it doesn't exist, no override is in play.
+    static var modelsDir: URL {
+        // Documents directory may not be reachable yet during early init
+        // on a fresh install (e.g. before the run loop has touched it),
+        // but the user-override path only matters when transcribe()
+        // first runs — by then the dir is guaranteed createable. We
+        // intentionally do NOT call createDirectory here so a missing
+        // dir is a clean "no override" signal in the file-existence check.
+        let fm = FileManager.default
+        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Documents")
+        return docs
+            .appendingPathComponent("LiveTranslate", isDirectory: true)
+            .appendingPathComponent("models", isDirectory: true)
+    }
+
     /// All output paths for a single run, sharing one timestamp stem.
     /// Subtitle paths are computed lazily because they depend on the
     /// language codes the user picked.
