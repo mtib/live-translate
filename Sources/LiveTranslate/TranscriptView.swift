@@ -56,11 +56,8 @@ struct TranscriptView: View {
                 compactBar
                 sentenceList(compact: true)
             }
-            // No top padding — compact mode is meant to be as compact
-            // vertically as possible. The window's title-bar gap is
-            // already reclaimed via fullSizeContentView.
             .padding(.horizontal, 12)
-            .padding(.bottom, 8)
+            .padding(.vertical, 8)
         } else {
             VStack(alignment: .leading, spacing: 10) {
                 fullBar
