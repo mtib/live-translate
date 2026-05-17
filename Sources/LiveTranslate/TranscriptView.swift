@@ -277,7 +277,11 @@ private struct SentenceRow: View {
                 .foregroundStyle(.primary.opacity(opacity))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
-            if !sentence.translation.isEmpty, (!compact || isMostRecent) {
+            // Source caption only in full mode. Compact mode shows
+            // translations only — the source text would clutter the
+            // overlay and the user can switch out of compact if they
+            // want to verify.
+            if !compact, !sentence.translation.isEmpty {
                 Text(sentence.text)
                     .font(.caption)
                     .foregroundStyle(.secondary.opacity(opacity * 0.85))

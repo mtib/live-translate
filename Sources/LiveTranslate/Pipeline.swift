@@ -340,38 +340,63 @@ final class Pipeline: ObservableObject {
 
     // MARK: - Translation worker
 
-    /// Translates every sentence whose text has changed since its last
-    /// translation. Cache (`lastTranslatedSource` + `translationCache`)
-    /// keeps duplicate strings from re-hitting the framework.
+    /// Greedy translation loop that always works on the most recent
+    /// outstanding sentence. Two priority tiers:
+    ///
+    ///   1. **Untranslated** sentences (no translation yet) — newest first.
+    ///   2. **Stale** sentences (text drifted since last translation) —
+    ///      newest first.
+    ///
+    /// After each successful translate the loop picks the *current* best
+    /// candidate again — so if the user has spoken more in the meantime,
+    /// the new live partial jumps the queue. Older dirty sentences that
+    /// already have *some* translation keep their last value during heavy
+    /// load; the loop catches up on them once the live row stabilises.
+    ///
+    /// This is the "skip ahead if we're falling behind real-time"
+    /// behavior — the freshest content always wins the next translator
+    /// slot, the older lines can lag without blocking it.
     private func runTranslationLoop() async {
         Log.line("Translation loop started")
         while !Task.isCancelled {
-            try? await Task.sleep(nanoseconds: 400_000_000)
-            let pending: [(id: UUID, text: String)] = sentences.compactMap { s in
-                guard !s.text.isEmpty, s.text != s.lastTranslatedSource else { return nil }
-                return (s.id, s.text)
-            }
-
-            for item in pending {
-                if Task.isCancelled { break }
-
+            // Drain whatever's currently dirty before sleeping.
+            while !Task.isCancelled, let item = nextTranslationCandidate() {
                 if let cached = translationCache[item.text] {
                     applyTranslation(cached, to: item.id, originalSource: item.text)
                     continue
                 }
-
                 do {
                     let translated = try await translator.translate(item.text)
                     cacheTranslation(source: item.text, translated: translated)
                     applyTranslation(translated, to: item.id, originalSource: item.text)
                 } catch TranslateError.noSession {
-                    break
+                    break  // session not yet handed to us — wait it out
                 } catch {
                     Log.line("Translation error: \(error.localizedDescription)")
+                    break  // back off briefly rather than spinning on the error
                 }
             }
+            try? await Task.sleep(nanoseconds: 150_000_000)
         }
         Log.line("Translation loop exited")
+    }
+
+    /// Pick the next sentence to translate. Untranslated beats stale across
+    /// tiers; newest beats oldest within each tier.
+    private func nextTranslationCandidate() -> (id: UUID, text: String)? {
+        // Tier 1: anything without a translation yet, walking newest → oldest.
+        for s in sentences.reversed() {
+            if !s.text.isEmpty && s.translation.isEmpty {
+                return (s.id, s.text)
+            }
+        }
+        // Tier 2: dirty but already-translated, newest → oldest.
+        for s in sentences.reversed() {
+            if !s.text.isEmpty && s.text != s.lastTranslatedSource {
+                return (s.id, s.text)
+            }
+        }
+        return nil
     }
 
     private func applyTranslation(_ translated: String, to id: UUID, originalSource: String) {
