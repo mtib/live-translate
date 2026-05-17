@@ -60,8 +60,28 @@ First launch prompts for:
 - **Screen Recording** — required by `ScreenCaptureKit` to access system
   audio. No screen frames are kept; only the audio stream is used.
 
-(Speech Recognition permission is no longer needed — Apple's Speech
-framework isn't in the pipeline anymore.)
+### Persisting permissions across rebuilds
+
+By default `build.sh` ad-hoc-signs the bundle, which means every
+rebuild produces a fresh `cdhash` and macOS re-prompts for permissions.
+To persist mic + screen-recording grants across rebuilds, sign with a
+stable self-signed code-signing certificate:
+
+1. Open **Keychain Access** → menu **Keychain Access → Certificate
+   Assistant → Create a Certificate…**
+2. Name: `LiveTranslateDev` (any name works). Identity Type: **Self
+   Signed Root**. Certificate Type: **Code Signing**. Click *Create*.
+3. Build with the env var set, then `open` the app and grant
+   permissions one last time:
+   ```sh
+   LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev ./build.sh
+   open build/LiveTranslate.app
+   ```
+4. Future builds reuse the same identity — TCC keys the grants on the
+   certificate, not on the binary hash, so the permissions stick.
+
+You can also export the variable in your shell rc so you don't have to
+prefix every invocation.
 
 ## How it works (one-paragraph version)
 

@@ -39,8 +39,18 @@ cp "build/whisper-models/ggml-large-v3-turbo-q5_0.bin" "${APP_DIR}/Contents/Reso
 ./tools/make-icon.sh build/icon
 cp build/icon/icon.icns "${APP_DIR}/Contents/Resources/icon.icns"
 
-# Ad-hoc sign so the TCC system will remember permission grants across runs.
-codesign --force --deep --sign - "${APP_DIR}" >/dev/null
+# Code-sign. By default ad-hoc (sign id "-"), which means every rebuild
+# produces a fresh cdhash and macOS prompts for permissions again. To
+# persist mic/screen-recording grants across rebuilds, set
+# `LIVETRANSLATE_SIGN_IDENTITY` to the name of a self-signed code-
+# signing certificate in your login keychain (see README). TCC keys
+# grants on the certificate's identity rather than the binary hash, so
+# the new build is recognised as the same app.
+SIGN_IDENTITY="${LIVETRANSLATE_SIGN_IDENTITY:--}"
+codesign --force --deep --sign "${SIGN_IDENTITY}" "${APP_DIR}" >/dev/null
+if [[ "${SIGN_IDENTITY}" != "-" ]]; then
+    echo "  signed with identity: ${SIGN_IDENTITY}"
+fi
 
 echo "✓ built ${APP_DIR}"
 echo "  run with: open ${APP_DIR}"

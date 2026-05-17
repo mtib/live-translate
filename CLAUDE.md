@@ -361,6 +361,14 @@ tccutil reset Microphone local.mtib.livetranslate
 tccutil reset ScreenCapture local.mtib.livetranslate
 ```
 
+**Persisting grants across rebuilds.** Ad-hoc signing (`codesign
+--sign -`, the default) produces a fresh cdhash each build → TCC
+re-prompts. Set `LIVETRANSLATE_SIGN_IDENTITY` to a self-signed
+code-signing certificate name (created via Keychain Access →
+Certificate Assistant) and `build.sh` will use it. TCC keys grants
+on the certificate identity rather than the binary hash, so future
+builds reuse the existing grant. See README for the one-time setup.
+
 ### Window
 - Real macOS app (not menu-bar). `LSUIElement = false`.
 - Translucent (`NSVisualEffectView.Material.hudWindow`), floating
