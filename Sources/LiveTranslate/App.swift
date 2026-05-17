@@ -53,8 +53,12 @@ struct LiveTranslateApp: App {
         window.hasShadow = true
         window.level = .floating
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        window.standardWindowButton(.closeButton)?.isHidden = false
-        window.standardWindowButton(.miniaturizeButton)?.isHidden = false
+        // Hide all traffic lights — the app is meant to be a small floating
+        // overlay and the title-bar chrome eats vertical real estate. Use
+        // Cmd+Q (or the app menu) to quit; the window drags from anywhere
+        // thanks to isMovableByWindowBackground.
+        window.standardWindowButton(.closeButton)?.isHidden = true
+        window.standardWindowButton(.miniaturizeButton)?.isHidden = true
         window.standardWindowButton(.zoomButton)?.isHidden = true
     }
 }

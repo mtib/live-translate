@@ -46,7 +46,7 @@ final class AppleSpeechTranscriber: Transcriber {
                 if let result {
                     let snapshot = SessionSnapshot(
                         sentences: Self.splitIntoSentences(
-                            result.bestTranscription.formattedString,
+                            from: result.bestTranscription,
                             sessionIsFinal: result.isFinal
                         )
                     )
@@ -77,43 +77,69 @@ final class AppleSpeechTranscriber: Transcriber {
 
     // MARK: - Splitter
 
-    /// Split a recognition result into sentences. A sentence ends at `.` `!`
-    /// `?` followed by whitespace/EOS, or at a literal newline. Punctuation
-    /// stays with its sentence. The trailing fragment (no terminator yet) is
-    /// kept as the last entry — it is the **live partial** that the UI will
-    /// keep updating as the user speaks.
+    /// Pause threshold for sentence boundaries. Apple's recognizer often
+    /// omits a period when the speaker doesn't fully stop, so we *also*
+    /// split when the inter-word gap exceeds this — that catches real-
+    /// world dialog where sentences run on. Tunable; 0.5 s is a comma-
+    /// like beat, longer than that is a clean break.
+    static var pauseThreshold: TimeInterval = 0.5
+
+    /// Split a recognition result into sentences using two signals:
+    ///   1. Sentence-terminating punctuation (`.` `!` `?` `\n`).
+    ///   2. **Inter-word silence** longer than `pauseThreshold` — catches
+    ///      the dialog case where the recognizer hasn't placed a period
+    ///      yet but the speaker clearly paused.
     ///
-    /// `sessionIsFinal` indicates whether the whole recognizer session is
-    /// closing — when true, even the trailing fragment is marked `isFinal`.
-    static func splitIntoSentences(_ s: String, sessionIsFinal: Bool) -> [SessionSentence] {
-        guard !s.isEmpty else { return [] }
-        var finished: [String] = []
-        var current = ""
-        let chars = Array(s)
-        for i in 0..<chars.count {
-            let ch = chars[i]
-            current.append(ch)
-            let nextIsBoundary: Bool = {
-                if ch == "\n" { return true }
-                if ch == "." || ch == "!" || ch == "?" {
-                    if i == chars.count - 1 { return true }
-                    let nxt = chars[i + 1]
-                    return nxt == " " || nxt == "\n" || nxt == "\t"
+    /// The trailing fragment (no terminator, no pause after) is the live
+    /// partial — it stays mutable until either a terminator lands, a long
+    /// pause happens, or the whole session ends (`sessionIsFinal`).
+    static func splitIntoSentences(
+        from transcription: SFTranscription,
+        sessionIsFinal: Bool
+    ) -> [SessionSentence] {
+        let segments = transcription.segments
+        guard !segments.isEmpty else { return [] }
+
+        var sentences: [SessionSentence] = []
+        var currentTokens: [String] = []
+        var prevEnd: TimeInterval = segments[0].timestamp
+
+        func flush(asFinal: Bool) {
+            let text = currentTokens.joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty {
+                sentences.append(SessionSentence(text: text, isFinal: asFinal))
+            }
+            currentTokens = []
+        }
+
+        for (i, seg) in segments.enumerated() {
+            // Pause-based split: long silence before this segment ends the
+            // previous sentence (even with no terminator).
+            if i > 0 {
+                let gap = seg.timestamp - prevEnd
+                if gap >= pauseThreshold && !currentTokens.isEmpty {
+                    flush(asFinal: true)
                 }
-                return false
-            }()
-            if nextIsBoundary {
-                let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { finished.append(trimmed) }
-                current = ""
+            }
+
+            currentTokens.append(seg.substring)
+            prevEnd = seg.timestamp + seg.duration
+
+            // Punctuation-based split: if this token ends with a sentence
+            // terminator, the sentence ends here.
+            if let last = seg.substring.last, "!.?".contains(last) {
+                flush(asFinal: true)
+            } else if seg.substring.contains("\n") {
+                flush(asFinal: true)
             }
         }
-        var out: [SessionSentence] = finished.map { SessionSentence(text: $0, isFinal: true) }
-        let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tail.isEmpty {
-            out.append(SessionSentence(text: tail, isFinal: sessionIsFinal))
+
+        // Whatever's left is the live partial. Mark final only when the
+        // whole recognizer session is closing.
+        if !currentTokens.isEmpty {
+            flush(asFinal: sessionIsFinal)
         }
-        return out
+        return sentences
     }
 }
 

@@ -230,6 +230,11 @@ struct TranscriptView: View {
                 .padding(.vertical, 2)
             }
             .frame(minHeight: compact ? 50 : 140)
+            // No scrollbar — the list is short by design (capped at
+            // maxSentenceCount) and the indicator just adds visual noise.
+            // The window scrolls anyway when content overflows; we just
+            // don't show the thumb.
+            .scrollIndicators(.hidden)
             .onChange(of: pipeline.sentences.last?.id) { _, _ in
                 withAnimation(.easeOut(duration: 0.12)) {
                     proxy.scrollTo("BOTTOM", anchor: .bottom)
