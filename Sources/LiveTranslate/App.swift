@@ -52,6 +52,11 @@ struct LiveTranslateApp: App {
         window.isOpaque = false
         window.hasShadow = true
         window.level = .floating
+        // Extend our content into the title-bar area so the hidden
+        // traffic-light strip doesn't leave a dead band of background
+        // above the controls. The View ignores the safe area to match.
+        window.styleMask.insert(.fullSizeContentView)
+        window.titleVisibility = .hidden
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         // Hide all traffic lights — the app is meant to be a small floating
         // overlay and the title-bar chrome eats vertical real estate. Use

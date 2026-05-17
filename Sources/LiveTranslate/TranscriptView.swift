@@ -32,6 +32,9 @@ struct TranscriptView: View {
                 .ignoresSafeArea()
             content
         }
+        // Extend into the (now-hidden) title-bar area so we don't leave
+        // a dead band above our controls.
+        .ignoresSafeArea()
         // Park the translation session for the lifetime of this config.
         .translationTask(translationConfig) { session in
             pipeline.installTranslationSession(session)
@@ -53,8 +56,11 @@ struct TranscriptView: View {
                 compactBar
                 sentenceList(compact: true)
             }
+            // No top padding — compact mode is meant to be as compact
+            // vertically as possible. The window's title-bar gap is
+            // already reclaimed via fullSizeContentView.
             .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.bottom, 8)
         } else {
             VStack(alignment: .leading, spacing: 10) {
                 fullBar
