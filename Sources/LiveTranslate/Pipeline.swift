@@ -48,8 +48,23 @@ final class Pipeline: ObservableObject {
 
     // MARK: - User settings (persisted)
 
-    @Published var source: SourceLocale { didSet { persist(source, forKey: K.source) } }
-    @Published var target: TargetLanguage { didSet { persist(target, forKey: K.target) } }
+    /// Changing source/target while a run is in progress flushes the
+    /// current run to disk and immediately starts a fresh one — new
+    /// recording, new SRTs, new JSONL, clean visible history. The
+    /// new run picks up the new language values when it opens its
+    /// output files and starts its recognizer.
+    @Published var source: SourceLocale {
+        didSet {
+            persist(source, forKey: K.source)
+            if oldValue != source { requestRestartIfRunning() }
+        }
+    }
+    @Published var target: TargetLanguage {
+        didSet {
+            persist(target, forKey: K.target)
+            if oldValue != target { requestRestartIfRunning() }
+        }
+    }
 
     /// Non-protected sentence older than this is pruned. Generous — old
     /// sentences are dimmed in the UI but still readable, so we'd rather
@@ -101,6 +116,11 @@ final class Pipeline: ObservableObject {
     private var recorder: AudioRecorder?
     private var sourceSubs: SubtitleArchive?
     private var targetSubs: SubtitleArchive?
+
+    /// Set by a settings-change observer; read by run()'s defer. When
+    /// true after the current run winds down, defer spawns a fresh run.
+    /// Cleared by `stop()` so a user-initiated Stop doesn't auto-restart.
+    private var restartRequested: Bool = false
     /// Wall-clock instant the current run's recording started. Used to
     /// compute SRT cue offsets (`sentence.createdAt - runStartedAt`).
     private var runStartedAt: Date = .distantPast
@@ -153,10 +173,24 @@ final class Pipeline: ObservableObject {
 
     func stop() {
         Log.line("Pipeline.stop()")
+        // Explicit user stop cancels any pending auto-restart from a
+        // recent settings change.
+        restartRequested = false
         runTask?.cancel()
         // Don't nil runTask here — let run()'s defer do it after the
         // wind-down completes, so a redundant Stop press is a no-op
         // instead of starting a fresh run on top.
+    }
+
+    /// Called from the source/target property observers. Cancels the
+    /// in-flight run if any, flagging that the wind-down should spawn
+    /// a fresh replacement. No-op when no run is active — the next
+    /// manual Start already picks up the new settings.
+    private func requestRestartIfRunning() {
+        guard runTask != nil else { return }
+        Log.line("Pipeline.requestRestart() — settings changed mid-run")
+        restartRequested = true
+        runTask?.cancel()
     }
 
     func clear() {
@@ -204,6 +238,15 @@ final class Pipeline: ObservableObject {
             recorder = nil
             sourceSubs = nil
             targetSubs = nil
+            // A settings change while we were running flagged
+            // restartRequested and cancelled us. Spawn a fresh run
+            // with a clean visible list (the just-flushed sentences
+            // are already on disk).
+            if restartRequested {
+                restartRequested = false
+                sentences = []
+                runTask = Task { await run() }
+            }
         }
 
         // 1. Permissions. Mic via TCC up front; SCK prompts on its own when

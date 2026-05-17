@@ -160,8 +160,10 @@ struct TranscriptView: View {
         }
         .labelsHidden()
         .frame(maxWidth: 170)
-        .disabled(pipeline.isRunning)
         .controlSize(.small)
+        // Enabled even while running: the Pipeline will tear the
+        // current run down (flushing transcripts/audio) and start a
+        // fresh one with the new language.
     }
 
     private var targetPicker: some View {
