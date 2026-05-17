@@ -61,36 +61,43 @@ enum Paths {
     }
 
     /// All output paths for a single run, sharing one timestamp stem.
-    /// Subtitle paths are computed lazily because they depend on the
-    /// language codes the user picked.
+    /// Per-source files (`<stamp>.mic.wav`, `<stamp>.system.wav`,
+    /// `<stamp>.mic.<lang>.srt`, `<stamp>.system.<lang>.srt`) are
+    /// produced live; merged files (combined audio/srt) are an
+    /// after-the-fact step (`tools/merge-srt.py`, ffmpeg amix).
     struct Outputs {
         let timestamp: String
-        let transcript: URL    // …/transcripts/<stamp>.jsonl
-        let recording: URL     // …/recordings/<stamp>.wav
+        let transcript: URL                       // …/transcripts/<stamp>.jsonl
         private let transcriptsDir: URL
+        private let recordingsDir: URL
 
-        /// SRT path for one language. `langCode` is a 2-letter ISO code
-        /// like "de" or "en"; pass the same dir as the transcript so
-        /// players can pick subtitles up by suffix matching.
-        func subtitle(_ langCode: String) -> URL {
-            transcriptsDir.appendingPathComponent("\(timestamp).\(langCode).srt")
+        /// `.wav` path for one input source.
+        func recording(_ source: SourceTag) -> URL {
+            recordingsDir.appendingPathComponent("\(timestamp).\(source.rawValue).wav")
         }
 
-        init(timestamp: String, transcript: URL, recording: URL, transcriptsDir: URL) {
+        /// SRT path for one source + language pair. `langCode` is a
+        /// 2-letter ISO code like "de" or "en".
+        func subtitle(_ source: SourceTag, _ langCode: String) -> URL {
+            transcriptsDir.appendingPathComponent("\(timestamp).\(source.rawValue).\(langCode).srt")
+        }
+
+        init(timestamp: String, transcript: URL, transcriptsDir: URL, recordingsDir: URL) {
             self.timestamp = timestamp
             self.transcript = transcript
-            self.recording = recording
             self.transcriptsDir = transcriptsDir
+            self.recordingsDir = recordingsDir
         }
     }
     static func newRunOutputs(now: Date = Date()) throws -> Outputs {
         let stamp = runFilenameFormatter.string(from: now)
         let tDir = try transcriptsDirectory()
+        let rDir = try recordingsDirectory()
         return Outputs(
             timestamp: stamp,
             transcript: tDir.appendingPathComponent("\(stamp).jsonl"),
-            recording: try recordingsDirectory().appendingPathComponent("\(stamp).wav"),
-            transcriptsDir: tDir
+            transcriptsDir: tDir,
+            recordingsDir: rDir
         )
     }
 }

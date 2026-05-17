@@ -29,6 +29,23 @@ struct TargetLanguage: Hashable, Identifiable, Codable {
 
 // MARK: - Transcriber events
 
+/// Which input stream produced a given sentence. The app captures
+/// mic and system audio as independent streams (each with its own
+/// RNNoise + accumulator + whisper invocation); this tag flows
+/// through to per-stream WAV/SRT files and the JSONL `source` field.
+enum SourceTag: String, Codable, Hashable, Sendable, CaseIterable {
+    case mic
+    case system
+
+    /// Compact label used in merged SRTs and UI annotations.
+    var shortLabel: String {
+        switch self {
+        case .mic: return "Mic"
+        case .system: return "Sys"
+        }
+    }
+}
+
 /// One sentence as the active recognition session currently sees it. The
 /// Transcriber owns sentence splitting — the Pipeline stays ignorant of
 /// how any particular backend formats its output.
@@ -86,6 +103,9 @@ struct Sentence: Identifiable, Equatable {
     let text: String
     /// Target-language text. Empty until the translator handles it.
     var translation: String
+    /// Which input stream produced this sentence — drives which
+    /// per-source WAV/SRT it lands in and the JSONL `source` field.
+    let source: SourceTag
     /// Wall-clock time when the **audio** for this sentence began.
     /// Anchored on `runStartedAt + startSeconds` from the transcriber,
     /// so SRT cue start and JSONL "start" line up with the matching
@@ -153,14 +173,19 @@ protocol AudioSource: AnyObject {
     var buffers: AsyncStream<AVAudioPCMBuffer> { get }
 }
 
-/// Consumes audio buffers and produces session snapshots. One call to
-/// `transcribe(...)` represents one recognition session; the stream
-/// finishes when the session ends. The Pipeline calls this repeatedly
-/// to give the user continuous output across the backend's session caps.
+/// Consumes audio buffers and produces session snapshots for one
+/// **input stream** (mic or system). The Pipeline runs one call per
+/// active source — calls run concurrently and may share internal state
+/// (e.g. the whisper.cpp backend serializes `whisper_full` invocations
+/// across calls via a lock).
+///
+/// The stream finishes when the audio source's `buffers` AsyncStream
+/// ends (Pipeline drives this by stopping the audio source on Stop).
 protocol Transcriber {
     func transcribe(
         audio: AsyncStream<AVAudioPCMBuffer>,
-        locale: SourceLocale
+        locale: SourceLocale,
+        source: SourceTag
     ) -> AsyncThrowingStream<SessionSnapshot, Error>
 }
 

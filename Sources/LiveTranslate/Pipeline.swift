@@ -115,15 +115,13 @@ final class Pipeline: ObservableObject {
     private let maxCacheEntries: Int = 200
 
     private var runTask: Task<Void, Never>?
+    /// Shared JSONL archive — sentences from all sources interleave
+    /// here, distinguished by the `source` field.
     private var archive: TranscriptArchive?
-    private var recorder: AudioRecorder?
-    private var sourceSubs: SubtitleArchive?
-    private var targetSubs: SubtitleArchive?
-    /// The audio source currently feeding the run. Held here so `stop()`
-    /// can end it from outside the task tree — the audio pipeline then
-    /// drains naturally rather than being aborted via cancellation, which
-    /// is what gives us trailing-audio flush on Stop.
-    private var activeAudioSource: AudioSource?
+    /// One per-stream pipeline per `SourceTag`. Each owns its denoiser,
+    /// recorder, SRT writers, and emits Sentences via an AsyncStream.
+    /// Held here so `stop()` can signal each one to drain.
+    private var sourcePipelines: [SourceTag: SourcePipeline] = [:]
 
     /// Set by a settings-change observer; read by run()'s defer. When
     /// true after the current run winds down, defer spawns a fresh run.
@@ -177,33 +175,27 @@ final class Pipeline: ObservableObject {
 
     func stop() {
         Log.line("Pipeline.stop()")
-        // Explicit user stop cancels any pending auto-restart from a
-        // recent settings change.
         restartRequested = false
-        // Graceful shutdown: stopping the audio source ends the
-        // broadcaster's `buffers` AsyncStreams, which lets the
-        // recognition accumulator emit any in-flight chunk and the
-        // worker drain the queue before run()'s for-await exits. Without
-        // this, cancellation would abort the pipeline mid-flight and
-        // drop trailing audio.
-        if let active = activeAudioSource {
-            Task { await active.stop() }
-        }
-        // Don't nil runTask here — let run()'s defer do it after the
-        // wind-down completes, so a redundant Stop press is a no-op
-        // instead of starting a fresh run on top.
+        stopActiveSources()
     }
 
-    /// Called from the source/target property observers. Stops the audio
-    /// source so the current run drains naturally, then run()'s defer
-    /// spawns a fresh replacement. No-op when no run is active — the
-    /// next manual Start already picks up the new settings.
+    /// Called from the source/target property observers. Stops the
+    /// audio sources so the current run drains naturally, then run()'s
+    /// defer spawns a fresh replacement.
     private func requestRestartIfRunning() {
         guard runTask != nil else { return }
         Log.line("Pipeline.requestRestart() — settings changed mid-run")
         restartRequested = true
-        if let active = activeAudioSource {
-            Task { await active.stop() }
+        stopActiveSources()
+    }
+
+    /// Graceful shutdown: stopping each source pipeline ends its
+    /// audio broadcaster, which drains the per-stream accumulator +
+    /// worker + recording loops. Without this, cancellation would
+    /// abort the pipeline mid-flight and drop trailing audio.
+    private func stopActiveSources() {
+        for pipeline in sourcePipelines.values {
+            Task { await pipeline.stop() }
         }
     }
 
@@ -223,9 +215,7 @@ final class Pipeline: ObservableObject {
     func flushPendingSentences() {
         for s in sentences { archiveDrop(s) }
         archive?.flush()
-        sourceSubs?.flush()
-        targetSubs?.flush()
-        recorder?.flush()
+        for sp in sourcePipelines.values { sp.flush() }
         sentences = []
     }
 
@@ -234,25 +224,14 @@ final class Pipeline: ObservableObject {
     private func run() async {
         isActive = true
         defer {
-            // Flush still-visible sentences to every output before letting
-            // the writers drop, so a clean Stop persists in-flight content.
             for s in sentences { archiveDrop(s) }
             archive?.flush()
-            sourceSubs?.flush()
-            targetSubs?.flush()
-            recorder?.flush()
+            for sp in sourcePipelines.values { sp.flush() }
             if case .stopped = status { } else { status = .idle }
             runTask = nil
             isActive = false
             archive = nil
-            recorder = nil
-            sourceSubs = nil
-            targetSubs = nil
-            activeAudioSource = nil
-            // A settings change while we were running flagged
-            // restartRequested and stopped the audio source. Spawn a
-            // fresh run with a clean visible list (the just-flushed
-            // sentences are already on disk).
+            sourcePipelines.removeAll()
             if restartRequested {
                 restartRequested = false
                 sentences = []
@@ -260,54 +239,70 @@ final class Pipeline: ObservableObject {
             }
         }
 
-        // 1. Permissions. Mic via TCC up front; SCK prompts on its own
-        //    when the stream starts. Both are mandatory — the app
-        //    always mixes mic + system audio.
+        // 1. Permissions.
         status = .requestingPermissions
         let micGranted: Bool = await withCheckedContinuation { c in
             AVCaptureDevice.requestAccess(for: .audio) { c.resume(returning: $0) }
         }
         guard micGranted else { status = .stopped(reason: "Microphone permission denied"); return }
 
-        // 2. Active source is always the mixed mic+system stream.
-        let active: AudioSource = MixedAudioSource(micSource, systemSource)
-        activeAudioSource = active
+        // 2. Build per-stream `DenoisingAudioSource`s and start them in
+        //    parallel. Each upstream goes through its own RNNoise; no
+        //    mixing happens.
+        let micDenoised = DenoisingAudioSource(micSource, label: "mic")
+        let systemDenoised = DenoisingAudioSource(systemSource, label: "system")
+        let denoised: [SourceTag: AudioSource] = [.mic: micDenoised, .system: systemDenoised]
 
-        // 3. Start audio.
         status = .starting
         do {
-            try await active.start()
+            async let m: Void = micDenoised.start()
+            async let s: Void = systemDenoised.start()
+            try await (m, s)
         } catch {
             status = .stopped(reason: "Audio: \(error.localizedDescription)"); return
         }
 
-        // 4. Open paired output files for this run.
+        // 3. Open output files. One shared JSONL; per-source WAVs and
+        //    per-(source,language) SRTs.
         runStartedAt = Date()
         let srcLangCode = String(source.identifier.prefix(2))
         let tgtLangCode = target.code
+        let outputs: Paths.Outputs
         do {
-            let outputs = try Paths.newRunOutputs(now: runStartedAt)
+            outputs = try Paths.newRunOutputs(now: runStartedAt)
             archive = try TranscriptArchive(at: outputs.transcript)
-            recorder = try AudioRecorder(at: outputs.recording)
-            sourceSubs = try SubtitleArchive(at: outputs.subtitle(srcLangCode))
-            if tgtLangCode != srcLangCode {
-                targetSubs = try SubtitleArchive(at: outputs.subtitle(tgtLangCode))
-            }
-            Log.line("Run outputs: \(outputs.timestamp) (.jsonl, .wav, .\(srcLangCode).srt\(tgtLangCode == srcLangCode ? "" : ", .\(tgtLangCode).srt"))")
         } catch {
-            Log.line("Pipeline: opening output files failed: \(error.localizedDescription)")
-            archive = nil
-            recorder = nil
-            sourceSubs = nil
-            targetSubs = nil
+            Log.line("Pipeline: opening JSONL archive failed: \(error.localizedDescription)")
+            for src in denoised.values { await src.stop() }
+            status = .stopped(reason: "Output: \(error.localizedDescription)")
+            return
         }
+
+        // 4. Build per-source pipelines with their own recorder + SRTs.
+        for tag in SourceTag.allCases {
+            guard let src = denoised[tag] else { continue }
+            let recorder = try? AudioRecorder(at: outputs.recording(tag))
+            let sourceSubs = try? SubtitleArchive(at: outputs.subtitle(tag, srcLangCode))
+            let targetSubs: SubtitleArchive? = (srcLangCode == tgtLangCode)
+                ? nil
+                : try? SubtitleArchive(at: outputs.subtitle(tag, tgtLangCode))
+            sourcePipelines[tag] = SourcePipeline(
+                source: tag,
+                audioSource: src,
+                transcriber: self.transcriber,
+                locale: self.source,
+                runStartedAt: runStartedAt,
+                recorder: recorder,
+                sourceSubs: sourceSubs,
+                targetSubs: targetSubs
+            )
+        }
+        Log.line("Run outputs: \(outputs.timestamp) (.jsonl, 2 .wav, per-source SRTs)")
 
         status = .running
 
-        // 5. Background workers (translation + prune): infinite loops
-        //    driven by `while !Task.isCancelled`. Run as a separate
-        //    cancellable Task so stopping them doesn't disturb the
-        //    audio-path drain.
+        // 5. Background workers (translation + prune): cancellable
+        //    separately from the audio path.
         let backgroundTask = Task {
             await withTaskGroup(of: Void.self) { group in
                 group.addTask { await self.runTranslationLoop() }
@@ -315,93 +310,39 @@ final class Pipeline: ObservableObject {
             }
         }
 
-        // 6. Audio path: recognition + recording. Both consume
-        //    `active.buffers`; both exit naturally when the audio
-        //    source's `stop()` closes the broadcaster's streams.
-        //    No cancellation involved — that's what lets the
-        //    transcriber emit a final chunk for trailing audio.
+        // 6. Run each SourcePipeline + a sentence-consumer that merges
+        //    its emissions into the shared UI. All exit naturally when
+        //    each pipeline's audio source stops.
         await withTaskGroup(of: Void.self) { group in
-            group.addTask { await self.runRecognitionCycle(audioSource: active) }
-            group.addTask { await self.runRecordingLoop(audioSource: active) }
+            for (_, sp) in sourcePipelines {
+                group.addTask { await sp.run() }
+                group.addTask { await self.consumeSentences(from: sp) }
+            }
         }
-        Log.line("Audio path drained")
+        Log.line("All source pipelines drained")
 
-        // 7. Audio drained. Now cancel background workers and wait.
+        // 7. Cancel background workers and wait.
         backgroundTask.cancel()
         _ = await backgroundTask.value
 
-        // 8. Final audio cleanup. `stop()` is idempotent — running it
-        //    twice (once from Pipeline.stop, once here on natural exit)
-        //    is fine.
-        await active.stop()
+        // 8. Final audio cleanup. Each `stop()` is idempotent.
+        for sp in sourcePipelines.values { await sp.stop() }
+    }
+
+    /// Consume one SourcePipeline's outgoing `Sentence` stream and
+    /// append each to the shared visible list. Exits when the source
+    /// pipeline finishes its stream.
+    private func consumeSentences(from sp: SourcePipeline) async {
+        for await sentence in sp.sentences {
+            self.sentences.append(sentence)
+            enforceMaxCount()
+        }
+        Log.line("Pipeline: sentence consumer for \(sp.source.rawValue) exited")
     }
 
     /// One recognition cycle, restarting sessions as they end. Bails after
     /// 6 consecutive fast-fails (typically the language model isn't installed,
     /// or no audio is reaching the recognizer).
-    /// Subscribes to the active audio source as a second consumer of its
-    /// broadcaster and forwards every PCM buffer to `AudioRecorder`. The
-    /// MixedAudioSource sample-sums mic + system, so what we write is the
-    /// exact audio the recognizer sees — the .wav pairs 1:1 with the
-    /// JSONL transcript by timestamp. Exits when the buffer stream ends.
-    private func runRecordingLoop(audioSource: AudioSource) async {
-        guard recorder != nil else { return }
-        Log.line("Recording loop started")
-        for await buf in audioSource.buffers {
-            recorder?.append(buf)
-        }
-        Log.line("Recording loop exited")
-    }
-
-    /// Run one continuous transcription session for the lifetime of
-    /// the audio source. The whisper.cpp backend's `transcribe()` is
-    /// itself a long-lived call that internally pumps audio without
-    /// pause and yields one snapshot per closed chunk, so the Pipeline
-    /// just consumes that stream straight through. No outer loop is
-    /// needed — re-subscribing would risk dropping audio while the
-    /// previous subscription was being torn down.
-    private func runRecognitionCycle(audioSource: AudioSource) async {
-        let audio = audioSource.buffers
-        do {
-            for try await snapshot in transcriber.transcribe(audio: audio, locale: source) {
-                if Task.isCancelled { break }
-                ingest(snapshot)
-            }
-        } catch is CancellationError {
-            // Expected on Stop — fall through to outer cleanup.
-        } catch {
-            Log.line("Transcribe error: \(error.localizedDescription)")
-        }
-    }
-
-    /// Append every sentence in the snapshot as a new `Sentence`. No
-    /// in-place edits, no UUID reuse — every snapshot represents fresh
-    /// content from a closed chunk.
-    ///
-    /// Timestamps from the transcriber are anchored against
-    /// `runStartedAt` so they map directly to positions in the paired
-    /// `.wav`. If the backend didn't report timing, we fall back to
-    /// `Date()`.
-    private func ingest(_ snapshot: SessionSnapshot) {
-        if snapshot.sentences.isEmpty { return }
-        let now = Date()
-        for ss in snapshot.sentences {
-            let trimmed = ss.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            let startedAt = ss.startSeconds.map { runStartedAt.addingTimeInterval($0) } ?? now
-            let endedAt = ss.endSeconds.map { runStartedAt.addingTimeInterval($0) } ?? now
-            sentences.append(Sentence(
-                id: UUID(),
-                text: trimmed,
-                translation: "",
-                createdAt: startedAt,
-                endsAt: max(startedAt, endedAt),
-                lastModified: now
-            ))
-        }
-        enforceMaxCount()
-    }
-
     // MARK: - Translation worker
 
     /// Translation worker. Each sentence's source text is immutable
@@ -517,19 +458,12 @@ final class Pipeline: ObservableObject {
         sentences.remove(at: idx)
     }
 
-    /// Fan one outgoing sentence to every writer: JSONL transcript, source
-    /// SRT subtitle, target SRT subtitle (if the translation is present and
-    /// the languages differ). The audio recorder is fed elsewhere (it
-    /// consumes the buffer broadcaster directly). SRT cue times are
-    /// offsets from `runStartedAt` so they map straight onto the paired
-    /// `.wav`'s timeline.
+    /// Fan one outgoing sentence to every writer: shared JSONL (with
+    /// the sentence's source tag) and the matching per-source SRT
+    /// files. Audio recorders are fed elsewhere — each SourcePipeline
+    /// subscribes to its denoised broadcaster directly.
     private func archiveDrop(_ s: Sentence) {
         archive?.append(s)
-        let start = s.createdAt.timeIntervalSince(runStartedAt)
-        let end = max(start, s.endsAt.timeIntervalSince(runStartedAt))
-        sourceSubs?.append(text: s.text, startSeconds: start, endSeconds: end)
-        if !s.translation.isEmpty {
-            targetSubs?.append(text: s.translation, startSeconds: start, endSeconds: end)
-        }
+        sourcePipelines[s.source]?.archiveSRT(s)
     }
 }

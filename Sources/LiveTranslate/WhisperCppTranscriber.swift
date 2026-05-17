@@ -110,11 +110,18 @@ final class WhisperCppTranscriber: Transcriber {
     private var ctx: OpaquePointer?
     private var modelLoadError: Error?
 
-    /// Tail of the previous chunk's text — fed back to whisper as
-    /// `initial_prompt` to keep speaker style, proper nouns, and
-    /// vocabulary stable across chunk boundaries. Empty for the very
-    /// first chunk and after any error.
-    private var previousChunkTail: String = ""
+    /// Tail of the previous chunk's text per input stream — fed back
+    /// to whisper as `initial_prompt` to keep speaker style, proper
+    /// nouns, and vocabulary stable across chunk boundaries. Per-source
+    /// because mic and system audio have unrelated content; mixing
+    /// the tails would pollute each.
+    private var previousChunkTail: [SourceTag: String] = [:]
+
+    /// `whisper_full` isn't reentrant on a single context. With two
+    /// streams (mic + system) feeding the same `ctx`, we serialize
+    /// invocations via this lock. Chunks are typically 1-5 s with
+    /// 1-3 s whisper time, so waits are bounded and small.
+    private let whisperLock = NSLock()
 
     deinit {
         if let ctx { whisper_free(ctx) }
@@ -206,7 +213,8 @@ final class WhisperCppTranscriber: Transcriber {
 
     func transcribe(
         audio: AsyncStream<AVAudioPCMBuffer>,
-        locale: SourceLocale
+        locale: SourceLocale,
+        source: SourceTag
     ) -> AsyncThrowingStream<SessionSnapshot, Error> {
         AsyncThrowingStream { continuation in
             // AsyncStream's closure isn't async, so we *must* spawn a
@@ -215,17 +223,17 @@ final class WhisperCppTranscriber: Transcriber {
             let runner = Task {
                 do {
                     let ctx = try self.ensureContextLoaded()
-                    Log.line("Whisper.transcribe: starting, locale=\(locale.identifier)")
-                    try await self.runChunkLoop(ctx: ctx, audio: audio, locale: locale, continuation: continuation)
-                    Log.line("Whisper.transcribe: audio ended, finishing stream")
+                    Log.line("Whisper.transcribe[\(source.rawValue)]: starting, locale=\(locale.identifier)")
+                    try await self.runChunkLoop(ctx: ctx, audio: audio, locale: locale, source: source, continuation: continuation)
+                    Log.line("Whisper.transcribe[\(source.rawValue)]: audio ended, finishing stream")
                     continuation.finish()
                 } catch {
-                    Log.line("Whisper.transcribe: error \(error.localizedDescription)")
+                    Log.line("Whisper.transcribe[\(source.rawValue)]: error \(error.localizedDescription)")
                     continuation.finish(throwing: error)
                 }
             }
             continuation.onTermination = { reason in
-                Log.line("Whisper.transcribe: onTermination (\(reason)), cancelling runner")
+                Log.line("Whisper.transcribe[\(source.rawValue)]: onTermination (\(reason)), cancelling runner")
                 runner.cancel()
             }
         }
@@ -243,36 +251,38 @@ final class WhisperCppTranscriber: Transcriber {
         ctx: OpaquePointer,
         audio: AsyncStream<AVAudioPCMBuffer>,
         locale: SourceLocale,
+        source: SourceTag,
         continuation: AsyncThrowingStream<SessionSnapshot, Error>.Continuation
     ) async throws {
         let (chunkQueue, queueSink) = AsyncStream<ChunkBuffer>.makeStream()
         let langCode = String(locale.identifier.prefix(2))
+        let tag = source.rawValue
 
         async let accumulate: Void = {
-            await self.accumulateChunks(audio: audio, sink: queueSink)
-            Log.line("accumulator: audio ended, closing queue")
+            await self.accumulateChunks(audio: audio, sink: queueSink, sourceTag: tag)
+            Log.line("accumulator[\(tag)]: audio ended, closing queue")
             queueSink.finish()
         }()
 
         async let process: Void = {
-            Log.line("worker: started")
+            Log.line("worker[\(tag)]: started")
             for await chunk in chunkQueue {
-                if Task.isCancelled { Log.line("worker: cancelled"); return }
-                Log.line("worker: received chunk #\(chunk.index) (\(chunk.closeReason)), samples=\(chunk.samples16k.count), voiced=\(chunk.voicedSampleCount)")
+                if Task.isCancelled { Log.line("worker[\(tag)]: cancelled"); return }
+                Log.line("worker[\(tag)]: received chunk #\(chunk.index) (\(chunk.closeReason)), samples=\(chunk.samples16k.count), voiced=\(chunk.voicedSampleCount)")
                 do {
                     if let snapshot = try await self.processChunk(
-                        ctx: ctx, chunk: chunk, languageCode: langCode
+                        ctx: ctx, chunk: chunk, languageCode: langCode, source: source
                     ) {
                         continuation.yield(snapshot)
-                        Log.line("worker: yielded snapshot for chunk #\(chunk.index), segments=\(snapshot.sentences.count)")
+                        Log.line("worker[\(tag)]: yielded snapshot for chunk #\(chunk.index), segments=\(snapshot.sentences.count)")
                     }
                 } catch {
-                    Log.line("worker: whisper error on chunk #\(chunk.index): \(error.localizedDescription)")
+                    Log.line("worker[\(tag)]: whisper error on chunk #\(chunk.index): \(error.localizedDescription)")
                     continuation.finish(throwing: error)
                     return
                 }
             }
-            Log.line("worker: queue closed, exiting")
+            Log.line("worker[\(tag)]: queue closed, exiting")
         }()
 
         _ = await (accumulate, process)
@@ -284,7 +294,8 @@ final class WhisperCppTranscriber: Transcriber {
     /// processes X" bug. Reset state in place; don't exit the for-await.
     private func accumulateChunks(
         audio: AsyncStream<AVAudioPCMBuffer>,
-        sink: AsyncStream<ChunkBuffer>.Continuation
+        sink: AsyncStream<ChunkBuffer>.Continuation,
+        sourceTag: String
     ) async {
         var sampleRate: Float = 48_000
         var silenceFramesForBreak = Int(sampleRate * Float(Self.endChunkAfterSilence))
@@ -325,10 +336,10 @@ final class WhisperCppTranscriber: Transcriber {
         // stays smooth across chunks (per-chunk converters click at seams).
         let converter = WhisperResampler()
 
-        Log.line("accumulator: started")
+        Log.line("accumulator[\(sourceTag)]: started")
         for await buf in audio {
             if Task.isCancelled {
-                Log.line("accumulator: task cancelled, exiting")
+                Log.line("accumulator[\(sourceTag)]: task cancelled, exiting")
                 return
             }
             bufferCount += 1
@@ -342,7 +353,7 @@ final class WhisperCppTranscriber: Transcriber {
                 silenceFramesForBreak = Int(sampleRate * Float(Self.endChunkAfterSilence))
                 warmupFrames = Int(sampleRate * Float(Self.chunkWarmup))
                 maxFrames = Int(sampleRate * Float(Self.maxChunkSeconds))
-                Log.line("accumulator: sampleRate=\(sampleRate) Hz from first buffer")
+                Log.line("accumulator[\(sourceTag)]: sampleRate=\(sampleRate) Hz from first buffer")
             }
 
             let bufStart16k = samples16k.count
@@ -362,7 +373,7 @@ final class WhisperCppTranscriber: Transcriber {
                 consecutiveSilentFrames = 0
                 if firstVoiceSample16k == nil {
                     firstVoiceSample16k = bufStart16k
-                    Log.line("accumulator: voice onset in chunk #\(chunkIndex + 1) at \(String(format: "%.2f", Float(totalFrames) / sampleRate))s (rms=\(String(format: "%.3f", rms)))")
+                    Log.line("accumulator[\(sourceTag)]: voice onset in chunk #\(chunkIndex + 1) at \(String(format: "%.2f", Float(totalFrames) / sampleRate))s (rms=\(String(format: "%.3f", rms)))")
                 }
                 lastVoiceSample16k = bufEnd16k
                 voicedSampleCount16k += (bufEnd16k - bufStart16k)
@@ -395,6 +406,7 @@ final class WhisperCppTranscriber: Transcriber {
                 emitChunk(
                     index: chunkIndex,
                     reason: reason,
+                    sourceTag: sourceTag,
                     sink: sink,
                     samples16k: samples16k,
                     chunkStartSample16k: chunkStartSample16k,
@@ -423,6 +435,7 @@ final class WhisperCppTranscriber: Transcriber {
             emitChunk(
                 index: chunkIndex,
                 reason: "stream-end-flush",
+                sourceTag: sourceTag,
                 sink: sink,
                 samples16k: samples16k,
                 chunkStartSample16k: chunkStartSample16k,
@@ -431,13 +444,14 @@ final class WhisperCppTranscriber: Transcriber {
                 voicedSampleCount16k: voicedSampleCount16k
             )
         }
-        Log.line("accumulator: for-await ended naturally, buffersSeen=\(bufferCount), chunksEmitted=\(chunkIndex)")
+        Log.line("accumulator[\(sourceTag)]: for-await ended naturally, buffersSeen=\(bufferCount), chunksEmitted=\(chunkIndex)")
     }
 
     /// Yield one closed chunk to the worker queue + log.
     private func emitChunk(
         index: Int,
         reason: String,
+        sourceTag: String,
         sink: AsyncStream<ChunkBuffer>.Continuation,
         samples16k: [Float],
         chunkStartSample16k: Int,
@@ -446,7 +460,7 @@ final class WhisperCppTranscriber: Transcriber {
         voicedSampleCount16k: Int
     ) {
         let chunkEndSample16k = chunkStartSample16k + samples16k.count
-        Log.line("accumulator: closing chunk #\(index) (\(reason)) — stream=[\(chunkStartSample16k)…\(chunkEndSample16k)] (\(String(format: "%.2f", Double(chunkStartSample16k) / 16_000))s…\(String(format: "%.2f", Double(chunkEndSample16k) / 16_000))s), voiced16k=\(voicedSampleCount16k), hadVoice=\(firstVoiceSample16k != nil)")
+        Log.line("accumulator[\(sourceTag)]: closing chunk #\(index) (\(reason)) — stream=[\(chunkStartSample16k)…\(chunkEndSample16k)] (\(String(format: "%.2f", Double(chunkStartSample16k) / 16_000))s…\(String(format: "%.2f", Double(chunkEndSample16k) / 16_000))s), voiced16k=\(voicedSampleCount16k), hadVoice=\(firstVoiceSample16k != nil)")
         sink.yield(ChunkBuffer(
             index: index,
             chunkStartSample16k: chunkStartSample16k,
@@ -456,7 +470,7 @@ final class WhisperCppTranscriber: Transcriber {
             voicedSampleCount: voicedSampleCount16k,
             closeReason: reason
         ))
-        Log.line("accumulator: yielded chunk #\(index) to queue, resuming pump")
+        Log.line("accumulator[\(sourceTag)]: yielded chunk #\(index) to queue, resuming pump")
     }
 
     /// Voice-trim + skip-empty + run whisper. Returns nil when the chunk
@@ -468,10 +482,12 @@ final class WhisperCppTranscriber: Transcriber {
     private func processChunk(
         ctx: OpaquePointer,
         chunk: ChunkBuffer,
-        languageCode: String
+        languageCode: String,
+        source: SourceTag
     ) async throws -> SessionSnapshot? {
+        let tag = source.rawValue
         guard let voiceStart = chunk.voiceStart else {
-            Log.line("worker: chunk #\(chunk.index) had no voice, skipping")
+            Log.line("worker[\(tag)]: chunk #\(chunk.index) had no voice, skipping")
             return nil
         }
 
@@ -488,7 +504,7 @@ final class WhisperCppTranscriber: Transcriber {
         let minVoicedSamples = Int(16_000 * Self.minVoicedSeconds)
         if chunk.voicedSampleCount < minVoicedSamples
             || trimmed.count < Int(16_000 * Self.minChunkSeconds) {
-            Log.line("worker: chunk #\(chunk.index) too short (voiced=\(chunk.voicedSampleCount), trimmed=\(trimmed.count)), skipping")
+            Log.line("worker[\(tag)]: chunk #\(chunk.index) too short (voiced=\(chunk.voicedSampleCount), trimmed=\(trimmed.count)), skipping")
             return nil
         }
 
@@ -499,17 +515,17 @@ final class WhisperCppTranscriber: Transcriber {
         let preLen = trimmed.count
         if trimmed.count < minWhisperSamples {
             trimmed.append(contentsOf: repeatElement(0, count: minWhisperSamples - trimmed.count))
-            Log.line("worker: chunk #\(chunk.index) padded \(preLen) → \(trimmed.count) samples (under whisper minimum)")
+            Log.line("worker[\(tag)]: chunk #\(chunk.index) padded \(preLen) → \(trimmed.count) samples (under whisper minimum)")
         }
 
-        let prompt = previousChunkTail
+        let prompt = previousChunkTail[source] ?? ""
         let started = Date()
-        Log.line("worker: chunk #\(chunk.index) → whisper_full (samples=\(trimmed.count), prompt=\"\(prompt.prefix(40))\")")
-        let segments = try await Self.runWhisper(
+        Log.line("worker[\(tag)]: chunk #\(chunk.index) → whisper_full (samples=\(trimmed.count), prompt=\"\(prompt.prefix(40))\")")
+        let segments = try await self.runWhisperLocked(
             ctx: ctx, samples: trimmed, languageCode: languageCode, initialPrompt: prompt
         )
         let elapsed = Date().timeIntervalSince(started)
-        Log.line("worker: chunk #\(chunk.index) ← whisper_full in \(String(format: "%.2f", elapsed))s, segments=\(segments.count)")
+        Log.line("worker[\(tag)]: chunk #\(chunk.index) ← whisper_full in \(String(format: "%.2f", elapsed))s, segments=\(segments.count)")
 
         // Join all of whisper's internal segments into a single line.
         // The RMS-based chunker already split on natural pauses, so
@@ -519,10 +535,10 @@ final class WhisperCppTranscriber: Transcriber {
         let joined = segments.joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !joined.isEmpty else {
-            Log.line("worker: chunk #\(chunk.index) produced no text, skipping")
+            Log.line("worker[\(tag)]: chunk #\(chunk.index) produced no text, skipping")
             return nil
         }
-        previousChunkTail = String(joined.suffix(Self.maxInitialPromptChars))
+        previousChunkTail[source] = String(joined.suffix(Self.maxInitialPromptChars))
 
         // Audio-stream timing: anchor at the chunk's voice onset and
         // end (chunk-local indices + chunk start offset = absolute
@@ -538,64 +554,84 @@ final class WhisperCppTranscriber: Transcriber {
         ])
     }
 
-    /// Runs `whisper_full()` on a detached task. The C call itself isn't
-    /// async, but it's long-running and we don't want to hold the
-    /// MainActor (or the audio pump task) while it spins.
-    private static func runWhisper(
+    /// Instance-level wrapper that serializes whisper_full calls across
+    /// all `transcribe()` invocations on this transcriber via
+    /// `whisperLock`. Two streams (mic + system) share one ctx; without
+    /// the lock concurrent whisper_full calls would corrupt internal
+    /// state.
+    private func runWhisperLocked(
         ctx: OpaquePointer,
         samples: [Float],
         languageCode: String,
         initialPrompt: String
     ) async throws -> [String] {
-        try await Task.detached(priority: .userInitiated) {
-            var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
-            params.print_realtime = false
-            params.print_progress = false
-            params.print_timestamps = false
-            params.print_special = false
-            params.translate = false
-            params.no_context = true   // each chunk is independent
-            params.single_segment = false
-            params.suppress_blank = true
-            params.suppress_nst = true
-            params.temperature = 0.0
-            params.n_threads = Int32(max(2, ProcessInfo.processInfo.activeProcessorCount - 2))
-
-            // C-string lifetimes: language and initial_prompt must remain
-            // alive for the duration of whisper_full(). We nest
-            // withCString blocks so both pointers stay valid through the
-            // call. Empty prompt → leave the field null (default).
-            let result: Int32 = languageCode.withCString { langPtr in
-                params.language = langPtr
-                let inner: (UnsafePointer<CChar>?) -> Int32 = { promptPtr in
-                    params.initial_prompt = promptPtr
-                    return samples.withUnsafeBufferPointer { buf in
-                        whisper_full(ctx, params, buf.baseAddress, Int32(buf.count))
-                    }
-                }
-                if initialPrompt.isEmpty {
-                    return inner(nil)
-                } else {
-                    return initialPrompt.withCString { promptPtr in inner(promptPtr) }
-                }
-            }
-            if result != 0 {
-                throw TranscribeError.unavailable("whisper_full failed: \(result)")
-            }
-            let segCount = whisper_full_n_segments(ctx)
-            var out: [String] = []
-            out.reserveCapacity(Int(segCount))
-            for i in 0..<segCount {
-                if let cStr = whisper_full_get_segment_text(ctx, i) {
-                    let trimmed = String(cString: cStr)
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty {
-                        out.append(trimmed)
-                    }
-                }
-            }
-            return out
+        let lock = self.whisperLock
+        return try await Task.detached(priority: .userInitiated) {
+            lock.lock()
+            defer { lock.unlock() }
+            return try Self.runWhisperSync(
+                ctx: ctx, samples: samples,
+                languageCode: languageCode, initialPrompt: initialPrompt
+            )
         }.value
+    }
+
+    /// Synchronous whisper_full invocation. Caller is expected to be
+    /// off the MainActor (`runWhisperLocked` provides that via its
+    /// detached Task) and holding `whisperLock`. Takes 1-3 s wall time.
+    private static func runWhisperSync(
+        ctx: OpaquePointer,
+        samples: [Float],
+        languageCode: String,
+        initialPrompt: String
+    ) throws -> [String] {
+        var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
+        params.print_realtime = false
+        params.print_progress = false
+        params.print_timestamps = false
+        params.print_special = false
+        params.translate = false
+        params.no_context = true   // each chunk is independent
+        params.single_segment = false
+        params.suppress_blank = true
+        params.suppress_nst = true
+        params.temperature = 0.0
+        params.n_threads = Int32(max(2, ProcessInfo.processInfo.activeProcessorCount - 2))
+
+        // C-string lifetimes: language and initial_prompt must remain
+        // alive for the duration of whisper_full(). We nest withCString
+        // blocks so both pointers stay valid through the call. Empty
+        // prompt → leave the field null (default).
+        let result: Int32 = languageCode.withCString { langPtr in
+            params.language = langPtr
+            let inner: (UnsafePointer<CChar>?) -> Int32 = { promptPtr in
+                params.initial_prompt = promptPtr
+                return samples.withUnsafeBufferPointer { buf in
+                    whisper_full(ctx, params, buf.baseAddress, Int32(buf.count))
+                }
+            }
+            if initialPrompt.isEmpty {
+                return inner(nil)
+            } else {
+                return initialPrompt.withCString { promptPtr in inner(promptPtr) }
+            }
+        }
+        if result != 0 {
+            throw TranscribeError.unavailable("whisper_full failed: \(result)")
+        }
+        let segCount = whisper_full_n_segments(ctx)
+        var out: [String] = []
+        out.reserveCapacity(Int(segCount))
+        for i in 0..<segCount {
+            if let cStr = whisper_full_get_segment_text(ctx, i) {
+                let trimmed = String(cString: cStr)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    out.append(trimmed)
+                }
+            }
+        }
+        return out
     }
 }
 

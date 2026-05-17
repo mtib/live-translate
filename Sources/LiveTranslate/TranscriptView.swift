@@ -280,21 +280,27 @@ private struct SentenceRow: View {
 
     var body: some View {
         let opacity: Double = isMostRecent ? 1.0 : 0.8
+        // Very subtle source tint via `colorMultiply`: shifts each
+        // text pixel's color slightly toward red (mic) or blue
+        // (system). The multiplier is close to white on the dominant
+        // axis so the effect reads as a faint warm/cool cast rather
+        // than a coloured label.
+        let tintMultiplier: Color = sentence.source == .mic
+            ? Color(red: 1.0, green: 0.92, blue: 0.92)
+            : Color(red: 0.92, green: 0.95, blue: 1.0)
 
         VStack(alignment: .leading, spacing: 1) {
             Text(sentence.translation.isEmpty ? sentence.text : sentence.translation)
                 .font(compact ? .callout : .body)
                 .foregroundStyle(.primary.opacity(opacity))
+                .colorMultiply(tintMultiplier)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .textSelection(.enabled)
-            // Source caption only in full mode. Compact mode shows
-            // translations only — the source text would clutter the
-            // overlay and the user can switch out of compact if they
-            // want to verify.
             if !compact, !sentence.translation.isEmpty {
                 Text(sentence.text)
                     .font(.caption)
                     .foregroundStyle(.secondary.opacity(opacity * 0.85))
+                    .colorMultiply(tintMultiplier)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
             }

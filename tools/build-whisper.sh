@@ -68,6 +68,14 @@ fi
 #   - GGML_NATIVE=ON         → let the compiler enable host-specific ISA
 if [[ "${SKIP_LIB_BUILD}" == "0" ]]; then
   echo "→ configuring CMake build at ${BUILD_DIR}"
+  # `GGML_NATIVE=OFF`: don't let ggml probe the build host for ARM
+  # microarchitecture extensions like i8mm. The autodetection on
+  # whisper.cpp v1.7.4 misbehaves on some Apple-Silicon CI runners —
+  # it sets `__ARM_FEATURE_MATMUL_INT8` without telling the compiler
+  # to allow the intrinsics, breaking the build. With native off, the
+  # baseline arm64 build path is used and works on every Apple Silicon
+  # generation. The perf cost vs. native is single-digit percent on
+  # whisper inference because Metal does the heavy lifting anyway.
   cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$(pwd)/${PREFIX_DIR}" \
@@ -79,7 +87,7 @@ if [[ "${SKIP_LIB_BUILD}" == "0" ]]; then
     -DGGML_METAL=ON \
     -DGGML_METAL_EMBED_LIBRARY=ON \
     -DGGML_ACCELERATE=ON \
-    -DGGML_NATIVE=ON \
+    -DGGML_NATIVE=OFF \
     >/dev/null
 
   echo "→ compiling (this takes a minute on first run; cached after)"

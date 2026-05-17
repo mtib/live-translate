@@ -66,25 +66,28 @@ framework isn't in the pipeline anymore.)
 ## How it works (one-paragraph version)
 
 The mic feeds an `AVAudioEngine` tap; system audio comes from
-`ScreenCaptureKit` (audio-only configuration). Both are converted to
-48 kHz mono Float32 and **sample-summed** with hardware-accelerated
-`vDSP_vadd`, then the summed stream is passed through a vendored
-copy of [xiph/rnnoise](https://github.com/xiph/rnnoise) (a tiny
-GRU-based denoiser, BSD 3-clause). The denoised stream is then
-downsampled to 16 kHz mono and fed to
-[whisper.cpp](https://github.com/ggerganov/whisper.cpp) in chunks
-(closed when the user pauses or after ~25 s of continuous speech).
-Recognized sentences are translated per-sentence via Apple's
-`Translation` framework (cached by source text). Old sentences fade out
-and eventually drop into a per-run JSONL archive — paired with a `.wav`
-of the exact denoised audio whisper saw:
+`ScreenCaptureKit` (audio-only configuration). Each stream stays
+independent — both are 48 kHz mono Float32, each goes through its
+**own** copy of [xiph/rnnoise](https://github.com/xiph/rnnoise) (a tiny
+GRU-based denoiser, BSD 3-clause), then each is downsampled to 16 kHz
+and fed to [whisper.cpp](https://github.com/ggerganov/whisper.cpp) in
+chunks (closed at silence or after 5 s). The two streams share one
+whisper model + a mutex around `whisper_full`, so they're transcribed
+in chunk-arrival order without contention. Recognized sentences are
+translated per-sentence via Apple's `Translation` framework and tagged
+with their source stream in the UI (faint warm tint = mic, faint cool
+tint = system). Old sentences eventually drop into a per-run JSONL
+archive paired with per-stream `.wav` + `.srt` files:
 
 ```
 ~/Documents/LiveTranslate/
-    transcripts/<stamp>.jsonl       (one sentence per line as JSON)
-    transcripts/<stamp>.<src>.srt   (subtitles, source language)
-    transcripts/<stamp>.<tgt>.srt   (subtitles, translated)
-    recordings/<stamp>.wav          (mixed mic+system, post-denoise, 48 kHz mono)
+    transcripts/<stamp>.jsonl                       (mic + system interleaved, "source" field)
+    transcripts/<stamp>.mic.<src>.srt              (mic subtitles, source language)
+    transcripts/<stamp>.mic.<tgt>.srt              (mic subtitles, translated)
+    transcripts/<stamp>.system.<src>.srt           (system subtitles, source language)
+    transcripts/<stamp>.system.<tgt>.srt           (system subtitles, translated)
+    recordings/<stamp>.mic.wav                     (post-denoise mic, 48 kHz mono)
+    recordings/<stamp>.system.wav                  (post-denoise system, 48 kHz mono)
 ```
 
 The `.srt` files use cue times relative to the start of the matching
@@ -93,46 +96,63 @@ the audio. They're also plain text — `grep -i term *.srt` works.
 
 ## Reviewing a run
 
-VLC (and most other players) only render subtitles when there's a
-video track to draw them onto, so a bare `.wav` + `.srt` won't show
-captions. Easiest fix: wrap the run into a single MKV with a tiny
-black "video", the audio, and **both** subtitle tracks embedded —
-your player's *Subtitle → Sub Track* menu then switches between
-languages on the fly.
+You usually want both streams playing simultaneously and one merged
+subtitle track per language. Two steps:
 
-One-liner from inside `~/Documents/LiveTranslate/`:
+**Step 1: merge SRTs.** `tools/merge-srt.py` reads the two per-source
+SRTs and interleaves them into one, tagging each cue with `[Mic]` or
+`[Sys]` so the speaker is obvious:
 
 ```sh
-STAMP=2026-05-17_11-59-50   # ← change to the run you want
+STAMP=2026-05-17_13-46-19   # ← change to the run you want
+REPO=/path/to/live-translate   # ← wherever you cloned this repo
+cd ~/Documents/LiveTranslate
 
-ffmpeg \
+"${REPO}/tools/merge-srt.py" \
+    "transcripts/${STAMP}.mic.de.srt" "transcripts/${STAMP}.system.de.srt" \
+    "transcripts/${STAMP}.de.srt"
+"${REPO}/tools/merge-srt.py" \
+    "transcripts/${STAMP}.mic.en.srt" "transcripts/${STAMP}.system.en.srt" \
+    "transcripts/${STAMP}.en.srt"
+```
+
+**Step 2: build the MKV.** ffmpeg's `amix` filter sums the two WAVs at
+the same wall-clock rate (both start at the run's t=0). Both merged
+subtitle tracks embed; toggle in your player's *Subtitle → Sub Track*
+menu:
+
+```sh
+ffmpeg -y \
   -f lavfi -i color=c=black:s=960x180:r=2 \
-  -i "recordings/${STAMP}.wav" \
+  -i "recordings/${STAMP}.mic.wav" \
+  -i "recordings/${STAMP}.system.wav" \
   -i "transcripts/${STAMP}.de.srt" \
   -i "transcripts/${STAMP}.en.srt" \
-  -map 0:v -map 1:a -map 2 -map 3 \
+  -filter_complex "[1:a][2:a]amix=inputs=2:normalize=0[aout]" \
+  -map 0:v -map "[aout]" -map 3 -map 4 \
   -c:v libx264 -preset ultrafast -tune stillimage \
-  -c:a copy -c:s srt \
+  -c:a aac -c:s srt \
   -metadata:s:s:0 language=deu \
   -metadata:s:s:1 language=eng \
   -disposition:s:0 default \
   -shortest "${STAMP}.mkv"
 ```
 
-Adjust the two `language=` codes to match your actual source/target
-(`deu`, `eng`, `fra`, `spa`, `nld`…). `-disposition:s:0 default` makes
-the source-language subtitle the one VLC turns on by default; drop it
-if you'd rather start with no subtitles visible.
+Adjust the two `language=` codes (`deu`, `eng`, `fra`, `spa`, `nld`…)
+to match your actual source/target. `normalize=0` keeps mic and system
+at their original loudness; switch to `=1` if one dominates the mix.
 
-If you specifically want subtitles **burned in** (one fixed language,
-playable in any tool that can't toggle tracks):
+If you want subtitles **burned in** (one fixed language, playable in
+any tool that can't toggle tracks):
 
 ```sh
-ffmpeg \
+ffmpeg -y \
   -f lavfi -i color=c=black:s=960x180:r=10 \
-  -i "recordings/${STAMP}.wav" \
+  -i "recordings/${STAMP}.mic.wav" \
+  -i "recordings/${STAMP}.system.wav" \
+  -filter_complex "[1:a][2:a]amix=inputs=2:normalize=0[aout]" \
   -vf "subtitles=filename=transcripts/${STAMP}.en.srt" \
-  -map 0:v -map 1:a \
+  -map 0:v -map "[aout]" \
   -c:v libx264 -preset ultrafast -tune stillimage -c:a aac \
   -shortest "${STAMP}.en.mp4"
 ```

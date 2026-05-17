@@ -48,30 +48,39 @@ clone of [transcrybe.app](https://transcrybe.app).
 ## Architecture
 
 ```
-   Mic ──buffers──▶ Transcriber ──SessionSnapshot──┐
-                                                    ├─▶ Pipeline.ingest(_, kind)
-   System audio ─▶ Transcriber ──SessionSnapshot──┘
-                                                    │
-                                                    ▼
-                                            @Published sentences: [Sentence]
-                                                    │       ▲
-                                                    │       │ writes translation back
-                                                    ▼       │
-                                            Translator (per-sentence, cached)
+  Mic ──▶ Denoise ──▶ SourcePipeline(mic) ─┐
+                       ├─ AudioRecorder    ─┤
+                       ├─ Transcriber      ─┤── Sentence ──┐
+                       └─ SRT writers      ─┘               │
+                                                            ├─▶ @Published sentences: [Sentence]
+  System ─▶ Denoise ─▶ SourcePipeline(sys) ─┐               │      │      ▲
+                       ├─ AudioRecorder    ─┤── Sentence ──┘      ▼      │ writes translation back
+                       ├─ Transcriber      ─┤                  Translator (per-sentence, cached)
+                       └─ SRT writers      ─┘
+                                                            ┌──▶ TranscriptArchive (.jsonl, source-tagged)
+                                                            │       (on drop)
+                                                            └──▶ per-source SRT (.srt, source-tagged)
 ```
 
-Each stage is a protocol so it can be swapped (whisper.cpp, OpenRouter,
-ScreenCaptureKit) without touching `Pipeline`.
+Each stream stays **independent end-to-end** — mic and system never
+mix. They share the whisper context (`NSLock` around `whisper_full`)
+and the translation worker, but otherwise have their own audio
+broadcasters, denoiser state, recorders, and SRT files.
 
 ### Key design decisions
 
-- **Always mix mic + system.** The app does not expose input toggles —
-  mic and system audio are always both captured and sample-summed by
-  `MixedAudioSource` before the transcriber sees them. Both audio
-  sources standardize on **48 kHz mono Float32** (RNNoise's native
-  rate) so the mixed stream is format-consistent and the per-sample
-  sum is meaningful. The transcriber downsamples to 16 kHz internally
-  for whisper; the `.wav` writer downcasts to 16-bit Int on the
+- **Per-stream pipelines, never mixed.** Mic and system are captured
+  in parallel, each runs through its own `RNNoise` (via
+  `DenoisingAudioSource`), then a `SourcePipeline` ferries the
+  per-source data: a `WhisperCppTranscriber.transcribe(...,source:)`
+  call, an `AudioRecorder` writing `<stamp>.<source>.wav`, and per
+  `(source, language)` SRT writers. Each `SourcePipeline` emits
+  finished `Sentence`s via an `AsyncStream` that `Pipeline` consumes
+  and merges into the shared UI array.
+- **Audio format invariant.** Both sources standardize on **48 kHz
+  mono Float32** (RNNoise's native rate). The transcriber downsamples
+  to 16 kHz internally for whisper; each `.wav` writer downcasts to
+  16-bit Int on the
   write path.
 - **RNNoise on the merged stream.** A vendored copy of xiph/rnnoise
   v0.1.1 (BSD 3-clause, GRU weights embedded in `rnn_data.c`, ~400 KB
@@ -154,21 +163,22 @@ ScreenCaptureKit) without touching `Pipeline`.
 |---|---|
 | `App.swift` | `@main` entry. SwiftUI `Window` scene. Configures the NSWindow for floating / translucent / movable-from-background behavior. |
 | `TranscriptView.swift` | The whole UI. Renders one `SentenceRow` per sentence, with opacity fade for older rows. Hosts `.translationTask` (the only way to get a `TranslationSession`). Background is a flat translucent color — no blur. |
-| `Pipeline.swift` | `@MainActor ObservableObject` orchestrator. Owns the published `sentences` array. Runs **one** recognition cycle on a `MixedAudioSource` that sample-sums mic + system. Translation + prune workers run alongside. Persists user settings via UserDefaults. |
-| `BufferBroadcaster.swift` | Helper that fans audio buffers out to any number of subscribed `AsyncStream`s — used by all three `AudioSource` implementations to avoid duplicating the broadcaster pattern. |
-| `Types.swift` | `SourceLocale`, `TargetLanguage`, `Sentence`, `PipelineStatus`, `SessionSentence` / `SessionSnapshot`. Protocols: `AudioSource`, `Transcriber`, `Translator`. |
-| `MicrophoneSource.swift` | `AVAudioEngine` mic capture. Converts to 48 kHz mono Float32 so output matches `SystemAudioSource` (required by `MixedAudioSource`). Broadcaster pattern. |
-| `SystemAudioSource.swift` | `ScreenCaptureKit`-based system audio capture. Converts `CMSampleBuffer` → 48 kHz mono Float32 `AVAudioPCMBuffer`. |
-| `MixedAudioSource.swift` | Combines two `AudioSource`s by **sample-summing** at mic's cadence (Accelerate `vDSP_vadd`), then runs the summed buffer through `RNNoiseProcessor` before broadcasting. Mic clocks the output; system samples come from a small queue. 1:1 audio-time:wall-time. |
+| `Pipeline.swift` | `@MainActor ObservableObject` orchestrator. Owns the shared `sentences` array, the JSONL archive, the translator, and the prune loop. Spawns one `SourcePipeline` per `SourceTag` and merges their `Sentence` streams into the visible array. Persists user settings via UserDefaults. |
+| `SourcePipeline.swift` | Self-contained per-stream pipeline (mic OR system). Owns its denoised audio source, recorder, source/target SRT writers, and a `transcribe()` call. Emits `Sentence`s via an `AsyncStream` that `Pipeline` consumes. |
+| `BufferBroadcaster.swift` | Helper that fans audio buffers out to any number of subscribed `AsyncStream`s. `finishAll()` ends every subscription on audio-source stop, which is what drains the recognition pipeline naturally. |
+| `Types.swift` | `SourceLocale`, `TargetLanguage`, `SourceTag` (mic/system), `Sentence`, `PipelineStatus`, `SessionSentence` / `SessionSnapshot`. Protocols: `AudioSource`, `Transcriber`, `Translator`. |
+| `MicrophoneSource.swift` | `AVAudioEngine` mic capture, emits 48 kHz mono Float32. |
+| `SystemAudioSource.swift` | `ScreenCaptureKit`-based system audio capture, emits 48 kHz mono Float32. |
+| `DenoisingAudioSource.swift` | Wraps any `AudioSource`, applies its own `RNNoiseProcessor`, re-broadcasts. One per input stream so denoiser state is independent. |
 | `RNNoiseProcessor.swift` | Swift wrapper around the vendored RNNoise C library. Owns the `DenoiseState`, buffers arbitrary-sized input into 480-sample frames, handles ±32768 ↔ ±1 scaling, emits denoised samples via `drain(into:count:)`. |
 | `CRNNoise/` | Vendored xiph/rnnoise v0.1.1 as a SwiftPM C target. BSD 3-clause; GRU weights statically linked. See `Sources/CRNNoise/README.md`. |
-| `WhisperCppTranscriber.swift` | **The transcriber.** Two structured-concurrency child tasks via `async let`: an accumulator that pumps audio and emits closed chunks on silence/max-chunk, and a worker that runs `whisper_full()` serially on chunks pulled from the queue. Emits exactly **one** `SessionSentence` per chunk (whisper's internal segment splits are joined). Resolves the model file from `~/Documents/LiveTranslate/models/` first, then `Bundle.main`. |
+| `WhisperCppTranscriber.swift` | **The transcriber.** Two structured-concurrency child tasks via `async let` (per `transcribe()` call): an accumulator that pumps audio and emits closed chunks on silence/max-chunk, and a worker that runs `whisper_full()`. Multiple concurrent calls (mic + system) share one `ctx` and serialize via `NSLock` around `whisper_full`. Per-source `previousChunkTail` keyed by `SourceTag` keeps `initial_prompt` context independent per stream. |
 | `CWhisper/` | SwiftPM bridge target around `libwhisper.a` + `libggml*.a` produced by `tools/build-whisper.sh`. Headers (`whisper.h`, `ggml*.h`) are mirrored in by the build script and gitignored. |
 | `AppleTranslator.swift` | Holds a `TranslationSession` that the View injects via `Pipeline.installTranslationSession(_:)`. |
-| `TranscriptArchive.swift` | One-per-run JSONL archive. Takes its file URL; doesn't know about layout. |
-| `AudioRecorder.swift` | One-per-run `.wav` writer fed by a parallel consumer of the active source's broadcaster. 16 kHz mono Int16. |
-| `SubtitleArchive.swift` | One-per-language SRT writer. Cue times are offsets into the paired `.wav`. |
-| `Paths.swift` | Single source of truth for `~/Documents/LiveTranslate/{transcripts,recordings}/<stamp>.…`. |
+| `TranscriptArchive.swift` | One-per-run JSONL archive. Rows carry a `source` field (`"mic"` / `"system"`) plus the audio-anchored `start`/`end` timestamps. |
+| `AudioRecorder.swift` | One-per-stream `.wav` writer fed by a parallel consumer of its source's broadcaster. 48 kHz mono Int16. |
+| `SubtitleArchive.swift` | One-per-`(source,language)` SRT writer. Cue times are offsets into the matching `<stamp>.<source>.wav`. |
+| `Paths.swift` | Single source of truth for `~/Documents/LiveTranslate/{transcripts,recordings}/<stamp>.<source>[.<lang>].{wav,srt}` plus the shared `<stamp>.jsonl`. |
 | `Log.swift` | Append-only file logger at `/tmp/livetranslate.log`. Truncates on launch if > 5 MB. |
 
 ## Key behaviors / non-obvious bits

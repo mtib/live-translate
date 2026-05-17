@@ -6,12 +6,15 @@ import Foundation
 ///
 /// One JSON object per line:
 ///
-///     {"end":"2026-05-16T22:13:09.581Z","start":"2026-05-16T22:13:07.123Z","transcription":"…","translation":"…"}
+///     {"end":"…","source":"mic","start":"…","transcription":"…","translation":"…"}
 ///
-/// `start` / `end` are ISO-8601 with fractional seconds, marking when
-/// the sentence first appeared and when its text last changed. Both
-/// `transcription` and `translation` are always present (empty strings
-/// allowed). Sorted keys for grep/diff stability.
+/// `start` / `end` are ISO-8601 with fractional seconds, anchored to
+/// audio-stream positions (see `Sentence.createdAt`/`endsAt`). `source`
+/// is one of `"mic"` / `"system"` and identifies which input stream
+/// produced the sentence — the paired `.wav` and `.srt` files use the
+/// same tag in their filenames. Both `transcription` and `translation`
+/// are always present (empty strings allowed). Sorted keys for
+/// grep/diff stability.
 ///
 /// Writes go through a serial queue so the MainActor (where prune runs)
 /// never blocks on disk IO.
@@ -48,6 +51,7 @@ final class TranscriptArchive {
         let record = Record(
             start: Self.isoFormatter.string(from: sentence.createdAt),
             end: Self.isoFormatter.string(from: sentence.endsAt),
+            source: sentence.source.rawValue,
             transcription: sentence.text,
             translation: sentence.translation
         )
@@ -69,6 +73,7 @@ final class TranscriptArchive {
     private struct Record: Encodable {
         let start: String
         let end: String
+        let source: String
         let transcription: String
         let translation: String
     }
