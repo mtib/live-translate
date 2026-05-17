@@ -12,6 +12,11 @@ embedded).
 ![Default layout](docs/default.png)
 ![Compact layout](docs/compact.png)
 
+Example session output: [youtu.be/jXrzOEh-zZU](https://www.youtube.com/watch?v=jXrzOEh-zZU)
+— the `.mkv` shipped in the zip, uploaded to YouTube with the
+extracted SRTs re-attached as caption tracks (YouTube ignores
+subtitles embedded inside the container).
+
 ## Build & run
 
 ```sh

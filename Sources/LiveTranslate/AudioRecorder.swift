@@ -13,7 +13,7 @@ import AVFoundation
 /// where ingest runs — never blocks on disk IO.
 final class AudioRecorder {
     let url: URL
-    private let file: AVAudioFile
+    private var file: AVAudioFile?
     private let queue = DispatchQueue(label: "AudioRecorder.write", qos: .utility)
 
     /// Open a file for writing. Throws if the directory isn't writable or
@@ -36,8 +36,8 @@ final class AudioRecorder {
     /// happens on `queue`. `AVAudioFile.write(from:)` transparently
     /// converts the buffer's Float32 frames to the file's Int16 format.
     func append(_ buffer: AVAudioPCMBuffer) {
-        let file = self.file
-        queue.async {
+        queue.async { [weak self] in
+            guard let file = self?.file else { return }
             do {
                 try file.write(from: buffer)
             } catch {
@@ -46,9 +46,16 @@ final class AudioRecorder {
         }
     }
 
-    /// Block until every queued write has hit disk. Used on shutdown so
-    /// the last few seconds of audio aren't lost when the process exits.
+    /// Block until every queued write has hit disk, then close the
+    /// underlying `AVAudioFile` so the WAV header's data-chunk length
+    /// gets finalized. Without the close, `AVAudioFile(forReading:)`
+    /// (used downstream by `MKVExporter` to probe duration) sees a
+    /// stale header — the writer only finalizes on deinit. That
+    /// stale duration was making lavfi produce 0.5s of video for a
+    /// 10s audio file.
     func flush() {
-        queue.sync {}
+        queue.sync {
+            self.file = nil
+        }
     }
 }
