@@ -89,9 +89,12 @@ final class WhisperCppTranscriber: Transcriber {
     /// Whisper hallucinates aggressively on near-silent audio (the model
     /// has been trained on captioned video and will manufacture phrases
     /// like "Thanks for watching!" or "[Music]" given enough silence).
-    /// If we got fewer than this many seconds of *voice* in a chunk,
-    /// drop it entirely.
-    static var minVoicedSeconds: TimeInterval = 0.4
+    /// Tuned for short utterances ("yes" / "ok" / "no" are typically
+    /// 200-300 ms) to actually get through — the worker still pads the
+    /// trimmed clip to 1.1 s so whisper sees enough context, and the
+    /// padding tail (silence) doesn't trigger hallucinations when the
+    /// voiced prefix is real.
+    static var minVoicedSeconds: TimeInterval = 0.2
 
     /// Lower bound on the audio length fed to `whisper_full()`. whisper.cpp
     /// silently returns zero segments for audio shorter than ~1 second
