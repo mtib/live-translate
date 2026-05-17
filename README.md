@@ -54,19 +54,21 @@ First launch prompts for, in order:
 
 The mic feeds an `AVAudioEngine` tap; system audio comes from
 `ScreenCaptureKit` (audio-only configuration). Both are converted to
-16 kHz mono Float32 and **sample-summed** with hardware-accelerated
-`vDSP_vadd` so that one continuous audio stream reaches Apple's
+48 kHz mono Float32 and **sample-summed** with hardware-accelerated
+`vDSP_vadd`, then the summed stream is passed through a vendored
+copy of [xiph/rnnoise](https://github.com/xiph/rnnoise) (a tiny
+GRU-based denoiser, BSD 3-clause) before reaching Apple's
 `SFSpeechRecognizer`. Recognized sentences are translated per-sentence
 via the `Translation` framework (cached by source text). Old sentences
 fade out and eventually drop into a per-run JSONL archive — paired
-with a `.wav` of the exact mixed audio the recognizer heard:
+with a `.wav` of the exact denoised audio the recognizer heard:
 
 ```
 ~/Documents/LiveTranslate/
     transcripts/<stamp>.jsonl       (one sentence per line as JSON)
     transcripts/<stamp>.<src>.srt   (subtitles, source language)
     transcripts/<stamp>.<tgt>.srt   (subtitles, translated)
-    recordings/<stamp>.wav          (mixed mic+system audio, 16 kHz mono)
+    recordings/<stamp>.wav          (mixed mic+system, post-denoise, 48 kHz mono)
 ```
 
 The `.srt` files use cue times relative to the start of the matching

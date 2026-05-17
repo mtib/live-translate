@@ -56,9 +56,19 @@ ScreenCaptureKit) without touching `Pipeline`.
   `MixedAudioSource` before the single SFSpeechRecognizer sees them.
   Apple Speech serializes recognition tasks per-app, so two concurrent
   recognizers can't coexist; mixing into one stream is the workaround.
-  Both audio sources standardize on 16 kHz mono Float32 (SFSpeech's
-  native format) so the mixed stream is format-consistent and the per-
-  sample sum is meaningful.
+  Both audio sources standardize on **48 kHz mono Float32** (RNNoise's
+  native rate) so the mixed stream is format-consistent and the per-
+  sample sum is meaningful. SFSpeech consumes 48 kHz fine; the AudioFile
+  WAV writer downcasts to 16-bit Int on the write path.
+- **RNNoise on the merged stream.** A vendored copy of xiph/rnnoise
+  v0.1.1 (BSD 3-clause, GRU weights embedded in `rnn_data.c`, ~400 KB
+  static, zero runtime dependencies) runs inside `MixedAudioSource`
+  right after the sample sum, before the broadcaster emits. That means
+  the recognizer, the JSONL archive, and the `.wav` recorder all see
+  the **post-denoise** signal. RNNoise wants ±32768-scaled Float32 in
+  480-sample frames at 48 kHz — the wrapper (`RNNoiseProcessor`) buffers
+  arbitrary input sizes and converts to/from our ±1 normalised range.
+  Algorithmic latency: 10 ms.
 - **Transcribers emit sentence snapshots, not raw text.** A `SessionSnapshot`
   carries `[SessionSentence]` already split. The Pipeline reconciles each
   snapshot against its own array by position — this handles "new sentence
@@ -108,10 +118,10 @@ ScreenCaptureKit) without touching `Pipeline`.
   `transcription` / `translation` always present; `translation` may be
   empty if the translator hadn't gotten to it yet.
 
-  The `.wav` is 16 kHz mono signed-16-bit linear PCM (AVAudioFile auto-
-  converts our Float32 buffers on the write path). One sample = exactly
-  what the recognizer heard, so audio and transcript line up. Paths
-  are centralised in `Paths.swift`.
+  The `.wav` is 48 kHz mono signed-16-bit linear PCM (AVAudioFile auto-
+  converts our Float32 buffers on the write path). Recording is taken
+  **after** RNNoise, so one sample = exactly what the recognizer heard
+  — audio and transcript line up. Paths are centralised in `Paths.swift`.
 
 ### Files
 
@@ -122,9 +132,11 @@ ScreenCaptureKit) without touching `Pipeline`.
 | `Pipeline.swift` | `@MainActor ObservableObject` orchestrator. Owns the published `sentences` array. Runs **one** recognition cycle on a `MixedAudioSource` that sample-sums mic + system. Translation + prune workers run alongside. Persists user settings via UserDefaults. |
 | `BufferBroadcaster.swift` | Helper that fans audio buffers out to any number of subscribed `AsyncStream`s — used by all three `AudioSource` implementations to avoid duplicating the broadcaster pattern. |
 | `Types.swift` | `SourceLocale`, `TargetLanguage`, `Sentence`, `PipelineStatus`, `SessionSentence` / `SessionSnapshot`. Protocols: `AudioSource`, `Transcriber`, `Translator`. |
-| `MicrophoneSource.swift` | `AVAudioEngine` mic capture. Converts to 16 kHz mono Float32 so output matches `SystemAudioSource` (required by `MixedAudioSource`). Broadcaster pattern. |
-| `SystemAudioSource.swift` | `ScreenCaptureKit`-based system audio capture. Converts `CMSampleBuffer` → 16 kHz mono Float32 `AVAudioPCMBuffer`. |
-| `MixedAudioSource.swift` | Combines two `AudioSource`s by **sample-summing** at mic's cadence. Mic clocks the output; system samples are pulled from a small queue and added per-sample. Keeps audio-time : wall-time at 1:1 so the recognizer doesn't lag. |
+| `MicrophoneSource.swift` | `AVAudioEngine` mic capture. Converts to 48 kHz mono Float32 so output matches `SystemAudioSource` (required by `MixedAudioSource`). Broadcaster pattern. |
+| `SystemAudioSource.swift` | `ScreenCaptureKit`-based system audio capture. Converts `CMSampleBuffer` → 48 kHz mono Float32 `AVAudioPCMBuffer`. |
+| `MixedAudioSource.swift` | Combines two `AudioSource`s by **sample-summing** at mic's cadence (Accelerate `vDSP_vadd`), then runs the summed buffer through `RNNoiseProcessor` before broadcasting. Mic clocks the output; system samples come from a small queue. 1:1 audio-time:wall-time. |
+| `RNNoiseProcessor.swift` | Swift wrapper around the vendored RNNoise C library. Owns the `DenoiseState`, buffers arbitrary-sized input into 480-sample frames, handles ±32768 ↔ ±1 scaling, emits denoised samples via `drain(into:count:)`. |
+| `CRNNoise/` | Vendored xiph/rnnoise v0.1.1 as a SwiftPM C target. BSD 3-clause; GRU weights statically linked. See `Sources/CRNNoise/README.md`. |
 | `AppleSpeechTranscriber.swift` | Apple `Speech` framework. Owns the sentence splitter (`splitIntoSentences`). |
 | `AppleTranslator.swift` | Holds a `TranslationSession` that the View injects via `Pipeline.installTranslationSession(_:)`. |
 | `TranscriptArchive.swift` | One-per-run JSONL archive. Takes its file URL; doesn't know about layout. |
@@ -231,7 +243,8 @@ tccutil reset ScreenCapture local.mtib.livetranslate
 ## Roadmap (rough)
 
 - [ ] Per-app audio capture (instead of whole-machine) via SCK's filter
-- [ ] whisper.cpp backend as an alternative `Transcriber` impl
+- [x] RNNoise denoising on the merged stream (vendored, BSD 3-clause)
+- [ ] whisper.cpp backend as an alternative `Transcriber` impl (in progress on `whisper-cpp` branch)
 - [ ] OpenRouter fallback as an alternative `Translator` impl
 - [ ] Global hotkey to start/stop
 - [ ] Click-through floating overlay mode
