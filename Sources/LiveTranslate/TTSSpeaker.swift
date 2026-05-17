@@ -52,10 +52,7 @@ final class TTSSpeaker: @unchecked Sendable {
     }
 
     /// 1.0 = AVSpeechUtteranceDefaultSpeechRate (~175 wpm).
-    /// 1.3 is noticeably faster while staying clearly intelligible
-    /// for a translated-audio use case — listeners don't need to
-    /// parse every word carefully, so a brisk pace reduces lag.
-    static let speechRate: Float = AVSpeechUtteranceDefaultSpeechRate * 1.3
+    static let speechRate: Float = AVSpeechUtteranceDefaultSpeechRate * 1.05
 
     private let voice: AVSpeechSynthesisVoice
     private let onPCM: (Data) -> Void
