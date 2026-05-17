@@ -34,7 +34,7 @@ cp Info.plist "${APP_DIR}/Contents/Info.plist"
 # overrides (drop a larger model file there if you want).
 # Filename is matched against `WhisperCppTranscriber.bundledModelName`
 # at runtime — they must agree.
-MODEL_NAME="${WHISPER_MODEL:-ggml-small-q5_1.bin}"
+MODEL_NAME="${WHISPER_MODEL:-ggml-large-v3-turbo-q5_0.bin}"
 cp "build/whisper-models/${MODEL_NAME}" "${APP_DIR}/Contents/Resources/${MODEL_NAME}"
 
 # Generate the app icon (idempotent — re-renders from the same SF Symbol

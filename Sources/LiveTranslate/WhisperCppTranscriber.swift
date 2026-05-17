@@ -226,8 +226,10 @@ final class WhisperCppTranscriber: Transcriber {
 
     /// Name of the bundled GGML model (without `.bin`). Has to match
     /// the file `build.sh` copies into `Contents/Resources/` and the
-    /// `MODEL_NAME` default in `tools/build-whisper.sh`.
-    private static let bundledModelName = "ggml-small-q5_1"
+    /// `MODEL_NAME` default in `tools/build-whisper.sh`. Large-v3-turbo
+    /// is the distilled large variant — large quality, medium-class
+    /// speed, the practical sweet spot for live transcription.
+    private static let bundledModelName = "ggml-large-v3-turbo-q5_0"
 
     // MARK: - Transcribe (continuous chunk loop)
     //
