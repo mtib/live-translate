@@ -21,7 +21,7 @@ final class AudioRecorder {
     init(at url: URL) throws {
         let settings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatLinearPCM),
-            AVSampleRateKey: 16_000,
+            AVSampleRateKey: 48_000,
             AVNumberOfChannelsKey: 1,
             AVLinearPCMBitDepthKey: 16,
             AVLinearPCMIsFloatKey: false,

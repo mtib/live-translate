@@ -8,9 +8,13 @@ final class MicrophoneSource: AudioSource {
     private let engine = AVAudioEngine()
     private var tapInstalled = false
 
+    /// 48 kHz mono Float32. The whole pipeline now operates at 48 kHz
+    /// because RNNoise expects that rate natively (see RNNoiseProcessor).
+    /// SFSpeech accepts 48 kHz mono perfectly fine and downsamples
+    /// internally.
     private let targetFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32,
-        sampleRate: 16_000,
+        sampleRate: 48_000,
         channels: 1,
         interleaved: false
     )!

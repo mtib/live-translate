@@ -73,9 +73,12 @@ final class AppleSpeechTranscriber: Transcriber {
             // see CLAUDE.md lesson 15a). Net effect: a real-world pause
             // produces a clean sentence break within ~1 s.
             let pump = Task {
-                let sampleRate: Float = 16_000
-                let silenceFramesForBreak = Int(sampleRate * Float(Self.endSessionAfterSilence))
-                let warmupFrames = Int(sampleRate * Float(Self.sessionWarmup))
+                // Sample rate is derived from each incoming buffer (rather
+                // than hard-coded) so a pipeline-wide format change
+                // doesn't silently break the silence-detection thresholds.
+                var sampleRate: Float = 48_000
+                var silenceFramesForBreak = Int(sampleRate * Float(Self.endSessionAfterSilence))
+                var warmupFrames = Int(sampleRate * Float(Self.sessionWarmup))
                 var totalFrames = 0
                 var consecutiveSilentFrames = 0
                 var hadVoice = false
@@ -85,9 +88,17 @@ final class AppleSpeechTranscriber: Transcriber {
                     let n = Int(buf.frameLength)
                     totalFrames += n
 
-                    // RMS of this buffer. AVAudioPCMBuffer is 16 kHz mono
-                    // Float32 by the time we get here (both audio sources
-                    // normalise to that format).
+                    // Re-derive sample-based thresholds from the first
+                    // buffer's actual format.
+                    let bufRate = Float(buf.format.sampleRate)
+                    if bufRate > 0 && bufRate != sampleRate {
+                        sampleRate = bufRate
+                        silenceFramesForBreak = Int(sampleRate * Float(Self.endSessionAfterSilence))
+                        warmupFrames = Int(sampleRate * Float(Self.sessionWarmup))
+                    }
+
+                    // RMS of this buffer. Both audio sources normalise to
+                    // mono Float32 by the time we get here.
                     guard let data = buf.floatChannelData?[0] else { continue }
                     var ms: Float = 0
                     vDSP_measqv(data, 1, &ms, vDSP_Length(n))
