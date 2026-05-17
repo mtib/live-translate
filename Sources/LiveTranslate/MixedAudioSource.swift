@@ -73,19 +73,24 @@ final class MixedAudioSource: AudioSource {
     /// Target RMS level (linear Float32, ≈ -26 dBFS — comfortable speech).
     private let agcTargetRMS: Float = 0.05
 
-    /// EMA mix weight per buffer. At ~47 buffers/sec, α = 0.05 ≈ a
-    /// ~400 ms-ish smoothing — fast enough to feel responsive without
-    /// audible pumping.
-    private let agcAlpha: Float = 0.05
+    /// EMA mix weight per buffer. Slow — about a 1-second time constant
+    /// at ~50 buffers/sec — so the gain doesn't chase short loud bursts
+    /// or short silences. Keeps pumping inaudible.
+    private let agcAlpha: Float = 0.03
 
-    /// Clamps on the gain so we don't amplify silence into hiss or crush
-    /// a sudden peak. 0.25× to 4× covers ±12 dB either way.
-    private let agcMinGain: Float = 0.25
-    private let agcMaxGain: Float = 4.0
+    /// Clamp the per-source gain to a *modest* range. Wider clamps
+    /// (the first version of this code used ±12 dB) amplified noise
+    /// floor far enough to confuse the recognizer. ±6 dB is plenty
+    /// to balance two sources whose levels are in the same ballpark
+    /// and stops cold any attempt to "lift" silence into hiss.
+    private let agcMinGain: Float = 0.5    // -6 dB
+    private let agcMaxGain: Float = 2.0    // +6 dB
 
-    /// Below this RMS we treat the source as silence and don't apply
-    /// gain at all (would just amplify noise floor).
-    private let agcSilenceRMS: Float = 0.0008
+    /// Below this RMS we don't update the EMA — i.e. background noise
+    /// can't drag the running estimate down to the floor and trick the
+    /// next loud sample into being amplified. Roughly typical mic
+    /// noise-floor + headroom; speech sits well above this.
+    private let agcSilenceRMS: Float = 0.005
 
     /// Running RMS estimate per source. Initialized to the target so the
     /// first few buffers don't get a wild boost.
