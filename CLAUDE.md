@@ -32,6 +32,20 @@ clone of [transcrybe.app](https://transcrybe.app).
 > interactions live at the boundaries. Skimming or grepping for one
 > symbol misses the patterns. Read everything first, *then* edit.
 
+> **Always build with the signing identity**
+>
+> The user keeps `export LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev`
+> in `~/.zshrc` so their interactive shell sessions sign with a stable
+> self-signed cert (keeps TCC grants across rebuilds). Non-interactive
+> `bash` invocations — including the agent's Bash tool — DO NOT source
+> `.zshrc`, so without the variable set explicitly every build the
+> agent triggers is ad-hoc-signed and re-prompts for mic + screen
+> recording. Always prefix builds the agent runs with the env var:
+>
+> ```sh
+> LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev ./build.sh
+> ```
+
 ## How it's built
 
 - **No `.xcodeproj`.** Pure SwiftPM plus a CMake-driven build step for
