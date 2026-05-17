@@ -2,12 +2,18 @@ import SwiftUI
 import Translation
 
 /// Main UI surface. Two layouts:
-///   - Full mode (`!compactMode`): a single-row control bar with primary
-///     action, source / target language pickers, translate toggle, and
-///     status indicator — followed by the rolling sentence list.
-///   - Compact mode: a slim bar (play/stop + language pair + status dot)
-///     with the sentence list right below. Designed to float as a small
-///     hover overlay over other content.
+///   - Full mode (`!compactMode`): one-row control bar (Start/Stop,
+///     source / target language pickers, compact toggle) followed by
+///     the rolling sentence list.
+///   - Compact mode: a slim bar (play/stop + language pair + expand)
+///     with the sentence list directly below. Designed to float as
+///     a small hover overlay over other content.
+///
+/// The sentence list shows completed `Sentence` rows followed by any
+/// `InflightChunk` rows currently in flight (listening / transcribing /
+/// translating). When a chunk graduates, its inflight row is replaced
+/// by the matching sentence with the same UUID, so SwiftUI animates
+/// the transition smoothly.
 ///
 /// The view persists its compact-mode preference via `@AppStorage`. All
 /// other settings live in `Pipeline` (which persists them via UserDefaults).
@@ -24,12 +30,11 @@ struct TranscriptView: View {
 
     var body: some View {
         ZStack {
-            // Translucent flat color (no blur). Use the system's
-            // text-background color (white in light mode, near-black
-            // in dark mode) — same theming as `windowBackgroundColor`
-            // but with materially more contrast against the primary
-            // text. 0.8 opacity keeps the floating overlay translucent
-            // over content behind it.
+            // Translucent flat color (no blur). Theme-aware via
+            // `NSColor.textBackgroundColor` (white in light, near-black
+            // in dark) — more contrast against the primary text than
+            // `windowBackgroundColor` would give. 0.7 opacity keeps
+            // the overlay see-through over content behind it.
             Color(nsColor: .textBackgroundColor)
                 .opacity(0.7)
                 .ignoresSafeArea()
@@ -75,9 +80,9 @@ struct TranscriptView: View {
 
     // MARK: - Bars
 
-    /// Compact bar: primary action, language pair label, per-source
-    /// activity icons, expand. Designed to fit a ~280px-wide floating
-    /// overlay — icons share the same component as the full bar.
+    /// Compact bar: primary action, language pair label, expand.
+    /// In-flight activity is shown in the sentence list itself (one
+    /// row per active chunk), so the bar stays minimal.
     private var compactBar: some View {
         HStack(spacing: 6) {
             primaryButton(compact: true)
@@ -85,66 +90,29 @@ struct TranscriptView: View {
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
             Spacer(minLength: 4)
-            activityIndicators
             iconButton("chevron.down", help: "Show controls") {
                 compactMode = false
             }
         }
     }
 
-    /// Full bar: one clean horizontal row.
-    /// Primary on the left, language pair in the middle, per-source
-    /// activity icons + compact-mode toggle on the right. The
-    /// Start/Stop button is the only "is the pipeline running?" cue —
-    /// no separate status dot.
+    /// Full bar: primary action, source/target pickers, compact toggle.
+    /// In-flight chunk state is visible in the sentence list rows;
+    /// the Start/Stop button color is the only "is the pipeline
+    /// running?" cue.
     private var fullBar: some View {
         HStack(spacing: 10) {
             primaryButton(compact: false)
-
             sourcePicker
             Image(systemName: "arrow.right")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
             targetPicker
-
             Spacer(minLength: 6)
-
-            activityIndicators
             iconButton("chevron.up", help: "Compact view") {
                 compactMode = true
             }
         }
-    }
-
-    /// Per-source busy state: a mic icon when a chunk is currently
-    /// being captured (voiced) and a "pen on paper" icon when whisper
-    /// is running on a chunk. Each tinted with the source's color
-    /// (mic = warm, system = cool). Up to four icons can be visible
-    /// when both streams are simultaneously capturing + transcribing.
-    private var activityIndicators: some View {
-        HStack(spacing: 3) {
-            indicatorIcon("mic.fill", source: .mic, active: pipeline.capturingVoice[.mic] ?? false, help: "Capturing mic chunk")
-            indicatorIcon("doc.text.fill", source: .mic, active: pipeline.transcribingChunk[.mic] ?? false, help: "Transcribing mic chunk")
-            indicatorIcon("mic.fill", source: .system, active: pipeline.capturingVoice[.system] ?? false, help: "Capturing system chunk")
-            indicatorIcon("doc.text.fill", source: .system, active: pipeline.transcribingChunk[.system] ?? false, help: "Transcribing system chunk")
-        }
-    }
-
-    /// One activity icon — full-saturation source tint when `active`,
-    /// standard secondary text color when idle (theme-aware, so the
-    /// off state reads correctly in both light and dark mode). The
-    /// persistent visible state preserves row layout when activities
-    /// toggle.
-    private func indicatorIcon(_ systemName: String, source: SourceTag, active: Bool, help: String) -> some View {
-        let tint: Color = source == .mic ? .red : .blue
-        let style: AnyShapeStyle = active
-            ? AnyShapeStyle(tint)
-            : AnyShapeStyle(.secondary)
-        return Image(systemName: systemName)
-            .font(.system(size: 11, weight: .medium))
-            .foregroundStyle(style)
-            .frame(width: 14, height: 14)
-            .help(help)
     }
 
     /// Inline banner shown only on `.stopped(reason:)`. Suppressed for
@@ -225,80 +193,119 @@ struct TranscriptView: View {
 
     // MARK: - Sentence list
 
-    /// Auto-scrolling list of sentences. The newest is at the bottom and
-    /// gets full opacity; older ones fade to 0.8.
+    /// Auto-scrolling list. Completed sentences first, then in-flight
+    /// chunks at the bottom (each showing its current state with the
+    /// source icon prefix). Rows fade/slide in with `.transition` and
+    /// the list animates on changes so additions / state flips /
+    /// removals all look smooth instead of popping.
     private func sentenceList(compact: Bool) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: compact ? 6 : 8) {
-                    ForEach(Array(pipeline.sentences.enumerated()), id: \.element.id) { idx, sentence in
-                        SentenceRow(
-                            sentence: sentence,
-                            isMostRecent: idx == pipeline.sentences.count - 1,
-                            compact: compact
-                        )
-                        .id(sentence.id)
+                    ForEach(pipeline.sentences) { sentence in
+                        SentenceRow(sentence: sentence, compact: compact)
+                            .id(sentence.id)
+                            .transition(.opacity.combined(with: .move(edge: .bottom)))
+                    }
+                    ForEach(pipeline.inflightChunks) { chunk in
+                        InflightRow(chunk: chunk, compact: compact)
+                            .id(chunk.id)
+                            .transition(.opacity.combined(with: .move(edge: .bottom)))
                     }
                     Color.clear.frame(height: 1).id("BOTTOM")
                 }
                 .padding(.vertical, 2)
+                .animation(.easeInOut(duration: 0.18), value: pipeline.sentences.map(\.id))
+                .animation(.easeInOut(duration: 0.18), value: pipeline.inflightChunks)
             }
             .frame(minHeight: compact ? 50 : 140)
-            // No scrollbar — the list is short by design (capped at
-            // maxSentenceCount) and the indicator just adds visual noise.
-            // The window scrolls anyway when content overflows; we just
-            // don't show the thumb.
             .scrollIndicators(.hidden)
             .onChange(of: pipeline.sentences.last?.id) { _, _ in
                 withAnimation(.easeOut(duration: 0.12)) {
                     proxy.scrollTo("BOTTOM", anchor: .bottom)
                 }
             }
-            .onChange(of: pipeline.sentences.last?.text) { _, _ in
-                proxy.scrollTo("BOTTOM", anchor: .bottom)
-            }
-            .onChange(of: pipeline.sentences.last?.translation) { _, _ in
-                proxy.scrollTo("BOTTOM", anchor: .bottom)
+            .onChange(of: pipeline.inflightChunks.last?.id) { _, _ in
+                withAnimation(.easeOut(duration: 0.12)) {
+                    proxy.scrollTo("BOTTOM", anchor: .bottom)
+                }
             }
         }
     }
 }
 
-/// One sentence row: translation as the primary line, source text as a
-/// caption underneath. Most-recent sentence is full opacity; older rows
-/// fade to 0.8. In compact mode the source caption is hidden for older
-/// rows to keep the overlay slim.
+/// One completed-sentence row. Source icon (mic/speaker) on the left
+/// keeps the layout aligned with in-flight rows; translation is the
+/// primary line; source-text caption sits beneath it in full mode.
+/// No tints — everything uses standard text colors.
 private struct SentenceRow: View {
     let sentence: Sentence
-    let isMostRecent: Bool
     let compact: Bool
 
     var body: some View {
-        let opacity: Double = isMostRecent ? 1.0 : 0.8
-        // Subtle source tint via `colorMultiply`: shifts text slightly
-        // toward red (mic) or blue (system). ~85% on the off axes — a
-        // gentle warm / cool cast, much subtler than v2's .65 (which
-        // made the translated lines feel dim). The translation stays
-        // bright because it's `.primary` × this near-white multiplier.
-        let tintMultiplier: Color = sentence.source == .mic
-            ? Color(red: 1.0, green: 0.85, blue: 0.85)
-            : Color(red: 0.85, green: 0.90, blue: 1.0)
-
-        VStack(alignment: .leading, spacing: 1) {
-            Text(sentence.translation.isEmpty ? sentence.text : sentence.translation)
-                .font(compact ? .callout : .body)
-                .foregroundStyle(.primary.opacity(opacity))
-                .colorMultiply(tintMultiplier)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
-            if !compact, !sentence.translation.isEmpty {
-                Text(sentence.text)
-                    .font(.caption)
-                    .foregroundStyle(.secondary.opacity(opacity * 0.85))
-                    .colorMultiply(tintMultiplier)
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: sentence.source.iconSystemName)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 14, alignment: .center)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(sentence.translation.isEmpty ? sentence.text : sentence.translation)
+                    .font(compact ? .callout : .body)
+                    .foregroundStyle(.primary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
+                if !compact, !sentence.translation.isEmpty {
+                    Text(sentence.text)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
             }
+        }
+    }
+}
+
+/// In-flight chunk row — reserves UI space the moment a chunk's voice
+/// is detected. Icon on the left is the source (mic or speaker, same
+/// as `SentenceRow` so the layout stays stable through graduation).
+/// The body is an italic state word ("listening", "transcribing",
+/// "translating") and — once whisper has returned text — the
+/// transcription itself, ready for the translation to land.
+private struct InflightRow: View {
+    let chunk: InflightChunk
+    let compact: Bool
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: chunk.source.iconSystemName)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 14, alignment: .center)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(stateLabel)
+                    .font(compact ? .callout : .body)
+                    .italic()
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                // Once whisper has returned text, show it in the
+                // caption slot while the italic primary line shifts
+                // to "translating" — same layout as a graduated row.
+                if !compact, case .translating(let text) = chunk.state {
+                    Text(text)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+    }
+
+    private var stateLabel: String {
+        switch chunk.state {
+        case .listening: return "listening"
+        case .transcribing: return "transcribing"
+        case .translating: return "translating"
         }
     }
 }

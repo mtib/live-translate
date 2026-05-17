@@ -20,6 +20,21 @@ struct LiveTranslateApp: App {
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentMinSize)
         .defaultSize(width: 520, height: 480)
+        .commands {
+            // Native macOS menu-bar entries. The Debug menu is small
+            // but exists so screenshots can be captured in a known UI
+            // state without recording real audio.
+            CommandMenu("Debug") {
+                Button("Load fixture sentences") {
+                    pipeline.loadDebugFixtures()
+                }
+                .keyboardShortcut("d", modifiers: [.command, .shift])
+                Button("Clear sentences") {
+                    pipeline.clear()
+                }
+                .keyboardShortcut("k", modifiers: [.command, .shift])
+            }
+        }
     }
 
     /// Registers (once) for `NSApplication.willTerminateNotification` so

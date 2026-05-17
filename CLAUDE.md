@@ -54,49 +54,71 @@ clone of [transcrybe.app](https://transcrybe.app).
 ## Architecture
 
 ```
-  Mic ──▶ Denoise ──▶ SourcePipeline(mic) ─┐
-                       ├─ AudioRecorder    ─┤
-                       ├─ Transcriber      ─┤── Sentence ──┐
-                       └─ SRT writers      ─┘               │
-                                                            ├─▶ @Published sentences: [Sentence]
-  System ─▶ Denoise ─▶ SourcePipeline(sys) ─┐               │      │      ▲
-                       ├─ AudioRecorder    ─┤── Sentence ──┘      ▼      │ writes translation back
-                       ├─ Transcriber      ─┤                  Translator (per-sentence, cached)
-                       └─ SRT writers      ─┘
-                                                            ┌──▶ TranscriptArchive (.jsonl, source-tagged)
-                                                            │       (on drop)
-                                                            └──▶ per-source SRT (.srt, source-tagged)
+  Mic ──▶ Denoise ──▶ SourcePipeline(mic) ──┐
+                       (recorder, SRTs)      │   chunk lifecycle
+                                             ├──▶ Pipeline.applyLifecycle
+  System ─▶ Denoise ─▶ SourcePipeline(sys) ──┤        │
+                       (recorder, SRTs)      │        ▼
+                                             │   @Published inflightChunks
+                                             │        │  on .completed
+                                             │        ▼
+                                             │   Translator (async, cached)
+                                             │        │  on result
+                                             │        ▼
+                                             └──▶ @Published sentences
+                                                      │  on prune/drop
+                                                      ▼
+                                                  TranscriptArchive (.jsonl,
+                                                  source-tagged) +
+                                                  per-source SubtitleArchives
 ```
 
-Each stream stays **independent end-to-end** — mic and system never
-mix. They share the whisper context (`NSLock` around `whisper_full`)
-and the translation worker, but otherwise have their own audio
-broadcasters, denoiser state, recorders, and SRT files.
+Both streams share one `WhisperCppTranscriber` (with `NSLock` around
+`whisper_full`). The UI sees in-flight chunks as reserved rows that
+flip through `.listening → .transcribing → .translating`, then
+graduate to a `Sentence` with the **same UUID** — so SwiftUI row
+identity stays stable across the lifecycle.
 
 ### Key design decisions
 
 - **Per-stream pipelines, never mixed.** Mic and system are captured
-  in parallel, each runs through its own `RNNoise` (via
-  `DenoisingAudioSource`), then a `SourcePipeline` ferries the
-  per-source data: a `WhisperCppTranscriber.transcribe(...,source:)`
-  call, an `AudioRecorder` writing `<stamp>.<source>.wav`, and per
-  `(source, language)` SRT writers. Each `SourcePipeline` emits
-  finished `Sentence`s via an `AsyncStream` that `Pipeline` consumes
-  and merges into the shared UI array.
+  in parallel; each goes through its own `RNNoise` (via
+  `DenoisingAudioSource`), an `AudioRecorder` writing
+  `<stamp>.<source>.wav`, and a `WhisperCppTranscriber.transcribe(audio:locale:source:)`
+  call. Per-`(source, language)` SRT writers archive sentences as they
+  drop. The transcribers share one whisper context (model + ctx are
+  loaded once under an `NSLock`); `whisper_full` calls serialize via
+  another `NSLock` so the two streams take turns without contention.
+- **Inflight-chunk UI model.** Every chunk reserves a UI row at voice
+  onset (state `.listening`). The state then progresses through
+  `.transcribing` and (if translation is needed) `.translating` as the
+  pipeline advances. On translation completion the chunk graduates to
+  a `Sentence` with the **same UUID** as the inflight row, so SwiftUI
+  animates a smooth content swap in place rather than removing one row
+  and adding another. Chunks whisper rejects (no voice / under 1 s / 0
+  segments) fire `.dropped` and the row collapses out.
+- **Lifecycle callback over snapshot stream.** `WhisperCppTranscriber`
+  emits `onChunkLifecycle(chunkID, source, .listening | .transcribing
+  | .completed(text) | .dropped)` from background tasks. Pipeline
+  hops to MainActor in `handleChunkLifecycle` and runs the state
+  machine in `applyLifecycle`. The legacy `transcribe()` AsyncStream
+  return value (a stream of `SessionSnapshot`) is drained but
+  ignored — the lifecycle callback is the single source of truth.
+  This is what lets translation (per-chunk, async) fit cleanly into
+  the same state machine.
 - **Audio format invariant.** Both sources standardize on **48 kHz
   mono Float32** (RNNoise's native rate). The transcriber downsamples
   to 16 kHz internally for whisper; each `.wav` writer downcasts to
   16-bit Int on the
   write path.
-- **RNNoise on the merged stream.** A vendored copy of xiph/rnnoise
-  v0.1.1 (BSD 3-clause, GRU weights embedded in `rnn_data.c`, ~400 KB
-  static, zero runtime dependencies) runs inside `MixedAudioSource`
-  right after the sample sum, before the broadcaster emits. That means
-  the recognizer, the JSONL archive, and the `.wav` recorder all see
-  the **post-denoise** signal. RNNoise wants ±32768-scaled Float32 in
-  480-sample frames at 48 kHz — the wrapper (`RNNoiseProcessor`) buffers
-  arbitrary input sizes and converts to/from our ±1 normalised range.
-  Algorithmic latency: 10 ms.
+- **RNNoise per stream.** A vendored copy of xiph/rnnoise v0.1.1
+  (BSD 3-clause, GRU weights embedded in `rnn_data.c`, ~400 KB
+  static, zero runtime dependencies) runs inside `DenoisingAudioSource`
+  — one instance per upstream (mic, system). Each wraps the raw
+  source's broadcaster and re-emits denoised buffers. RNNoise wants
+  ±32768-scaled Float32 in 480-sample frames at 48 kHz — the wrapper
+  (`RNNoiseProcessor`) buffers arbitrary input sizes and handles the
+  scale conversion. Algorithmic latency: 10 ms.
 - **whisper.cpp is the transcriber.** `WhisperCppTranscriber`
   downsamples the 48 kHz post-RNNoise stream to 16 kHz, runs an
   RMS-based VAD to segment into chunks (silence threshold
@@ -118,15 +140,22 @@ broadcasters, denoiser state, recorders, and SRT files.
   transcriber owns chunk boundaries (via RMS) and the joining of
   whisper's internal segments. Pipeline never edits a `Sentence`
   in place; ingest just appends.
+- **Translation is per-chunk, inline.** When `.completed(text)` fires
+  in `applyLifecycle`, Pipeline either graduates immediately (src ==
+  tgt language, or cache hit) or sets the inflight row to
+  `.translating(text)` and dispatches a `Task { @MainActor in
+  translator.translate(text) }`. Explicit `@MainActor` on the task is
+  load-bearing — without it, Swift 5's actor-inheritance heuristics
+  let the post-await `graduate` run off-actor on some paths, and
+  `@Published` mutations from the wrong actor don't surface in the UI.
 - **Translation cache.** `Pipeline.translationCache: [String: String]`
-  keyed by source text. Identical strings across sessions reuse the
+  keyed by source text. Identical strings during a run reuse the
   cached translation. LRU-ish eviction at 200 entries.
 - **Pruning.** Non-protected sentences whose `lastModified` is older
-  than **60 s** get dropped once per second. Hard cap at **8** retained.
-  "Protected" means: the most-recent sentence overall. `lastModified`
-  is purely an in-memory freshness signal (the translation worker
-  bumps it when the translation lands) and never written to disk —
-  the JSONL `end` field comes from `endsAt` (audio-end time).
+  than 5 minutes get dropped once per second. Hard cap at **50**
+  retained — generous so the user can scroll back through history.
+  "Protected" means just the most-recent sentence (so the UI is never
+  briefly empty mid-stream).
 - **Per-run output files.** Each Start opens up to four paired files
   under one app-private root, sharing a `YYYY-MM-DD_HH-MM-SS` timestamp:
 

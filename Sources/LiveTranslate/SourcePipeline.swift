@@ -2,23 +2,15 @@ import Foundation
 import AVFoundation
 
 /// Self-contained pipeline for one input stream (mic OR system).
-/// Owns its audio source, denoiser (via `DenoisingAudioSource`),
-/// recorder, and per-source SRT writers. Runs its own recognition
-/// loop, emitting completed `Sentence`s as an `AsyncStream` that the
-/// main `Pipeline` consumes and merges into the shared UI state.
+/// Owns its audio source, recorder, and per-source SRT writers; runs
+/// recording + recognition until the audio source stops. Final
+/// sentence delivery is **not** via this class — `WhisperCppTranscriber`
+/// emits chunk lifecycle events directly to `Pipeline`, which builds
+/// `Sentence`s and writes the JSONL.
 ///
-/// **What it does NOT own:** the shared whisper context (provided by
-/// the `Transcriber`), the shared JSONL archive (sentences from all
-/// sources interleave there), the translator, the translation loop,
-/// the prune loop, the sentences UI array. Those are orchestrator
-/// concerns — this class is purely the per-stream audio → text → file
-/// pipeline.
-///
-/// **Why two of these instead of one mixer:** previously we summed
-/// mic + system into a single stream before transcribing, losing
-/// source attribution. With independent denoisers each can adapt to
-/// its own noise profile, and per-source files line up exactly with
-/// what each microphone heard.
+/// This class exists so the per-stream side-effects (WAV writes, SRT
+/// writes, source-tagged log lines) are encapsulated and out of
+/// `Pipeline`'s body.
 final class SourcePipeline {
     let source: SourceTag
     let runStartedAt: Date
@@ -29,12 +21,6 @@ final class SourcePipeline {
     private let recorder: AudioRecorder?
     private let sourceSubs: SubtitleArchive?
     private let targetSubs: SubtitleArchive?
-
-    /// Outgoing sentence stream. One `Sentence` per closed chunk.
-    /// Finishes when both the recognition and recording loops exit
-    /// (after the audio source's broadcaster closes).
-    let sentences: AsyncStream<Sentence>
-    private let sentencesContinuation: AsyncStream<Sentence>.Continuation
 
     init(
         source: SourceTag,
@@ -54,42 +40,36 @@ final class SourcePipeline {
         self.recorder = recorder
         self.sourceSubs = sourceSubs
         self.targetSubs = targetSubs
-
-        let (stream, continuation) = AsyncStream<Sentence>.makeStream()
-        self.sentences = stream
-        self.sentencesContinuation = continuation
     }
 
-    /// Run recognition + recording until the audio source stops. Both
-    /// loops consume `audioSource.buffers`; they exit naturally when
-    /// the broadcaster closes its continuations (driven by
-    /// `audioSource.stop()` on Pipeline.stop()).
+    /// Run recording + recognition concurrently until the audio source
+    /// stops. Both loops consume `audioSource.buffers`; they exit
+    /// naturally when the broadcaster closes its continuations (driven
+    /// by `audioSource.stop()` on Pipeline.stop()).
     func run() async {
         Log.line("SourcePipeline[\(source.rawValue)]: run started")
         async let rec: Void = runRecordingLoop()
         async let trans: Void = runRecognitionCycle()
         _ = await (rec, trans)
-        sentencesContinuation.finish()
-        Log.line("SourcePipeline[\(source.rawValue)]: run finished, sentences stream closed")
+        Log.line("SourcePipeline[\(source.rawValue)]: run finished")
     }
 
-    /// Stop the audio source. Triggers the broadcaster to close, which
-    /// drains the loops naturally.
+    /// Stop the audio source. Closes the broadcaster, which drains the
+    /// loops naturally.
     func stop() async {
         await audioSource.stop()
     }
 
-    /// Block until queued disk writes have hit disk for this stream's
-    /// recorder and SRT files. Idempotent.
+    /// Block until queued disk writes hit disk. Idempotent.
     func flush() {
         recorder?.flush()
         sourceSubs?.flush()
         targetSubs?.flush()
     }
 
-    /// Append a sentence to the per-source SRT files. Called by the
-    /// orchestrator when the sentence is being dropped (pruned or
-    /// flushed). The shared JSONL is handled by the orchestrator.
+    /// Append a sentence to this stream's SRT files. Called by
+    /// `Pipeline.archiveDrop` when a sentence is being pruned/flushed.
+    /// The shared JSONL is handled by the orchestrator.
     func archiveSRT(_ sentence: Sentence) {
         precondition(sentence.source == source,
                      "SourcePipeline[\(source.rawValue)] got a sentence tagged \(sentence.source.rawValue)")
@@ -103,57 +83,34 @@ final class SourcePipeline {
 
     // MARK: - Loops
 
-    /// Subscribe to the audio source as a parallel consumer of its
-    /// broadcaster and forward every PCM buffer to the recorder. Exits
-    /// when the broadcaster closes (Pipeline.stop → audioSource.stop).
+    /// Parallel consumer of the audio broadcaster — forwards every PCM
+    /// buffer to the recorder. Exits when the broadcaster closes
+    /// (`Pipeline.stop` → `audioSource.stop`).
     private func runRecordingLoop() async {
         guard recorder != nil else { return }
-        Log.line("SourcePipeline[\(source.rawValue)]: recording loop started")
         for await buf in audioSource.buffers {
             recorder?.append(buf)
         }
-        Log.line("SourcePipeline[\(source.rawValue)]: recording loop exited")
     }
 
     /// Drive one continuous transcribe() call until the audio stream
-    /// ends. Each emitted `SessionSentence` becomes a `Sentence` and
-    /// is published to our `sentences` stream.
+    /// ends. The returned `SessionSnapshot`s are not currently used —
+    /// Pipeline owns sentence delivery via the transcriber's
+    /// per-chunk lifecycle callback. The for-await still has to drain
+    /// the stream so the AsyncThrowingStream completes cleanly.
     private func runRecognitionCycle() async {
         let audio = audioSource.buffers
         do {
-            for try await snapshot in transcriber.transcribe(
+            for try await _ in transcriber.transcribe(
                 audio: audio, locale: locale, source: source
             ) {
                 if Task.isCancelled { break }
-                ingest(snapshot)
             }
         } catch is CancellationError {
             // Audio path is graceful-drain-driven; cancellation isn't
-            // expected here, but bail cleanly if it does arrive.
+            // expected here.
         } catch {
             Log.line("SourcePipeline[\(source.rawValue)]: transcribe error: \(error.localizedDescription)")
-        }
-    }
-
-    /// Translate the transcriber's snapshot into `Sentence`s and push
-    /// them onto our outgoing stream. The orchestrator owns merging
-    /// into the visible array.
-    private func ingest(_ snapshot: SessionSnapshot) {
-        let now = Date()
-        for ss in snapshot.sentences {
-            let trimmed = ss.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            let startedAt = ss.startSeconds.map { runStartedAt.addingTimeInterval($0) } ?? now
-            let endedAt = ss.endSeconds.map { runStartedAt.addingTimeInterval($0) } ?? now
-            sentencesContinuation.yield(Sentence(
-                id: UUID(),
-                text: trimmed,
-                translation: "",
-                source: source,
-                createdAt: startedAt,
-                endsAt: max(startedAt, endedAt),
-                lastModified: now
-            ))
         }
     }
 }

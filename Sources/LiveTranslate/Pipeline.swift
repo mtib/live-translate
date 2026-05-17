@@ -5,32 +5,29 @@ import Translation
 
 // MARK: - Pipeline overview
 //
-//   ┌──────────┐
-//   │  Mic     │──┐
-//   └──────────┘  │   (one source picked per run, based on toggles)
-//                 ├─▶ AudioSource ──buffers──▶ Transcriber ──SessionSnapshot──▶ Pipeline
-//   ┌──────────┐  │
-//   │  System  │──┘
-//   └──────────┘
-//                                                  │
-//                                                  ▼
-//                                          @Published sentences: [Sentence]
-//                                                  │       ▲
-//                                                  ▼       │  writes translation back
-//                                          Translator (per-sentence, cached,
-//                                            only when stable or final)
-//                                                  │
-//                                                  └─▶ TranscriptArchive (.jsonl)
-//                                                        when a sentence is dropped
+//   Mic ──▶ Denoise ──▶ SourcePipeline(mic) ──┐
+//                       (recorder, SRTs)       │   chunk lifecycle
+//                                              ├──▶ Pipeline.applyLifecycle
+//   System ─▶ Denoise ─▶ SourcePipeline(sys) ──┤        │
+//                       (recorder, SRTs)       │        ▼
+//                                              │   @Published inflightChunks
+//                                              │        │  on .completed
+//                                              │        ▼
+//                                              │   Translator (async, cached)
+//                                              │        │  on result
+//                                              │        ▼
+//                                              └──▶ @Published sentences
+//                                                       │  on prune/drop
+//                                                       ▼
+//                                                   TranscriptArchive (.jsonl,
+//                                                   source-tagged) + per-source
+//                                                   SubtitleArchives
 //
-// Why is there only ONE recognition cycle, even with two sources enabled?
-//   Apple Speech serializes recognition tasks per-app. Two concurrent
-//   recognizers (even one on-device, one server-side) preempt each other
-//   on every restart — both fast-fail with "No speech detected" until one
-//   gives up. Workaround: when both sources are enabled we wrap them in
-//   `MixedAudioSource`, which merges their buffer streams into one. A
-//   single recognizer sees the interleaved audio and we lose source
-//   attribution as a trade-off.
+// Both streams share one `WhisperCppTranscriber` (and its `whisper_full`
+// invocations serialize via NSLock). The UI sees in-flight chunks as
+// reserved rows that flip through .listening → .transcribing →
+// .translating and graduate to a `Sentence` with the same UUID — so the
+// SwiftUI row identity stays stable across the lifecycle.
 
 @MainActor
 final class Pipeline: ObservableObject {
@@ -40,26 +37,13 @@ final class Pipeline: ObservableObject {
     @Published private(set) var status: PipelineStatus = .idle
     @Published private(set) var sentences: [Sentence] = []
 
-    /// Per-source "currently accumulating voiced audio into a chunk"
-    /// signal — drives the mic icon in the UI top bar. Set by the
-    /// transcriber's accumulator on voice onset; cleared on chunk
-    /// close or audio-stream end.
-    @Published private(set) var capturingVoice: [SourceTag: Bool] = [:]
-
-    /// Per-source "whisper is currently running on a chunk from this
-    /// stream" signal — drives the transcribing icon. Set by the
-    /// worker when entering `whisper_full`; cleared on return.
-    @Published private(set) var transcribingChunk: [SourceTag: Bool] = [:]
-
-    /// Called from `WhisperCppTranscriber` callbacks (background
-    /// tasks) to update the UI's busy state. Hops to MainActor to
-    /// publish so the `@Published` write is safe.
-    nonisolated func updateActivity(source: SourceTag, capturing: Bool? = nil, transcribing: Bool? = nil) {
-        Task { @MainActor in
-            if let capturing { self.capturingVoice[source] = capturing }
-            if let transcribing { self.transcribingChunk[source] = transcribing }
-        }
-    }
+    /// Chunks that have been detected but haven't graduated to a final
+    /// `Sentence` yet — reserved UI rows that show the live state of
+    /// the pipeline (listening / transcribing / translating). When a
+    /// chunk graduates, we append to `sentences` and remove from this
+    /// list, both keyed by the same UUID so the row identity stays
+    /// stable through the transition.
+    @Published private(set) var inflightChunks: [InflightChunk] = []
 
     /// True from when `run()` enters until its cleanup completes.
     /// Drives the UI Start/Stop button.
@@ -86,15 +70,15 @@ final class Pipeline: ObservableObject {
         }
     }
 
-    /// Non-protected sentence older than this is pruned. Generous — old
-    /// sentences are dimmed in the UI but still readable, so we'd rather
-    /// keep them around for re-reading than aggressively churn.
-    var maxAgeSeconds: TimeInterval = 60
+    /// Non-protected sentence older than this is pruned. Tuned for
+    /// "rows can scroll off the top before they disappear" — five
+    /// minutes is enough for several screen-heights of history at
+    /// normal conversational pace.
+    var maxAgeSeconds: TimeInterval = 300
 
-    /// Hard cap on retained sentences. Higher than feels tight on purpose:
-    /// older sentences are pruned by age anyway; this cap only kicks in
-    /// during very fast speech.
-    var maxSentenceCount: Int = 8
+    /// Hard cap on retained sentences. Generous so the scrollback
+    /// stays useful; pruning by age handles long sessions.
+    var maxSentenceCount: Int = 50
 
     // MARK: - Available choices
 
@@ -139,9 +123,10 @@ final class Pipeline: ObservableObject {
     /// Shared JSONL archive — sentences from all sources interleave
     /// here, distinguished by the `source` field.
     private var archive: TranscriptArchive?
-    /// One per-stream pipeline per `SourceTag`. Each owns its denoiser,
-    /// recorder, SRT writers, and emits Sentences via an AsyncStream.
-    /// Held here so `stop()` can signal each one to drain.
+    /// One per-stream pipeline per `SourceTag`. Each owns its recorder
+    /// and SRT writers. Held here so `stop()` can signal each one to
+    /// drain its audio source, and so `archiveDrop` can route SRT
+    /// writes to the right per-source file.
     private var sourcePipelines: [SourceTag: SourcePipeline] = [:]
 
     /// Set by a settings-change observer; read by run()'s defer. When
@@ -188,14 +173,125 @@ final class Pipeline: ObservableObject {
         self.target = Self.load(TargetLanguage.self, forKey: K.target,
                                 defaultValue: TargetLanguage(code: "en", name: "English"))
 
-        // Wire the transcriber's per-source activity callback to the
-        // published dicts. WhisperCppTranscriber calls this from
-        // background tasks; `updateActivity` hops to MainActor.
+        // Wire the transcriber's per-chunk lifecycle callback. The
+        // accumulator + worker invoke it from background tasks;
+        // `handleChunkLifecycle` hops to MainActor and runs the state
+        // machine (inflight bookkeeping + graduation to Sentence +
+        // translation dispatch).
         if let w = whisperTranscriber as? WhisperCppTranscriber {
-            w.onActivity = { [weak self] source, capturing, transcribing in
-                self?.updateActivity(source: source, capturing: capturing, transcribing: transcribing)
+            w.onChunkLifecycle = { [weak self] id, source, event in
+                self?.handleChunkLifecycle(id: id, source: source, event: event)
             }
         }
+    }
+
+    // MARK: - Chunk lifecycle handler
+
+    /// Receives lifecycle events from `WhisperCppTranscriber` (called
+    /// from off-MainActor tasks). All state mutation happens inside
+    /// the `Task { @MainActor in ... }` so SwiftUI sees a single
+    /// coherent change per event.
+    nonisolated private func handleChunkLifecycle(
+        id: UUID, source: SourceTag, event: WhisperCppTranscriber.ChunkLifecycle
+    ) {
+        Task { @MainActor in
+            self.applyLifecycle(id: id, source: source, event: event)
+        }
+    }
+
+    /// MainActor-isolated state-machine for one chunk's lifecycle.
+    /// Maintains `inflightChunks` and graduates completed chunks
+    /// (plus their translation, if any) to `sentences`.
+    private func applyLifecycle(
+        id: UUID, source: SourceTag, event: WhisperCppTranscriber.ChunkLifecycle
+    ) {
+        switch event {
+        case .listening:
+            // Reserve a row at voice onset. UI shows "listening".
+            inflightChunks.append(InflightChunk(
+                id: id, source: source, startedAt: Date(), state: .listening
+            ))
+
+        case .transcribing:
+            // Chunk closed, whisper running. UI flips to "transcribing".
+            if let idx = inflightChunks.firstIndex(where: { $0.id == id }) {
+                inflightChunks[idx].state = .transcribing
+            }
+
+        case .completed(let text, let startSeconds, let endSeconds):
+            // Whisper produced text. Either graduate immediately (no
+            // translation needed / cached) or flip to "translating"
+            // and dispatch the translator.
+            let createdAt = startSeconds.map { runStartedAt.addingTimeInterval($0) } ?? Date()
+            let endedAt = endSeconds.map { runStartedAt.addingTimeInterval($0) } ?? createdAt
+            let srcLang = String(self.source.identifier.prefix(2))
+            let tgtLang = self.target.code
+            Log.line("lifecycle[\(source.rawValue)]: completed id=\(id.uuidString.prefix(8)) \"\(text.prefix(40))\" → \(srcLang)→\(tgtLang)")
+
+            if srcLang == tgtLang {
+                graduate(id: id, source: source, text: text, translation: text,
+                         createdAt: createdAt, endsAt: endedAt)
+                return
+            }
+            if let cached = translationCache[text] {
+                Log.line("lifecycle[\(source.rawValue)]: cached translation hit for id=\(id.uuidString.prefix(8))")
+                graduate(id: id, source: source, text: text, translation: cached,
+                         createdAt: createdAt, endsAt: endedAt)
+                return
+            }
+            // Need to translate. Mark "translating" and dispatch.
+            if let idx = inflightChunks.firstIndex(where: { $0.id == id }) {
+                inflightChunks[idx].state = .translating(text: text)
+                Log.line("lifecycle[\(source.rawValue)]: state → translating, dispatching translator (id=\(id.uuidString.prefix(8)))")
+            }
+            // Explicit `@MainActor` on the Task closure so isolation
+            // doesn't depend on Swift 5 inheritance heuristics. The
+            // translator is @MainActor too; avoiding actor hops mid-
+            // task is what makes the post-await `graduate` reliably
+            // mutate `@Published` state on the right actor.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    let translated = try await self.translator.translate(text)
+                    Log.line("lifecycle[\(source.rawValue)]: translator returned for id=\(id.uuidString.prefix(8)): \"\(translated.prefix(40))\"")
+                    self.cacheTranslation(source: text, translated: translated)
+                    self.graduate(id: id, source: source, text: text, translation: translated,
+                                  createdAt: createdAt, endsAt: endedAt)
+                } catch {
+                    Log.line("lifecycle[\(source.rawValue)]: translator error for id=\(id.uuidString.prefix(8)): \(error.localizedDescription)")
+                    // Graduate with empty translation so the user still
+                    // sees the transcription text — they can re-run for
+                    // a retry.
+                    self.graduate(id: id, source: source, text: text, translation: "",
+                                  createdAt: createdAt, endsAt: endedAt)
+                }
+            }
+
+        case .dropped:
+            // Chunk filtered out by the worker (no voice, too short,
+            // empty whisper output). No sentence to graduate; just
+            // drop the inflight row.
+            inflightChunks.removeAll { $0.id == id }
+        }
+    }
+
+    /// Turn an inflight chunk into a `Sentence`. The Sentence gets a
+    /// **fresh** UUID — reusing the chunk's UUID would collide with
+    /// the inflight row's `.id()` in SwiftUI's LazyVStack and break
+    /// the row swap (the View can't morph between two different
+    /// concrete View types under one identity). Distinct UUIDs let
+    /// SwiftUI run a clean remove-then-insert transition.
+    private func graduate(
+        id: UUID, source: SourceTag, text: String, translation: String,
+        createdAt: Date, endsAt: Date
+    ) {
+        let sentence = Sentence(
+            id: UUID(), text: text, translation: translation, source: source,
+            createdAt: createdAt, endsAt: endsAt, lastModified: Date()
+        )
+        sentences.append(sentence)
+        inflightChunks.removeAll { $0.id == id }
+        enforceMaxCount()
     }
 
     // MARK: - Public controls
@@ -232,6 +328,34 @@ final class Pipeline: ObservableObject {
 
     func clear() {
         sentences = []
+        inflightChunks = []
+    }
+
+    /// Load a canned set of mic/system sentences into the UI for
+    /// screenshots and visual-regression checks. Triggered from the
+    /// macOS menu bar (`Debug → Load fixture sentences`). Doesn't
+    /// touch the audio pipeline; appends directly to `sentences`.
+    func loadDebugFixtures() {
+        let now = Date()
+        // (source, transcription, translation)
+        let fixtures: [(SourceTag, String, String)] = [
+            (.mic, "Ich spreche diesen Text auf Deutsch",
+             "I'm speaking this text in German"),
+            (.mic, "Alles, was ich sage oder was der PC ausgibt, wird live ins Englische übersetzt",
+             "Everything I say or what the PC outputs is translated live into English"),
+            (.system, "Hallo, dies ist ein test audio playback",
+             "Hello, this is a test audio playback"),
+            (.mic, "Der Text wird auch in eine Datei geschrieben, die ich später auslesen kann",
+             "The text is also written in a file that I can read later"),
+        ]
+        for (i, (source, text, translation)) in fixtures.enumerated() {
+            let created = now.addingTimeInterval(Double(i) * 2)
+            sentences.append(Sentence(
+                id: UUID(), text: text, translation: translation, source: source,
+                createdAt: created, endsAt: created.addingTimeInterval(1.5),
+                lastModified: created
+            ))
+        }
     }
 
     /// The View calls this from `.translationTask` to hand us a fresh
@@ -255,6 +379,9 @@ final class Pipeline: ObservableObject {
     private func run() async {
         isActive = true
         defer {
+            // Flush still-visible sentences and any in-flight chunk
+            // that we have transcribed text for, so clean Stop persists
+            // everything the user could see at the moment they pressed it.
             for s in sentences { archiveDrop(s) }
             archive?.flush()
             for sp in sourcePipelines.values { sp.flush() }
@@ -263,6 +390,7 @@ final class Pipeline: ObservableObject {
             isActive = false
             archive = nil
             sourcePipelines.removeAll()
+            inflightChunks.removeAll()
             if restartRequested {
                 restartRequested = false
                 sentences = []
@@ -270,16 +398,15 @@ final class Pipeline: ObservableObject {
             }
         }
 
-        // 1. Permissions.
+        // 1. Mic permission. (SCK prompts on its own when capture starts.)
         status = .requestingPermissions
         let micGranted: Bool = await withCheckedContinuation { c in
             AVCaptureDevice.requestAccess(for: .audio) { c.resume(returning: $0) }
         }
         guard micGranted else { status = .stopped(reason: "Microphone permission denied"); return }
 
-        // 2. Build per-stream `DenoisingAudioSource`s and start them in
-        //    parallel. Each upstream goes through its own RNNoise; no
-        //    mixing happens.
+        // 2. Per-stream `DenoisingAudioSource`s. Started in parallel —
+        //    mic and SCK startups are independent.
         let micDenoised = DenoisingAudioSource(micSource, label: "mic")
         let systemDenoised = DenoisingAudioSource(systemSource, label: "system")
         let denoised: [SourceTag: AudioSource] = [.mic: micDenoised, .system: systemDenoised]
@@ -332,23 +459,20 @@ final class Pipeline: ObservableObject {
 
         status = .running
 
-        // 5. Background workers (translation + prune): cancellable
-        //    separately from the audio path.
+        // 5. Background prune loop (the translation worker is gone —
+        //    translation happens inline in the lifecycle handler).
+        //    Cancellable separately from the audio path.
         let backgroundTask = Task {
-            await withTaskGroup(of: Void.self) { group in
-                group.addTask { await self.runTranslationLoop() }
-                group.addTask { await self.runPruneLoop() }
-            }
+            await self.runPruneLoop()
         }
 
-        // 6. Run each SourcePipeline + a sentence-consumer that merges
-        //    its emissions into the shared UI. All exit naturally when
-        //    each pipeline's audio source stops.
+        // 6. Run each SourcePipeline. They emit chunk lifecycle events
+        //    via the WhisperCppTranscriber callback; UI state is
+        //    managed in `applyLifecycle` (graduation, translation).
         Log.line("Pipeline: entering audio-path TaskGroup with \(sourcePipelines.count) pipelines")
         await withTaskGroup(of: Void.self) { group in
-            for (_, sp) in sourcePipelines {
+            for sp in sourcePipelines.values {
                 group.addTask { await sp.run() }
-                group.addTask { await self.consumeSentences(from: sp) }
             }
         }
         Log.line("All source pipelines drained")
@@ -361,79 +485,7 @@ final class Pipeline: ObservableObject {
         for sp in sourcePipelines.values { await sp.stop() }
     }
 
-    /// Consume one SourcePipeline's outgoing `Sentence` stream and
-    /// append each to the shared visible list. Exits when the source
-    /// pipeline finishes its stream.
-    private func consumeSentences(from sp: SourcePipeline) async {
-        Log.line("Pipeline: sentence consumer for \(sp.source.rawValue) started")
-        var count = 0
-        for await sentence in sp.sentences {
-            count += 1
-            Log.line("Pipeline: consumer[\(sp.source.rawValue)] got sentence #\(count): \"\(sentence.text.prefix(50))\"")
-            self.sentences.append(sentence)
-            enforceMaxCount()
-        }
-        Log.line("Pipeline: sentence consumer for \(sp.source.rawValue) exited (total \(count))")
-    }
-
-    /// One recognition cycle, restarting sessions as they end. Bails after
-    /// 6 consecutive fast-fails (typically the language model isn't installed,
-    /// or no audio is reaching the recognizer).
-    // MARK: - Translation worker
-
-    /// Translation worker. Each sentence's source text is immutable
-    /// (whisper emits finals only), so each row needs exactly one
-    /// translation pass. We walk newest-first so the freshest line on
-    /// screen gets its translation first — older lines lag without
-    /// blocking the live row.
-    private func runTranslationLoop() async {
-        Log.line("Translation loop started")
-        while !Task.isCancelled {
-            while !Task.isCancelled, let item = nextTranslationCandidate() {
-                if let cached = translationCache[item.text] {
-                    applyTranslation(cached, to: item.id, originalSource: item.text)
-                    continue
-                }
-                do {
-                    let translated = try await translator.translate(item.text)
-                    cacheTranslation(source: item.text, translated: translated)
-                    applyTranslation(translated, to: item.id, originalSource: item.text)
-                } catch TranslateError.noSession {
-                    break  // session not yet handed to us — wait it out
-                } catch {
-                    Log.line("Translation error: \(error.localizedDescription)")
-                    break  // back off briefly rather than spinning on the error
-                }
-            }
-            try? await Task.sleep(nanoseconds: 150_000_000)
-        }
-        Log.line("Translation loop exited")
-    }
-
-    /// Newest untranslated sentence, or nil if everything is done.
-    private func nextTranslationCandidate() -> (id: UUID, text: String)? {
-        for s in sentences.reversed() {
-            if !s.text.isEmpty && s.translation.isEmpty {
-                return (s.id, s.text)
-            }
-        }
-        return nil
-    }
-
-    /// Apply a translation result to the sentence with `id`. Guards
-    /// against a sentence that was pruned between dispatch and result
-    /// landing. `originalSource` defends against rare ID reuse — only
-    /// applies if the sentence still has the same source text we
-    /// translated. Bumps `lastModified` (a prune-freshness signal),
-    /// but never touches `createdAt` / `endsAt` — those are anchored
-    /// to the actual audio span and must not drift.
-    private func applyTranslation(_ translated: String, to id: UUID, originalSource: String) {
-        guard let idx = sentences.firstIndex(where: { $0.id == id }),
-              sentences[idx].text == originalSource
-        else { return }
-        sentences[idx].translation = translated
-        sentences[idx].lastModified = Date()
-    }
+    // MARK: - Translation cache
 
     private func cacheTranslation(source: String, translated: String) {
         translationCache[source] = translated
@@ -455,21 +507,21 @@ final class Pipeline: ObservableObject {
         }
     }
 
-    /// We never drop the most-recent sentence. There's no separate
-    /// "live" concept anymore — every sentence is final the moment it
-    /// arrives, so age + cap is the only signal for eviction, with the
-    /// newest entry held back so the UI is never empty mid-stream.
+    /// We never drop the most-recent sentence so the UI is never empty
+    /// mid-stream. Returned as a `Set<UUID>` so callers can use it as
+    /// a quick membership check inside a loop.
     private func protectedIDs() -> Set<UUID> {
         guard let id = sentences.last?.id else { return [] }
         return [id]
     }
 
     private func prune() {
+        let protected = protectedIDs()
         let cutoff = Date().addingTimeInterval(-maxAgeSeconds)
         var i = sentences.count - 1
         while i >= 0 {
             let s = sentences[i]
-            if !protectedIDs().contains(s.id) && s.lastModified < cutoff {
+            if !protected.contains(s.id) && s.lastModified < cutoff {
                 dropSentence(at: i)
             }
             i -= 1

@@ -44,6 +44,39 @@ enum SourceTag: String, Codable, Hashable, Sendable, CaseIterable {
         case .system: return "Sys"
         }
     }
+
+    /// SF Symbol name for the per-row prefix icon — mic for the
+    /// physical mic, speaker for system audio.
+    var iconSystemName: String {
+        switch self {
+        case .mic: return "mic.fill"
+        case .system: return "speaker.wave.2.fill"
+        }
+    }
+}
+
+/// A chunk that is being processed but hasn't graduated to a final
+/// `Sentence` yet. Reserves its eventual row in the UI as soon as
+/// voice is detected so the layout stays stable through the
+/// listening → transcribing → translating → done lifecycle.
+///
+/// `id` is generated at voice onset and remains stable through the
+/// whole pipeline. When the chunk graduates (translation done, or
+/// translation not needed), `Pipeline` builds a `Sentence` with a
+/// *fresh* UUID and removes this entry — SwiftUI sees that as one
+/// row being replaced by another in the same list position, which
+/// animates smoothly.
+struct InflightChunk: Identifiable, Equatable {
+    let id: UUID
+    let source: SourceTag
+    let startedAt: Date
+    var state: State
+
+    enum State: Equatable {
+        case listening      // accumulator has voice onset, chunk not yet closed
+        case transcribing   // chunk closed, whisper running
+        case translating(text: String)  // whisper done, translator running
+    }
 }
 
 /// One sentence as the active recognition session currently sees it. The

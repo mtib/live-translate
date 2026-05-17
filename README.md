@@ -8,9 +8,9 @@ target language of your choice — all in one rolling, hover-able window.
 Built with SwiftPM and a CMake-driven dependency on
 [whisper.cpp](https://github.com/ggerganov/whisper.cpp) — no Xcode project required.
 
-![Stopped](docs/stopped.png)
+![Default layout](docs/default.png)
 
-![Running](docs/while_running.png)
+![Compact layout](docs/compact.png)
 
 ## Build & run
 

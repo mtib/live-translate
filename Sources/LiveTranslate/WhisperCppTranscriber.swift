@@ -130,11 +130,23 @@ final class WhisperCppTranscriber: Transcriber {
     /// 1-3 s whisper time, so waits are bounded and small.
     private let whisperLock = NSLock()
 
-    /// UI activity hook — Pipeline installs a closure that updates its
-    /// `capturingVoice` / `transcribingChunk` @Published dicts so the
-    /// view can render per-source mic / pen icons. `Sendable` because
-    /// the accumulator and worker call it from background tasks.
-    var onActivity: (@Sendable (_ source: SourceTag, _ capturing: Bool?, _ transcribing: Bool?) -> Void)?
+    /// UI chunk-lifecycle hook — Pipeline installs a closure that
+    /// tracks each chunk's state transitions for the in-flight-row
+    /// UI. Each chunk gets a UUID generated at voice onset and
+    /// referenced consistently through subsequent events. `Sendable`
+    /// because accumulator + worker call it from background tasks.
+    var onChunkLifecycle: (@Sendable (_ chunkID: UUID, _ source: SourceTag, _ event: ChunkLifecycle) -> Void)?
+
+    /// Lifecycle of one chunk, emitted in order:
+    /// `.listening` → `.transcribing` → (`.completed(text)` | `.dropped`).
+    /// `.dropped` fires when the chunk was filtered out (no voice,
+    /// too short after trim, or whisper produced no segments).
+    enum ChunkLifecycle: Sendable {
+        case listening
+        case transcribing
+        case completed(text: String, startSeconds: Double?, endSeconds: Double?)
+        case dropped
+    }
 
     /// Cross-talk suppression: the system accumulator stamps the
     /// wall-clock time of the last "system is voiced" buffer here, and
@@ -243,14 +255,17 @@ final class WhisperCppTranscriber: Transcriber {
     // an inherited MainActor would serialize accumulator and worker.
 
     /// One closed chunk passed from accumulator → worker.
-    /// `chunkStartSample16k` is the cumulative position of the chunk's
-    /// first sample within the whole audio stream (so we can compute
-    /// audio-stream-relative timestamps for the resulting sentence,
-    /// which line up exactly with positions in the paired `.wav`).
-    /// `voiceStart` / `voiceEnd` are chunk-local 16 kHz indices.
+    /// `chunkID` is generated at voice onset and is the same UUID the
+    /// accumulator passed to `.listening` / `.transcribing` events;
+    /// the worker uses it for `.completed` / `.dropped` so Pipeline
+    /// can match events to the same UI entry through the full
+    /// lifecycle. `chunkStartSample16k` is the cumulative position of
+    /// the chunk's first sample within the audio stream — drives the
+    /// sentence's audio-stream-relative timestamps.
     private struct ChunkBuffer {
+        let chunkID: UUID
         let index: Int
-        let chunkStartSample16k: Int     // cumulative offset at chunk start
+        let chunkStartSample16k: Int
         let samples16k: [Float]
         let voiceStart: Int?              // nil → pure silence, skip whisper
         let voiceEnd: Int
@@ -370,6 +385,11 @@ final class WhisperCppTranscriber: Transcriber {
         var hadVoice = false
         var chunkIndex = 0
         var bufferCount = 0
+        /// UUID for the chunk currently being accumulated. Nil until
+        /// voice onset; set then for the rest of the chunk's lifecycle.
+        /// Pipeline matches lifecycle events back to its in-flight row
+        /// via this ID.
+        var currentChunkID: UUID? = nil
 
         // Audio-stream sample counter: cumulative 16 kHz samples ever
         // appended, across all chunks. The chunk's start offset is this
@@ -445,8 +465,10 @@ final class WhisperCppTranscriber: Transcriber {
                 consecutiveSilentFrames = 0
                 if firstVoiceSample16k == nil {
                     firstVoiceSample16k = bufStart16k
-                    Log.line("accumulator[\(sourceTag)]: voice onset in chunk #\(chunkIndex + 1) at \(String(format: "%.2f", Float(totalFrames) / sampleRate))s (rms=\(String(format: "%.3f", rms)))")
-                    self.onActivity?(source, true, nil)
+                    let id = UUID()
+                    currentChunkID = id
+                    Log.line("accumulator[\(sourceTag)]: voice onset in chunk #\(chunkIndex + 1) (id=\(id.uuidString.prefix(8))) at \(String(format: "%.2f", Float(totalFrames) / sampleRate))s (rms=\(String(format: "%.3f", rms)))")
+                    self.onChunkLifecycle?(id, source, .listening)
                 }
                 lastVoiceSample16k = bufEnd16k
                 voicedSampleCount16k += (bufEnd16k - bufStart16k)
@@ -470,7 +492,17 @@ final class WhisperCppTranscriber: Transcriber {
             if hitMax || silenceClose {
                 chunkIndex += 1
                 let reason = hitMax ? "max-chunk" : "silence"
+                // Voice-onset always precedes a voiced close, so
+                // currentChunkID is set for any chunk we'd actually
+                // care to transcribe. Max-chunk close without voice
+                // (chunk #N was pure silence) doesn't set an ID,
+                // doesn't fire .listening, and the worker just
+                // shorts it out — no UI row was ever reserved.
+                if let id = currentChunkID {
+                    self.onChunkLifecycle?(id, source, .transcribing)
+                }
                 emitChunk(
+                    chunkID: currentChunkID ?? UUID(),
                     index: chunkIndex,
                     reason: reason,
                     sourceTag: sourceTag,
@@ -481,7 +513,6 @@ final class WhisperCppTranscriber: Transcriber {
                     lastVoiceSample16k: lastVoiceSample16k,
                     voicedSampleCount16k: voicedSampleCount16k
                 )
-                self.onActivity?(source, false, nil)
                 samples16k.removeAll(keepingCapacity: true)
                 chunkStartSample16k = samplesEverEmitted16k
                 firstVoiceSample16k = nil
@@ -490,6 +521,7 @@ final class WhisperCppTranscriber: Transcriber {
                 totalFrames = 0
                 consecutiveSilentFrames = 0
                 hadVoice = false
+                currentChunkID = nil
             }
         }
 
@@ -500,7 +532,11 @@ final class WhisperCppTranscriber: Transcriber {
         // minimum if the trailing audio is short.
         if firstVoiceSample16k != nil && !samples16k.isEmpty {
             chunkIndex += 1
+            if let id = currentChunkID {
+                self.onChunkLifecycle?(id, source, .transcribing)
+            }
             emitChunk(
+                chunkID: currentChunkID ?? UUID(),
                 index: chunkIndex,
                 reason: "stream-end-flush",
                 sourceTag: sourceTag,
@@ -517,6 +553,7 @@ final class WhisperCppTranscriber: Transcriber {
 
     /// Yield one closed chunk to the worker queue + log.
     private func emitChunk(
+        chunkID: UUID,
         index: Int,
         reason: String,
         sourceTag: String,
@@ -528,8 +565,9 @@ final class WhisperCppTranscriber: Transcriber {
         voicedSampleCount16k: Int
     ) {
         let chunkEndSample16k = chunkStartSample16k + samples16k.count
-        Log.line("accumulator[\(sourceTag)]: closing chunk #\(index) (\(reason)) — stream=[\(chunkStartSample16k)…\(chunkEndSample16k)] (\(String(format: "%.2f", Double(chunkStartSample16k) / 16_000))s…\(String(format: "%.2f", Double(chunkEndSample16k) / 16_000))s), voiced16k=\(voicedSampleCount16k), hadVoice=\(firstVoiceSample16k != nil)")
+        Log.line("accumulator[\(sourceTag)]: closing chunk #\(index) (id=\(chunkID.uuidString.prefix(8)), \(reason)) — stream=[\(chunkStartSample16k)…\(chunkEndSample16k)] (\(String(format: "%.2f", Double(chunkStartSample16k) / 16_000))s…\(String(format: "%.2f", Double(chunkEndSample16k) / 16_000))s), voiced16k=\(voicedSampleCount16k), hadVoice=\(firstVoiceSample16k != nil)")
         sink.yield(ChunkBuffer(
+            chunkID: chunkID,
             index: index,
             chunkStartSample16k: chunkStartSample16k,
             samples16k: samples16k,
@@ -538,7 +576,6 @@ final class WhisperCppTranscriber: Transcriber {
             voicedSampleCount: voicedSampleCount16k,
             closeReason: reason
         ))
-        Log.line("accumulator[\(sourceTag)]: yielded chunk #\(index) to queue, resuming pump")
     }
 
     /// Voice-trim + skip-empty + run whisper. Returns nil when the chunk
@@ -555,6 +592,9 @@ final class WhisperCppTranscriber: Transcriber {
     ) async throws -> SessionSnapshot? {
         let tag = source.rawValue
         guard let voiceStart = chunk.voiceStart else {
+            // Pure-silence chunk (max-chunk fired with no voice). No
+            // UI row was reserved at voice-onset so there's nothing to
+            // mark dropped here. Just skip whisper.
             Log.line("worker[\(tag)]: chunk #\(chunk.index) had no voice, skipping")
             return nil
         }
@@ -573,6 +613,7 @@ final class WhisperCppTranscriber: Transcriber {
         if chunk.voicedSampleCount < minVoicedSamples
             || trimmed.count < Int(16_000 * Self.minChunkSeconds) {
             Log.line("worker[\(tag)]: chunk #\(chunk.index) too short (voiced=\(chunk.voicedSampleCount), trimmed=\(trimmed.count)), skipping")
+            self.onChunkLifecycle?(chunk.chunkID, source, .dropped)
             return nil
         }
 
@@ -589,11 +630,9 @@ final class WhisperCppTranscriber: Transcriber {
         let prompt = previousChunkTail[source] ?? ""
         let started = Date()
         Log.line("worker[\(tag)]: chunk #\(chunk.index) → whisper_full (samples=\(trimmed.count), prompt=\"\(prompt.prefix(40))\")")
-        self.onActivity?(source, nil, true)
         let segments = try await self.runWhisperLocked(
             ctx: ctx, samples: trimmed, languageCode: languageCode, initialPrompt: prompt
         )
-        self.onActivity?(source, nil, false)
         let elapsed = Date().timeIntervalSince(started)
         Log.line("worker[\(tag)]: chunk #\(chunk.index) ← whisper_full in \(String(format: "%.2f", elapsed))s, segments=\(segments.count)")
 
@@ -606,6 +645,7 @@ final class WhisperCppTranscriber: Transcriber {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !joined.isEmpty else {
             Log.line("worker[\(tag)]: chunk #\(chunk.index) produced no text, skipping")
+            self.onChunkLifecycle?(chunk.chunkID, source, .dropped)
             return nil
         }
         previousChunkTail[source] = String(joined.suffix(Self.maxInitialPromptChars))
@@ -615,6 +655,10 @@ final class WhisperCppTranscriber: Transcriber {
         // 16 kHz sample positions; divide by 16 000 for seconds).
         let startSeconds = Double(chunk.chunkStartSample16k + voiceStart) / 16_000
         let endSeconds = Double(chunk.chunkStartSample16k + chunk.voiceEnd) / 16_000
+
+        self.onChunkLifecycle?(chunk.chunkID, source, .completed(
+            text: joined, startSeconds: startSeconds, endSeconds: endSeconds
+        ))
 
         return SessionSnapshot(sentences: [
             SessionSentence(
