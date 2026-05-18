@@ -1,5 +1,8 @@
 # LiveTranslate
 
+> **Looking for the fixed-language sherpa-onnx variant (de→en)?**
+> → [github.com/mtib/live-translate-de-en-onnx](https://github.com/mtib/live-translate-de-en-onnx)
+
 Floating, translucent macOS 26+ app that captures your **microphone and
 system audio** in parallel, transcribes both on-device via
 [whisper.cpp](https://github.com/ggerganov/whisper.cpp), and translates
