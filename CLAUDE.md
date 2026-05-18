@@ -152,12 +152,12 @@ identity stays stable across the lifecycle.
 - **GGML model: bundled only.** `WhisperCppTranscriber.bundledModelName`
   is the filename (sans `.bin`) of the model loaded at runtime. The
   build script copies `models/<MODEL_NAME>` (or downloads it if not
-  cached) into `Contents/Resources/`. Default is `ggml-small-q5_1`
-  (~190 MB) — ~2× faster than the previous large-v3-turbo at
-  acceptable quality for live use. Swap by editing both
-  `bundledModelName` and `WHISPER_MODEL` (env var consumed by
-  `build.sh` + `tools/build-whisper.sh`). No runtime user-override
-  path; what you built is what you run.
+  cached) into `Contents/Resources/`. Default is
+  `ggml-large-v3-turbo-q5_0` (~570 MB) — distilled large-v3 with 4
+  decoder layers, large-class quality at ~3× realtime on Apple Silicon.
+  Swap by editing both `bundledModelName` and `WHISPER_MODEL` (env var
+  consumed by `build.sh` + `tools/build-whisper.sh`). No runtime
+  user-override path; what you built is what you run.
 - **Auto-gain control.** `DenoisingAudioSource` runs a per-instance
   envelope-follower AGC after RNNoise and before the crosstalk gate:
   measure RMS via `vDSP_measqv`, EMA the input level on voiced
@@ -182,17 +182,20 @@ identity stays stable across the lifecycle.
   cached translation. LRU-ish eviction at 200 entries.
 - **Live translated-audio HTTP stream (optional, opt-in by capability).**
   When the run starts, Pipeline checks `TTSSpeaker.bestVoice(forTargetCode:)`.
-  If a voice is installed for the target and src != tgt language, it
-  spins up `LiveAudioServer` on port 8765 and a `TTSSpeaker` that
-  speaks each graduated sentence's translation into the stream. The
-  UI shows a small share icon (radio-waves SF Symbol) in the bar
-  while this is active; clicking it pops a panel with the URL and a
-  QR code so a phone on the same Wi-Fi can listen. If no voice is
-  installed for that language, the whole feature is skipped silently
-  (icon stays hidden) — we never play wrong-language audio. Wire
-  format: 24 kHz mono PCM16 LE, served as an open-ended WAV
-  (`0xFFFFFFFF` chunk sizes). 200 ms heartbeat broadcasts 50 ms of
-  silence when idle so VLC doesn't tear the socket down.
+  If a Premium voice is installed for the target and src != tgt language,
+  it spins up `LiveAudioServer` on port 8765 and a `TTSSpeaker`. The UI
+  shows a radio-waves share icon; clicking pops the URL + QR code. If no
+  voice is installed the whole feature is skipped (icon hidden). The icon
+  turns **green** while at least one listener is connected to `/live.wav`
+  (`Pipeline.ttsActive`). Synthesis is **gated on listener count** —
+  `TTSSpeaker.enqueue` is only called when `server.audioListenerCount > 0`,
+  so the speaker stays silent when nobody is tuned in.
+  `LiveAudioServer` routes: `/` → dark-mode HTML listen page with an
+  `<audio>` player and a scrolling SSE-fed transcript; `/live.wav` →
+  open-ended WAV stream (24 kHz PCM16 LE, `0xFFFFFFFF` chunk size, 200 ms
+  silence heartbeat); `/events` → SSE transcript stream, one JSONL line
+  per graduated sentence, 200-entry replay buffer for late subscribers,
+  5 s keepalive ping.
 - **Pruning.** Non-protected sentences whose `lastModified` is older
   than 5 minutes get dropped once per second. Hard cap at **50**
   retained — generous so the user can scroll back through history.
@@ -214,7 +217,7 @@ identity stays stable across the lifecycle.
       <stamp>.mic.<tgt>.srt
       <stamp>.system.<src>.srt
       <stamp>.system.<tgt>.srt
-      <stamp>.<lang>.srt                  ← merged SRT per language ([Mic]/[Sys])
+      <stamp>.<lang>.srt                  ← merged SRT per language (plain cue text, no prefix)
       <stamp>.mic.wav                     ← post-denoise + AGC audio
       <stamp>.system.wav
       <stamp>.mkv                         ← 640×360 black + amix audio + SRTs
@@ -267,8 +270,8 @@ identity stays stable across the lifecycle.
 | `SubtitleArchive.swift` | One-per-`(source,language)` SRT writer. Cue times are offsets into the matching `<stamp>.<source>.wav`. |
 | `Paths.swift` | Single source of truth for `~/Documents/LiveTranslate/{transcripts,recordings}/<stamp>.<source>[.<lang>].{wav,srt}` plus the shared `<stamp>.jsonl`. |
 | `Log.swift` | Append-only file logger at `/tmp/livetranslate.log`. Truncates on launch if > 5 MB. |
-| `TTSSpeaker.swift` | Synthesizes finalized translations to 24 kHz PCM16 LE buffers via `AVSpeechSynthesizer.write(_:toBufferCallback:)` (never plays through local speakers). Serial queue — one utterance fully before the next; drops oldest pending past 5. `bestVoice(forTargetCode:)` picks the highest-quality installed voice for the target's primary subtag, or nil. |
-| `LiveAudioServer.swift` | Hand-rolled HTTP/1.1 server on a `NWListener` that streams 24 kHz mono PCM16 LE WAV to any client. Header advertises `0xFFFFFFFF` data size → "read until close" (works in VLC / mpv / iOS Safari / Chrome). 200 ms heartbeat task pushes 50 ms of silence when idle to keep VLC's socket alive. |
+| `TTSSpeaker.swift` | Synthesizes finalized translations to 24 kHz PCM16 LE buffers via `AVSpeechSynthesizer.write(_:toBufferCallback:)` (never plays through local speakers). Serial queue — one utterance fully before the next; drops oldest pending past 5. `bestVoice(forTargetCode:)` picks the highest-quality installed voice for the target's primary subtag, or nil. Only called when `LiveAudioServer.audioListenerCount > 0`. |
+| `LiveAudioServer.swift` | Hand-rolled HTTP/1.1 server on a `NWListener`. Routes: `/` → dark-mode HTML listen page; `/live.wav` → open-ended 24 kHz PCM16 LE WAV stream (200 ms silence heartbeat keeps VLC alive); `/events` → SSE transcript stream with 200-entry replay buffer and 5 s keepalive. Exposes `audioListenerCount` and `onAudioListenerCountChanged` so Pipeline can gate TTS synthesis and drive the `ttsActive` UI indicator. `publishTranscript(jsonLine:)` broadcasts each graduated sentence to SSE subscribers. |
 
 ## Key behaviors / non-obvious bits
 
@@ -382,8 +385,9 @@ per `buffers` access and fan tap callbacks out to all current subscribers.
 - A `TranslationSession` is **only** obtainable via SwiftUI's
   `.translationTask` modifier. There is no public way to create one
   programmatically. We work around this by parking the modifier's closure
-  on `Task.sleep(.max)` and stuffing the session into `AppleTranslator`
-  for the Pipeline to use.
+  on an `AsyncStream<Never>` that's never written to (cancellation from
+  SwiftUI wakes the iterator and unparks). `Task.sleep(nanoseconds: .max)`
+  was the original approach but trips a precondition on macOS 15+.
 - First time a language pair is used, macOS prompts to download translation
   models. The user must accept. The download can be triggered ahead of time
   via **System Settings → Apple Intelligence & Siri → Translation Languages**
@@ -438,17 +442,19 @@ builds reuse the existing grant. See README for the one-time setup.
 ## Tools / SDKs in use
 
 - `AVAudioEngine`, `AVAudioConverter` — mic capture + sample-rate conversion
-- `Accelerate` (`vDSP_vadd`) — SIMD per-sample sum in `MixedAudioSource`
+- `Accelerate` (`vDSP_measqv`, `vDSP_vsmul`) — AGC RMS measurement + gain multiply
 - `ScreenCaptureKit` — system audio capture
-- `Speech` (`SFSpeechRecognizer`, `SFSpeechAudioBufferRecognitionRequest`)
+- `AVSpeechSynthesizer` — on-device TTS synthesis (no local playback)
 - `Translation` (`TranslationSession`, `.translationTask`)
+- `Network` (`NWListener`) — hand-rolled HTTP server for the audio/SSE stream
 - SwiftUI
 
 ## Roadmap (rough)
 
 - [ ] Per-app audio capture (instead of whole-machine) via SCK's filter
-- [x] RNNoise denoising on the merged stream (vendored, BSD 3-clause)
-- [ ] whisper.cpp backend as an alternative `Transcriber` impl (in progress on `whisper-cpp` branch)
+- [x] RNNoise denoising per stream (vendored, BSD 3-clause)
+- [x] whisper.cpp backend (`WhisperCppTranscriber`, current default)
+- [x] Live LAN audio stream with HTML listen page + SSE transcript feed
 - [ ] OpenRouter fallback as an alternative `Translator` impl
 - [ ] Global hotkey to start/stop
 - [ ] Click-through floating overlay mode
