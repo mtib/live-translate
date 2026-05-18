@@ -3,6 +3,8 @@ import SwiftUI
 @main
 struct LiveTranslateApp: App {
     @StateObject private var pipeline = Pipeline()
+    @State private var mainWindow: NSWindow?
+    @State private var isWindowVisible = true
 
     init() {
         Log.startup()  // truncates the log if it's grown past the cap
@@ -19,6 +21,7 @@ struct LiveTranslateApp: App {
             TranscriptView(pipeline: pipeline)
                 .frame(minWidth: 260, minHeight: 80)
                 .background(WindowAccessor { window in
+                    mainWindow = window
                     configure(window)
                 })
                 .onAppear { installTerminateHook(pipeline: pipeline) }
@@ -41,6 +44,19 @@ struct LiveTranslateApp: App {
                 .keyboardShortcut("k", modifiers: [.command, .shift])
             }
         }
+
+        MenuBarExtra {
+            MenuBarView(
+                pipeline: pipeline,
+                isWindowVisible: $isWindowVisible,
+                mainWindow: mainWindow
+            )
+        } label: {
+            Image(systemName: pipeline.isRunning
+                ? "bubble.left.and.text.bubble.right.fill"
+                : "bubble.left.and.text.bubble.right")
+        }
+        .menuBarExtraStyle(.window)
     }
 
     /// Registers (once) for `NSApplication.willTerminateNotification` so
@@ -72,7 +88,7 @@ struct LiveTranslateApp: App {
         window.backgroundColor = .clear
         window.isOpaque = false
         window.hasShadow = true
-        window.level = .floating
+        window.level = .statusBar
         // Extend our content into the title-bar area so the hidden
         // traffic-light strip doesn't leave a dead band of background
         // above the controls. The View ignores the safe area to match.
@@ -86,6 +102,15 @@ struct LiveTranslateApp: App {
         window.standardWindowButton(.closeButton)?.isHidden = true
         window.standardWindowButton(.miniaturizeButton)?.isHidden = true
         window.standardWindowButton(.zoomButton)?.isHidden = true
+
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak window] _ in
+            guard window?.isVisible == true else { return }
+            window?.orderFrontRegardless()
+        }
     }
 }
 

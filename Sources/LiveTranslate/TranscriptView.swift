@@ -293,7 +293,7 @@ struct TranscriptView: View {
 /// keeps the layout aligned with in-flight rows; translation is the
 /// primary line; source-text caption sits beneath it in full mode.
 /// No tints — everything uses standard text colors.
-private struct SentenceRow: View {
+struct SentenceRow: View {
     let sentence: Sentence
     let compact: Bool
 
@@ -327,7 +327,7 @@ private struct SentenceRow: View {
 /// The body is an italic state word ("listening", "transcribing",
 /// "translating") and — once whisper has returned text — the
 /// transcription itself, ready for the translation to land.
-private struct InflightRow: View {
+struct InflightRow: View {
     let chunk: InflightChunk
     let compact: Bool
 
@@ -369,7 +369,7 @@ private struct InflightRow: View {
 /// selectable text (with a copy button) and a QR code generated via
 /// CoreImage's `CIQRCodeGenerator`. The QR is regenerated each time
 /// the URL changes — cheap, no caching needed for a 240×240 image.
-private struct StreamShareView: View {
+struct StreamShareView: View {
     let url: String
 
     var body: some View {
