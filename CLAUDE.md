@@ -1,649 +1,742 @@
 # LiveTranslate — context for Claude
 
-A minimal, no-Xcode macOS app that does on-device speech transcription and
-translation from one or two audio sources at the same time. A learning / DIY
-clone of [transcrybe.app](https://transcrybe.app).
+A minimal, no-Xcode macOS 15+ floating app for on-device speech transcription and
+translation from one or two audio sources simultaneously. A learning / DIY clone of
+[transcrybe.app](https://transcrybe.app).
 
-> **Process rule for future edits**
->
-> Any meaningful change to source layout, data flow, protocols, settings,
-> or runtime behavior **must be reflected in this file in the same commit**.
-> If you change `Sentence`'s shape, the pipeline order, the permissions
-> needed, the build script, or any of the "Things that have bitten us"
-> entries: update CLAUDE.md.
->
-> **Persist learnings.** When a bug bites — a race, an actor-isolation
-> surprise, a confused-by-the-API moment — add a numbered entry to
-> the "Things that have bitten us" section explaining what went wrong
-> AND the shape of the fix. This is the durable institutional memory;
-> without it the same trap will be re-stepped in a later session.
->
-> The reason: this file is the only durable orientation document. Source
-> comments cover *what* a function does; CLAUDE.md covers *why the design
-> is shaped this way* and *what to never do again*. Future sessions read
-> this first.
+---
 
-> **Eagerly load the Swift sources at session start**
->
-> Before changing any code in this project, read **all** of
-> `Sources/LiveTranslate/*.swift` and the relevant bridge headers. The
-> data flow crosses several files (audio source → mixer → denoiser →
-> transcriber → pipeline → translator → archives + UI), and surprising
-> interactions live at the boundaries. Skimming or grepping for one
-> symbol misses the patterns. Read everything first, *then* edit.
+## ┌─ RULE 1: Keep this file accurate ───────────────────────────────────┐
+## │ Update CLAUDE.md in the same commit as any meaningful code change.  │
+## │ What counts as "meaningful": source file layout, data-flow changes, │
+## │ new or changed protocols, settings keys, build pipeline, runtime    │
+## │ behavior, the files table, or any new entry in "Things That Bit Us".│
+## │ This file is the ONLY durable orientation document. It is read by   │
+## │ AI agents at session start; stale content directly misleads them    │
+## │ into making wrong assumptions about the codebase. Source comments   │
+## │ cover *what* a function does; CLAUDE.md covers *why the design is   │
+## │ shaped this way* and *what to never do again*.                      │
+## └──────────────────────────────────────────────────────────────────────┘
 
-> **Always build with the signing identity**
->
-> The user keeps `export LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev`
-> in `~/.zshrc` so their interactive shell sessions sign with a stable
-> self-signed cert (keeps TCC grants across rebuilds). Non-interactive
-> `bash` invocations — including the agent's Bash tool — DO NOT source
-> `.zshrc`, so without the variable set explicitly every build the
-> agent triggers is ad-hoc-signed and re-prompts for mic + screen
-> recording. Always prefix builds the agent runs with the env var:
->
-> ```sh
-> LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev ./build.sh
-> ```
+## ┌─ RULE 2: Persist learnings ──────────────────────────────────────────┐
+## │ Every bug that bites gets a numbered entry in "Things that have     │
+## │ bitten us": what went wrong AND the shape of the fix. This is the  │
+## │ durable institutional memory. Without it the same trap is re-       │
+## │ stepped in a later session. Mark historical entries (for approaches │
+## │ no longer in use) clearly so they are still readable as warnings.   │
+## └──────────────────────────────────────────────────────────────────────┘
+
+## ┌─ RULE 3: Eagerly load Swift sources at session start ────────────────┐
+## │ Before changing any code, read ALL of                               │
+## │   Sources/LiveTranslate/*.swift                                     │
+## │ and the relevant bridge headers. The data flow crosses many files   │
+## │ (audio source → denoiser → transcriber → pipeline → translator →   │
+## │ archives + UI), and surprising interactions live at the boundaries. │
+## │ Skimming or grepping for one symbol misses the patterns.            │
+## └──────────────────────────────────────────────────────────────────────┘
+
+## ┌─ RULE 4: Always build with signing identity ─────────────────────────┐
+## │ Non-interactive bash (the agent's Bash tool) does NOT source        │
+## │ ~/.zshrc, so the env var is NOT set unless you pass it explicitly.  │
+## │ Every build the agent triggers without it is ad-hoc-signed,         │
+## │ producing a fresh cdhash, which causes macOS to re-prompt for mic   │
+## │ and screen-recording permissions on every run. Always prefix with:  │
+## │                                                                     │
+## │   LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev ./build.sh           │
+## └──────────────────────────────────────────────────────────────────────┘
+
+---
 
 ## How it's built
 
 - **No `.xcodeproj`.** Pure SwiftPM plus a CMake-driven build step for
   whisper.cpp. Built with Command Line Tools (`/Library/Developer/CommandLineTools`)
   and Homebrew CMake (`brew install cmake`). No Xcode required.
-- `swift-tools-version: 6.0`, but the executable target is pinned to
-  `.swiftLanguageMode(.v5)` because the Translation APIs are awkward
-  under Swift 6 strict concurrency.
-- `./dev-setup.sh` pre-downloads a curated set of GGML models into
-  the repo-local `models/` directory (gitignored). `build.sh` then
-  prefers that cache; falls back to fetching into
-  `build/whisper-models/`.
-- `./build.sh` first runs `tools/build-whisper.sh` (idempotent — clones
-  whisper.cpp v1.7.4 into `external/`, builds static libraries into
-  `build/whisper-prefix/`, ensures the chosen `WHISPER_MODEL` is in
-  `build/whisper-models/`), then `swift build -c release`, then wraps
-  the binary into `build/LiveTranslate.app/`, copies the chosen GGML
-  model into Resources, and codesigns (ad-hoc by default; set
-  `LIVETRANSLATE_SIGN_IDENTITY` to a self-signed cert name to persist
-  TCC grants across rebuilds).
-- **Always launch via `open build/LiveTranslate.app`** — never run the
-  binary directly. TCC associates permission grants with the bundle,
-  not the executable path; direct exec leads to the system thinking
-  the usage-description keys are missing.
+- `Package.swift` declares `swift-tools-version: 6.0`. The `LiveTranslate`
+  executable target is pinned to `.swiftLanguageMode(.v5)` because the
+  Translation and AVAudioPCMBuffer APIs are awkward under Swift 6 strict
+  concurrency. The two C targets (`CRNNoise`, `CWhisper`) are unaffected.
+- **Three targets** in Package.swift:
+  - `CRNNoise` — vendored xiph/rnnoise v0.1.1 (BSD 3-clause). C sources in
+    `Sources/CRNNoise/`, GRU weights embedded in `rnn_data.c`. Build uses
+    `-Wno-implicit-function-declaration` and `-Wno-null-dereference` for
+    upstream idioms.
+  - `CWhisper` — thin bridge target linking against the static libs produced by
+    `tools/build-whisper.sh`. Headers live in `Sources/CWhisper/include/`
+    (mirrored from `build/whisper-prefix/include/` by the build script on every
+    run). Linker flags: `-lwhisper -lggml -lggml-base -lggml-cpu -lggml-blas
+    -lggml-metal -lc++`, plus `Metal`, `MetalKit`, `Foundation`, `Accelerate`
+    frameworks.
+  - `LiveTranslate` — the app itself, depends on `CRNNoise` and `CWhisper`.
+- **`tools/build-whisper.sh`** (idempotent, called by `build.sh`):
+  - Clones whisper.cpp **v1.7.4** (`--depth 1 --branch v1.7.4`) into
+    `external/whisper.cpp` if not present.
+  - Configures with CMake (`GGML_METAL=ON`, `GGML_METAL_EMBED_LIBRARY=ON`,
+    `GGML_ACCELERATE=ON`, `GGML_NATIVE=OFF` — native off because it broke
+    some Apple-Silicon CI builds). Builds static libs into `build/whisper-prefix/`.
+  - Always mirrors `build/whisper-prefix/include/*.h` into `Sources/CWhisper/include/`
+    (unconditional, outside the idempotency guard — branch switching can wipe
+    that dir while leaving the prefix on disk; re-copying every run is cheap).
+  - Downloads the GGML model into `build/whisper-models/` if not already there.
+    Prefers `models/<MODEL_NAME>` (local cache populated by `dev-setup.sh`).
+    Default model: `ggml-large-v3-turbo-q5_0.bin` from Hugging Face
+    (`ggerganov/whisper.cpp`).
+- **`build.sh`**:
+  1. Runs `tools/build-whisper.sh`.
+  2. `swift build -c release`.
+  3. Assembles `build/LiveTranslate.app/` (MacOS binary + `Info.plist` + GGML
+     model in `Contents/Resources/` + `icon.icns`).
+  4. Codesigns: ad-hoc (`-`) by default; uses `LIVETRANSLATE_SIGN_IDENTITY` if
+     set. Model filename in `Contents/Resources/` must match
+     `WhisperCppTranscriber.bundledModelName` (currently
+     `"ggml-large-v3-turbo-q5_0"`).
+- **`dev-setup.sh`** — pre-downloads a curated set of GGML models into `models/`
+  (gitignored). Running it once avoids repeated downloads when switching model
+  variants.
+- **Always launch via `open build/LiveTranslate.app`** — never run the binary
+  directly. TCC associates permission grants with the bundle, not the executable
+  path; direct exec leads to the system thinking usage-description keys are
+  missing.
 
-## Architecture
+---
+
+## Architecture diagram
 
 ```
-  Mic ──▶ Denoise ──▶ SourcePipeline(mic) ──┐
-                       (recorder, SRTs)      │   chunk lifecycle
-                                             ├──▶ Pipeline.applyLifecycle
-  System ─▶ Denoise ─▶ SourcePipeline(sys) ──┤        │
-                       (recorder, SRTs)      │        ▼
-                                             │   @Published inflightChunks
-                                             │        │  on .completed
-                                             │        ▼
-                                             │   Translator (async, cached)
-                                             │        │  on result
-                                             │        ▼
-                                             └──▶ @Published sentences
-                                                      │  on prune/drop
-                                                      ▼
-                                                  TranscriptArchive (.jsonl,
-                                                  source-tagged) +
-                                                  per-source SubtitleArchives
+  Mic ──────▶ MicrophoneSource ──▶ DenoisingAudioSource(mic)
+                (AVAudioEngine)      (RNNoise + AGC + crosstalk gate)
+                                          │
+                                          ├──▶ AudioRecorder → <stamp>.mic.wav
+                                          │
+                                          └──▶ WhisperCppTranscriber.transcribe()
+                                                    │   accumulator task
+                                                    │   ↓ ChunkBuffer
+                                                    │   worker task → whisper_full()
+                                                    │   ↓ onChunkLifecycle callback
+                                                    │
+  System ──▶ SystemAudioSource ──▶ DenoisingAudioSource(system)
+              (ScreenCaptureKit)     (RNNoise + AGC, no mute gate)
+                                          │
+                                          ├──▶ AudioRecorder → <stamp>.system.wav
+                                          │
+                                          └──▶ WhisperCppTranscriber.transcribe()
+                                                    │   (shares same ctx + NSLock)
+                                                    │   ↓ onChunkLifecycle callback
+                                                    │
+                Both streams ──────────────────────▶ Pipeline.handleChunkLifecycle
+                                                           │ (hops to MainActor)
+                                                           ▼
+                                                   Pipeline.applyLifecycle
+                                                           │
+                                         ┌─────────────────┼──────────────────┐
+                                         ▼                 ▼                  ▼
+                                  .listening         .transcribing       .completed(text)
+                                  (reserve row)      (flip row)          → translate (or cache hit)
+                                                                          → graduate()
+                                                                               │
+                                                    ┌──────────────────────────┤
+                                                    ▼                          ▼
+                                           @Published sentences        TranscriptArchive.append
+                                           (UI rows)                   (JSONL, source-tagged)
+                                                    │
+                                                    ├──▶ MergedSubtitleArchive.add (per lang)
+                                                    │
+                                                    └──▶ LiveAudioServer.publishTranscript (SSE)
+                                                              │
+                                                              ├── / → HTML listen page
+                                                              ├── /live.wav → open WAV stream
+                                                              └── /events → SSE transcript
+                                                                                │
+                                                              TTSSpeaker ──────▶ /live.wav
+                                                              (AVSpeechSynthesizer, no local
+                                                               playback, 24 kHz PCM16 LE)
 ```
 
-Both streams share one `WhisperCppTranscriber` (with `NSLock` around
-`whisper_full`). The UI sees in-flight chunks as reserved rows that
-flip through `.listening → .transcribing → .translating`, then
-graduate to a `Sentence` with the **same UUID** — so SwiftUI row
-identity stays stable across the lifecycle.
+Both streams share **one `WhisperCppTranscriber` instance** (and thus one
+`whisper_context *`). `whisper_full` invocations serialize via `NSLock`. The UI
+sees in-flight chunks as reserved rows that flip through `.listening →
+.transcribing → .translating`, then graduate to a `Sentence` with a **fresh**
+UUID (not the chunk's UUID — reusing it would collide in SwiftUI's `LazyVStack`).
 
-### Key design decisions
+---
 
-- **Per-stream pipelines, never mixed.** Mic and system are captured
-  in parallel; each goes through its own `RNNoise` (via
-  `DenoisingAudioSource`), an `AudioRecorder` writing
-  `<stamp>.<source>.wav`, and a `WhisperCppTranscriber.transcribe(audio:locale:source:)`
-  call. Per-`(source, language)` SRT writers archive sentences as they
-  drop. The transcribers share one whisper context (model + ctx are
-  loaded once under an `NSLock`); `whisper_full` calls serialize via
-  another `NSLock` so the two streams take turns without contention.
-- **Inflight-chunk UI model.** Every chunk reserves a UI row at voice
-  onset (state `.listening`). The state then progresses through
-  `.transcribing` and (if translation is needed) `.translating` as the
-  pipeline advances. On translation completion the chunk graduates to
-  a `Sentence` with the **same UUID** as the inflight row, so SwiftUI
-  animates a smooth content swap in place rather than removing one row
-  and adding another. Chunks whisper rejects (no voice / under 1 s / 0
-  segments) fire `.dropped` and the row collapses out.
-- **Lifecycle callback over snapshot stream.** `WhisperCppTranscriber`
-  emits `onChunkLifecycle(chunkID, source, .listening | .transcribing
-  | .completed(text) | .dropped)` from background tasks. Pipeline
-  hops to MainActor in `handleChunkLifecycle` and runs the state
-  machine in `applyLifecycle`. The legacy `transcribe()` AsyncStream
-  return value (a stream of `SessionSnapshot`) is drained but
-  ignored — the lifecycle callback is the single source of truth.
-  This is what lets translation (per-chunk, async) fit cleanly into
-  the same state machine.
-- **Audio format invariant.** Both sources standardize on **48 kHz
-  mono Float32** (RNNoise's native rate). The transcriber downsamples
-  to 16 kHz internally for whisper; each `.wav` writer downcasts to
-  16-bit Int on the
-  write path.
-- **RNNoise per stream.** A vendored copy of xiph/rnnoise v0.1.1
-  (BSD 3-clause, GRU weights embedded in `rnn_data.c`, ~400 KB
-  static, zero runtime dependencies) runs inside `DenoisingAudioSource`
-  — one instance per upstream (mic, system). Each wraps the raw
-  source's broadcaster and re-emits denoised buffers. RNNoise wants
-  ±32768-scaled Float32 in 480-sample frames at 48 kHz — the wrapper
-  (`RNNoiseProcessor`) buffers arbitrary input sizes and handles the
-  scale conversion. Algorithmic latency: 10 ms.
-- **whisper.cpp is the transcriber.** `WhisperCppTranscriber`
-  downsamples the 48 kHz post-RNNoise stream to 16 kHz, runs an
-  RMS-based VAD to segment into chunks (silence threshold
-  `endChunkAfterSilence` ~0.7 s, hard cap `maxChunkSeconds` 5 s),
-  trims and pads each chunk, then runs `whisper_full()` against the
-  bundled GGML model. Whisper's internal segments are joined into
-  one line per chunk; the chunk's audio-stream sample positions
-  become the sentence's `startSeconds` / `endSeconds`, anchored by
-  Pipeline at `runStartedAt` so JSONL/SRT timestamps map directly to
-  positions in the paired `.wav`.
-- **GGML model: bundled only.** `WhisperCppTranscriber.bundledModelName`
-  is the filename (sans `.bin`) of the model loaded at runtime. The
-  build script copies `models/<MODEL_NAME>` (or downloads it if not
-  cached) into `Contents/Resources/`. Default is
-  `ggml-large-v3-turbo-q5_0` (~570 MB) — distilled large-v3 with 4
-  decoder layers, large-class quality at ~3× realtime on Apple Silicon.
-  Swap by editing both `bundledModelName` and `WHISPER_MODEL` (env var
-  consumed by `build.sh` + `tools/build-whisper.sh`). No runtime
-  user-override path; what you built is what you run.
-- **Auto-gain control.** `DenoisingAudioSource` runs a per-instance
-  envelope-follower AGC after RNNoise and before the crosstalk gate:
-  measure RMS via `vDSP_measqv`, EMA the input level on voiced
-  buffers, target ~0.1 RMS, smooth the applied gain (slow ramp to
-  avoid pumping), multiply via `vDSP_vsmul`. Caps at 8× boost; never
-  attenuates (`agcMinGain=1`). This lets mic and system arrive at
-  comparable loudness without manual tuning.
-- **Transcribers emit one sentence per closed chunk.** The
-  transcriber owns chunk boundaries (via RMS) and the joining of
-  whisper's internal segments. Pipeline never edits a `Sentence`
-  in place; ingest just appends.
-- **Translation is per-chunk, inline.** When `.completed(text)` fires
-  in `applyLifecycle`, Pipeline either graduates immediately (src ==
-  tgt language, or cache hit) or sets the inflight row to
-  `.translating(text)` and dispatches a `Task { @MainActor in
-  translator.translate(text) }`. Explicit `@MainActor` on the task is
-  load-bearing — without it, Swift 5's actor-inheritance heuristics
-  let the post-await `graduate` run off-actor on some paths, and
-  `@Published` mutations from the wrong actor don't surface in the UI.
-- **Translation cache.** `Pipeline.translationCache: [String: String]`
-  keyed by source text. Identical strings during a run reuse the
-  cached translation. LRU-ish eviction at 200 entries.
-- **Live translated-audio HTTP stream (optional, opt-in by capability).**
-  When the run starts, Pipeline checks `TTSSpeaker.bestVoice(forTargetCode:)`.
-  If a Premium voice is installed for the target and src != tgt language,
-  it spins up `LiveAudioServer` on port 8765 and a `TTSSpeaker`. The UI
-  shows a radio-waves share icon; clicking pops the URL + QR code. If no
-  voice is installed the whole feature is skipped (icon hidden). The icon
-  turns **green** while at least one listener is connected to `/live.wav`
-  (`Pipeline.ttsActive`). Synthesis is **gated on listener count** —
-  `TTSSpeaker.enqueue` is only called when `server.audioListenerCount > 0`,
-  so the speaker stays silent when nobody is tuned in.
-  `LiveAudioServer` routes: `/` → dark-mode HTML listen page with an
-  `<audio>` player and a scrolling SSE-fed transcript; `/live.wav` →
-  open-ended WAV stream (24 kHz PCM16 LE, `0xFFFFFFFF` chunk size, 200 ms
-  silence heartbeat); `/events` → SSE transcript stream, one JSONL line
-  per graduated sentence, 200-entry replay buffer for late subscribers,
-  5 s keepalive ping.
-- **Pruning.** Non-protected sentences whose `lastModified` is older
-  than 5 minutes get dropped once per second. Hard cap at **50**
-  retained — generous so the user can scroll back through history.
-  "Protected" means just the most-recent sentence (so the UI is never
-  briefly empty mid-stream).
-- **Per-run output: temp dir then zip.** Each session writes into a
-  fresh temp working directory (`NSTemporaryDirectory()/livetranslate-<stamp>/`).
-  All artifacts (per-source WAVs, per-source SRTs, live-merged
-  per-language SRTs, JSONL log) land there immediately as they're
-  produced. At Stop the MKV is built in-place (ffmpeg, if available),
-  then `/usr/bin/zip` packs the directory into
-  `~/Documents/LiveTranslate/<stamp>.zip` and the temp dir is
-  deleted. Layout inside the zip:
+## Key design decisions
 
-  ```
-  <stamp>/
-      <stamp>.jsonl                       ← every sentence (source-tagged)
-      <stamp>.mic.<src>.srt               ← per-source SRTs, source language
-      <stamp>.mic.<tgt>.srt
-      <stamp>.system.<src>.srt
-      <stamp>.system.<tgt>.srt
-      <stamp>.<lang>.srt                  ← merged SRT per language (plain cue text, no prefix)
-      <stamp>.mic.wav                     ← post-denoise + AGC audio
-      <stamp>.system.wav
-      <stamp>.mkv                         ← 640×360 black + amix audio + SRTs
-  ```
+- **Per-stream pipelines, never mixed.** Mic and system audio are captured in
+  parallel, each going through its own `DenoisingAudioSource` (independent
+  RNNoise instance + AGC) and its own `SourcePipeline` (AudioRecorder +
+  `transcriber.transcribe()` call). The transcribers share one whisper `ctx` via
+  `NSLock`. No sample mixing. No attribution loss. The JSONL `source` field
+  tracks which stream produced each sentence.
 
-  SRTs are written live during the session — both per-source files
-  (one cue per sentence as it graduates) and the merged ones
-  (in-memory re-sort + atomic rewrite on each graduate). MKVExporter
-  consumes the already-merged files; it doesn't re-merge. If ffmpeg
-  isn't installed, no `.mkv` is produced and the zip just contains
-  the audio + SRTs + JSONL.
+- **Inflight-chunk UI model (UUID continuity through graduation).** Every chunk
+  reserves a UI row at voice onset (state `.listening`, with a UUID generated at
+  that moment). That UUID flows through `.transcribing` and `.translating(text)`
+  events. On translation completion, `graduate()` appends a `Sentence` with a
+  **fresh** UUID and removes the inflight entry — SwiftUI sees a smooth content
+  swap without an abrupt remove+add. Chunks whisper rejects (no voice, too short,
+  zero segments) fire `.dropped` and the reserved row collapses out.
 
-  The transcript line shape:
-  ```json
-  {"end":"2026-05-16T22:13:09.581Z","start":"2026-05-16T22:13:07.123Z","transcription":"…","translation":"…"}
-  ```
-  Keys sorted for grep/diff stability, ISO-8601 timestamps with
-  fractional seconds. `start` / `end` are derived from the chunk's
-  voiced span in the audio stream (anchored to `runStartedAt`), so
-  they line up sample-accurately with the matching position in the
-  paired `.wav`. The SRT cue uses the same offsets.
-  `transcription` / `translation` always present; `translation` may be
-  empty if the translator hadn't gotten to it yet.
+- **Lifecycle callback, not snapshot stream.** `WhisperCppTranscriber` emits
+  `onChunkLifecycle(chunkID, source, event)` from background tasks. `Pipeline`
+  receives it via `handleChunkLifecycle` (a `nonisolated` function) which
+  dispatches `Task { @MainActor in applyLifecycle(...) }`. The `AsyncThrowingStream<SessionSnapshot>` returned by `transcribe()` is drained but
+  its values are ignored — the lifecycle callback is the single source of truth.
+  This is what lets per-chunk async translation fit cleanly into the state machine.
 
-  The `.wav` is 48 kHz mono signed-16-bit linear PCM (AVAudioFile auto-
-  converts our Float32 buffers on the write path). Recording is taken
-  **after** RNNoise, so one sample = exactly what the recognizer heard
-  — audio and transcript line up. Paths are centralised in `Paths.swift`.
+- **Audio format invariant: 48 kHz mono Float32.** Both `MicrophoneSource` (via
+  AVAudioEngine tap + AVAudioConverter) and `SystemAudioSource` (via SCK +
+  AVAudioConverter) produce 48 kHz mono Float32 — RNNoise's native rate.
+  `WhisperCppTranscriber` downsamples to 16 kHz internally using a per-run
+  `WhisperResampler` (AVAudioConverter, stateful across chunks to avoid filter
+  discontinuities). `AudioRecorder` writes 48 kHz 16-bit int (AVAudioFile
+  auto-converts Float32 on write).
 
-### Files
+- **RNNoise per stream.** `DenoisingAudioSource` wraps any `AudioSource`, applies
+  its own `RNNoiseProcessor` (one `DenoiseState *` per instance), and re-broadcasts
+  via its own `BufferBroadcaster`. RNNoise processes 480-sample frames at 48 kHz
+  (10 ms algorithmic latency). Input must be ±1 Float32; the wrapper handles
+  ±32768 scaling in `feed()` / `drain()`. Denoising before mixing was the old
+  design; independent per-stream denoisers let the GRU adapt to mic room noise vs.
+  system ambient independently.
+
+- **AGC (Accelerate, envelope follower, targets 0.1 RMS, 8× cap).** Each
+  `DenoisingAudioSource` runs a post-RNNoise AGC per instance: measure RMS via
+  `vDSP_measqv`, EMA the input level on voiced buffers only (`agcNoiseFloor =
+  0.003`), target `agcTargetRMS = 0.1`, smooth the applied gain with
+  `agcGainSmoothing = 0.06` EMA, apply via `vDSP_vsmul`. `agcMinGain = 1.0`
+  (never attenuates), `agcMaxGain = 8.0`. AGC happens before the crosstalk
+  mute gate so the gate produces true silence, not amplified noise.
+
+- **Crosstalk gate on mic.** `Pipeline` wires `DenoisingAudioSource(mic)` with a
+  `muteWhen: { whisper?.isSystemRecentlyVoiced() }` closure. When system audio
+  was voiced within `crosstalkPersistSeconds` (250 ms), the mic's outgoing buffer
+  is zeroed with `memset` after denoising (so the RNNoise GRU stays coherent) but
+  before emission. Both consumers — `AudioRecorder` and the transcriber's
+  accumulator — see the muted buffer. The system accumulator calls
+  `markSystemVoiced()` on each buffer whose RMS clears `silenceRMSThreshold`.
+
+- **whisper.cpp: RMS VAD, chunk sizes, silence-close gating, padding.** The
+  accumulator runs a per-buffer RMS check (`silenceRMSThreshold = 0.012`). A
+  chunk closes on `endChunkAfterSilence` (0.7 s) of consecutive quiet frames,
+  but only after the chunk has grown past `minWhisperInputSeconds` (1.1 s) total
+  — without this gate, short utterances like "yes" would silence-close instantly
+  with too little audio. Hard cap at `maxChunkSeconds` (5 s). The worker trims
+  leading/trailing silence (±`voicePaddingSeconds` = 100 ms) and pads clips
+  shorter than 1.1 s with trailing zeros — whisper silently returns zero segments
+  for audio under ~1 s (100 mel frames × 10 ms). Minimum voiced-sample check:
+  `minVoicedSeconds = 0.1 s` (to pass single-syllable utterances like "Ja").
+
+- **GGML model: bundled, one file.** `WhisperCppTranscriber.bundledModelName =
+  "ggml-large-v3-turbo-q5_0"` (the `.bin` extension is added by
+  `Bundle.main.url(forResource:withExtension:)`). Default size ~570 MB. Distilled
+  large-v3 with 4 decoder layers vs. 32 in full large; large-class quality at
+  ~3× realtime on Apple Silicon. Metal GPU used (`params.use_gpu = true`),
+  `flash_attn = false`. To swap: edit `bundledModelName` in
+  `WhisperCppTranscriber.swift` AND `WHISPER_MODEL` env var (consumed by both
+  `build.sh` and `tools/build-whisper.sh`). No runtime model-picker; what you
+  built is what you run.
+
+- **Concurrent accumulator + worker.** `transcribe()` spawns two structured child
+  tasks via `async let`: the *accumulator* pumps audio forever and emits closed
+  `ChunkBuffer`s into an unbounded `AsyncStream<ChunkBuffer>`; the *worker* drains
+  that queue and runs `whisper_full()` serially. The accumulator is never blocked
+  on whisper. The whole thing runs off-MainActor (the task spawned inside the
+  `AsyncThrowingStream` continuation is not inherited — there is no `Task.detached`
+  needed at the outer level, but `runWhisperLocked` uses `Task.detached` for the
+  `NSLock` calls).
+
+- **One chunk = one sentence; transcriber owns segmentation.** The RMS VAD already
+  splits at natural pauses, so each chunk is one utterance. Whisper's internal
+  segments (it can emit multiple per call) are joined into a single line with
+  `joined(separator: " ")`. Pipeline never splits or edits a `Sentence` in place;
+  ingest just appends.
+
+- **`initial_prompt` continuity per source.** `previousChunkTail: [SourceTag:
+  String]` stores the last `maxInitialPromptChars` (120) chars of each stream's
+  previous chunk text and passes it as `params.initial_prompt` on the next call.
+  Per-source because mic and system content is unrelated — mixing them would
+  pollute both transcribers.
+
+- **Translation: per-chunk inline, `@MainActor` load-bearing.** When
+  `.completed(text, startSeconds, endSeconds)` fires in `applyLifecycle`, the
+  pipeline either graduates immediately (src == tgt language, or cache hit) or
+  sets the inflight row to `.translating(text)` and dispatches `Task { @MainActor
+  [weak self] in translator.translate(text) }`. The explicit `@MainActor` is
+  load-bearing: without it, Swift 5 actor-inheritance heuristics can let the
+  post-await `graduate` run off-actor, and `@Published` mutations from the wrong
+  actor don't surface in the UI.
+
+- **Translation cache: 200 entries, LRU-ish.** `Pipeline.translationCache:
+  [String: String]` keyed by source text. On eviction (count > 200), drops
+  ~10% of entries by insertion order (oldest first via `keys.prefix(toDrop)`).
+
+- **Live translated-audio HTTP stream (opt-in by capability).** At run start,
+  `Pipeline` calls `TTSSpeaker.bestVoice(forTargetCode: tgtLangCode)`. If a
+  Premium or Enhanced voice is installed for the target AND `srcLang != tgtLang`,
+  it spins up `LiveAudioServer` on port 8765 and a `TTSSpeaker`. If no voice is
+  installed, the whole feature is skipped — the stream icon stays hidden.
+  `ttsActive` is `true` while `ttsSpeaker != nil && ttsListenerCount > 0`.
+  TTS synthesis is gated on `server.audioListenerCount > 0` — the speaker is
+  never called when nobody is tuned in. `liveStreamURL` is published for the
+  UI's share popover (URL + QR code via CoreImage).
+
+- **`LiveAudioServer` routing.** Routes: `/` → dark-mode HTML listen page (self-
+  contained HTML/CSS/JS, served once per connection); `/live.wav` → open-ended
+  WAV stream (24 kHz mono PCM16 LE, `0xFFFFFFFF` data-chunk size, 200 ms
+  heartbeat of 50 ms silence = 2400 bytes to keep VLC alive, 100 ms idle
+  threshold); `/events` → SSE stream (one JSONL line per sentence, 200-entry
+  replay buffer for late subscribers, 5 s `: ping` keepalive via 25 × 200 ms
+  ticks). `audioListenerCount` and `onAudioListenerCountChanged` let Pipeline
+  gate TTS. `publishTranscript(jsonLine:)` broadcasts to SSE subscribers and
+  buffers for replay. URL resolution: tries private-range IPv4 first (walks
+  `getifaddrs`, skips `utun`/`ipsec`/`tun` interfaces), falls back to `scutil
+  --get LocalHostName` + `.local`, finally `localhost`.
+
+- **`TTSSpeaker`.** Uses `AVSpeechSynthesizer.write(_:toBufferCallback:)` —
+  delivers raw `AVAudioPCMBuffer`s without engaging an output device (no local
+  playback). One `AVAudioConverter` per utterance (not per buffer) so resampler
+  state is continuous. Converts to 24 kHz mono PCM16 LE. Serial queue: one
+  utterance completes before the next starts, with a 0.5 s gap between utterances
+  (so the client has time to consume buffered audio before the next starts). Max
+  pending queue: 5 utterances; oldest are dropped when over limit. Voice selection
+  via `bestVoice(forTargetCode:)`: filters installed voices by primary subtag
+  match, ranks Premium > Enhanced > Default. Pre-warms on init by synthesizing
+  a silent utterance.
+
+- **Pruning.** Non-protected sentences older than `maxAgeSeconds` (300 s = 5 min,
+  keyed on `lastModified`) are removed once per second in `runPruneLoop`. Hard
+  cap at `maxSentenceCount` (50) enforced in `enforceMaxCount` (called on each
+  `graduate`). "Protected" = the last `Sentence` in the array (so the UI is never
+  briefly empty mid-stream). Only the most-recent sentence is protected.
+
+- **Per-run output: temp dir → MKV via ffmpeg → zip.** Each session writes into
+  `NSTemporaryDirectory()/livetranslate-<stamp>/`. Sentences are archived to JSONL
+  immediately on `graduate` (not at prune time). At Stop: flush writers → ffmpeg
+  MKV → `/usr/bin/zip -j -q -X` into `~/Documents/LiveTranslate/<stamp>.zip` →
+  delete temp dir. `shippedFiles` = `[transcript (.jsonl), mkvOutput (.mkv)]`.
+  Per-source WAVs and merged SRTs are intermediates consumed by ffmpeg, not
+  shipped. If ffmpeg isn't installed, no MKV; zip contains only JSONL.
+
+- **Crash recovery.** `CrashRecovery.recoverPendingSessions()` (called
+  `Task.detached` from `App.init`) scans `NSTemporaryDirectory()` for leftover
+  `livetranslate-<stamp>/` dirs and runs the same MKV+zip+cleanup path for each.
+  Idempotent: if the zip already exists it just deletes the leftover dir.
+
+- **`TranscriptArchive.encodeLine(_:)` is static.** Used both by `append(_:)` (for
+  disk writes) and by `Pipeline.recordSentence` (for SSE broadcast), ensuring the
+  on-disk JSONL and the over-the-wire SSE event are bit-identical. The JSONL
+  record shape has five fields with sorted keys (grep/diff stable):
+  `end`, `source`, `start`, `transcription`, `translation`.
+
+- **Broadcaster pattern.** `BufferBroadcaster` fans one audio tap callback to any
+  number of `AsyncStream` subscribers. Each `var buffers: AsyncStream` access
+  creates a fresh stream and registers a new continuation. `finishAll()` closes
+  every subscriber's stream on `stop()`, driving natural drain rather than
+  task cancellation.
+
+- **Persisted settings.** `source` (BCP-47 `SourceLocale`) and `target`
+  (`TargetLanguage`) are stored as JSON in `UserDefaults` (keys `pipeline.source`,
+  `pipeline.target`). Default: `de-DE` source, `en` target. `compactMode` is
+  stored via `@AppStorage("compactMode")` (View concern). Changing source or
+  target while running triggers `requestRestartIfRunning()` → `stopActiveSources()`
+  → deferred restart in `run()`'s defer block.
+
+- **Window behavior.** `.floating` level, `isMovableByWindowBackground = true`,
+  `canJoinAllSpaces`, `fullScreenAuxiliary`, hidden title bar, all traffic lights
+  hidden, `fullSizeContentView`. No in-window Quit/Copy/Clear buttons; use Cmd+Q.
+  Text rows have `.textSelection(.enabled)`. Compact mode (`@AppStorage`) hides
+  language pickers and shows a slim bar.
+
+---
+
+## Files table
 
 | File | Role |
 |---|---|
-| `App.swift` | `@main` entry. SwiftUI `Window` scene. Configures the NSWindow for floating / translucent / movable-from-background behavior. |
-| `TranscriptView.swift` | The whole UI. Renders one `SentenceRow` per sentence, with opacity fade for older rows. Hosts `.translationTask` (the only way to get a `TranslationSession`). Background is a flat translucent color — no blur. |
-| `Pipeline.swift` | `@MainActor ObservableObject` orchestrator. Owns the shared `sentences` array, the JSONL archive, the translator, and the prune loop. Spawns one `SourcePipeline` per `SourceTag` and merges their `Sentence` streams into the visible array. Persists user settings via UserDefaults. |
-| `SourcePipeline.swift` | Self-contained per-stream pipeline (mic OR system). Owns its denoised audio source, recorder, source/target SRT writers, and a `transcribe()` call. Emits `Sentence`s via an `AsyncStream` that `Pipeline` consumes. |
-| `BufferBroadcaster.swift` | Helper that fans audio buffers out to any number of subscribed `AsyncStream`s. `finishAll()` ends every subscription on audio-source stop, which is what drains the recognition pipeline naturally. |
-| `Types.swift` | `SourceLocale`, `TargetLanguage`, `SourceTag` (mic/system), `Sentence`, `PipelineStatus`, `SessionSentence` / `SessionSnapshot`. Protocols: `AudioSource`, `Transcriber`, `Translator`. |
-| `MicrophoneSource.swift` | `AVAudioEngine` mic capture, emits 48 kHz mono Float32. |
-| `SystemAudioSource.swift` | `ScreenCaptureKit`-based system audio capture, emits 48 kHz mono Float32. |
-| `DenoisingAudioSource.swift` | Wraps any `AudioSource`, applies its own `RNNoiseProcessor`, re-broadcasts. One per input stream so denoiser state is independent. |
-| `RNNoiseProcessor.swift` | Swift wrapper around the vendored RNNoise C library. Owns the `DenoiseState`, buffers arbitrary-sized input into 480-sample frames, handles ±32768 ↔ ±1 scaling, emits denoised samples via `drain(into:count:)`. |
-| `CRNNoise/` | Vendored xiph/rnnoise v0.1.1 as a SwiftPM C target. BSD 3-clause; GRU weights statically linked. See `Sources/CRNNoise/README.md`. |
-| `WhisperCppTranscriber.swift` | **The transcriber.** Two structured-concurrency child tasks via `async let` (per `transcribe()` call): an accumulator that pumps audio and emits closed chunks on silence/max-chunk, and a worker that runs `whisper_full()`. Multiple concurrent calls (mic + system) share one `ctx` and serialize via `NSLock` around `whisper_full`. Per-source `previousChunkTail` keyed by `SourceTag` keeps `initial_prompt` context independent per stream. |
-| `CWhisper/` | SwiftPM bridge target around `libwhisper.a` + `libggml*.a` produced by `tools/build-whisper.sh`. Headers (`whisper.h`, `ggml*.h`) are mirrored in by the build script and gitignored. |
-| `AppleTranslator.swift` | Holds a `TranslationSession` that the View injects via `Pipeline.installTranslationSession(_:)`. |
-| `TranscriptArchive.swift` | One-per-run JSONL archive. Rows carry a `source` field (`"mic"` / `"system"`) plus the audio-anchored `start`/`end` timestamps. |
-| `AudioRecorder.swift` | One-per-stream `.wav` writer fed by a parallel consumer of its source's broadcaster. 48 kHz mono Int16. |
-| `SubtitleArchive.swift` | One-per-`(source,language)` SRT writer. Cue times are offsets into the matching `<stamp>.<source>.wav`. |
-| `Paths.swift` | Single source of truth for `~/Documents/LiveTranslate/{transcripts,recordings}/<stamp>.<source>[.<lang>].{wav,srt}` plus the shared `<stamp>.jsonl`. |
-| `Log.swift` | Append-only file logger at `/tmp/livetranslate.log`. Truncates on launch if > 5 MB. |
-| `TTSSpeaker.swift` | Synthesizes finalized translations to 24 kHz PCM16 LE buffers via `AVSpeechSynthesizer.write(_:toBufferCallback:)` (never plays through local speakers). Serial queue — one utterance fully before the next; drops oldest pending past 5. `bestVoice(forTargetCode:)` picks the highest-quality installed voice for the target's primary subtag, or nil. Only called when `LiveAudioServer.audioListenerCount > 0`. |
-| `LiveAudioServer.swift` | Hand-rolled HTTP/1.1 server on a `NWListener`. Routes: `/` → dark-mode HTML listen page; `/live.wav` → open-ended 24 kHz PCM16 LE WAV stream (200 ms silence heartbeat keeps VLC alive); `/events` → SSE transcript stream with 200-entry replay buffer and 5 s keepalive. Exposes `audioListenerCount` and `onAudioListenerCountChanged` so Pipeline can gate TTS synthesis and drive the `ttsActive` UI indicator. `publishTranscript(jsonLine:)` broadcasts each graduated sentence to SSE subscribers. |
+| `App.swift` | `@main` entry. Initialises `Log`, fires `CrashRecovery.recoverPendingSessions()` as a background `Task.detached`. Creates the `Window` scene with `Pipeline`. Installs `NSApplication.willTerminateNotification` observer to call `pipeline.flushPendingSentences()` on Cmd+Q. Configures `NSWindow` (floating, translucent, movable, canJoinAllSpaces, traffic lights hidden). Has a `Debug` menu (`Cmd+Shift+D` = load fixture sentences, `Cmd+Shift+K` = clear). |
+| `TranscriptView.swift` | Full UI. Renders `SentenceRow` (completed sentences) then `InflightRow` (in-flight chunks) in a `LazyVStack`/`ScrollView`. Two layouts: full (controls bar + list) and compact. Hosts `.translationTask(translationConfig)` — the only way to get a `TranslationSession`. Parks the closure with `AsyncStream<Never>.makeStream()` + `for await _ in parked { }` (see quirks section). Calls `pipeline.installTranslationSession(session)`. Renders `StreamShareView` popover (URL + CoreImage QR). `translationConfig` uses 2-letter primary subtag from BCP-47 source code. |
+| `Pipeline.swift` | `@MainActor ObservableObject` orchestrator. Owns `@Published sentences`, `inflightChunks`, `status`, `isActive`, `liveStreamURL`, `ttsActive`. Runs the full session lifecycle in `run()`: permissions → `DenoisingAudioSource` init → audio start → open output files → build `SourcePipeline`s + `MergedSubtitleArchive`s → optional TTS/LiveAudioServer → prune loop → `withTaskGroup` over `SourcePipeline.run()` → cancel prune loop → flush + MKV + zip. Implements `applyLifecycle`, `graduate`, `recordSentence`, `cacheTranslation`, `prune`, `enforceMaxCount`. Wires `WhisperCppTranscriber.onChunkLifecycle`. |
+| `SourcePipeline.swift` | Self-contained per-stream coordinator (mic OR system). Owns its denoised audio source, `AudioRecorder`. Runs recording and transcription loops concurrently via `async let`. The `AsyncThrowingStream` from `transcribe()` is drained but ignored — lifecycle events go via the transcriber callback to `Pipeline` directly. `flush()` delegates to recorder. |
+| `BufferBroadcaster.swift` | Fan-out for audio buffers. `NSLock`-guarded `[UUID: AsyncStream.Continuation]`. Each `var stream` access creates a fresh `AsyncStream` and registers itself. `emit(_:)` snapshots continuations and yields outside the lock. `finishAll()` closes all continuations — this is the graceful-drain signal that lets the pipeline wind down without task cancellation. |
+| `Types.swift` | `SourceLocale` (BCP-47 wrapper), `TargetLanguage` (code + name), `SourceTag` (mic/system, with `shortLabel` and `iconSystemName`), `InflightChunk` (with `State: listening / transcribing / translating(text:)`), `SessionSentence` (text, isFinal, startSeconds?, endSeconds?), `SessionSnapshot`, `Sentence` (id, text, translation, source, createdAt, endsAt, lastModified), `PipelineStatus` (idle/requestingPermissions/starting/running/finalizing/stopped). Protocols: `AudioSource`, `Transcriber`, `Translator`. |
+| `MicrophoneSource.swift` | `AVAudioEngine` mic capture. Installs a tap on `engine.inputNode`, converts native format → 48 kHz mono Float32 via `AVAudioConverter`, emits via `BufferBroadcaster`. `stop()` removes tap, stops engine, calls `broadcaster.finishAll()`. |
+| `SystemAudioSource.swift` | `ScreenCaptureKit`-based system audio capture. `SCStreamOutput` + `SCStreamDelegate`. Config: 48 kHz, 2 channels, tiny 2×2 video (SCK requires some video config; samples ignored). Converts SCK `CMSampleBuffer` → 48 kHz mono Float32 via `AVAudioPCMBuffer.fromCMSampleBuffer(_:format:)` + `AVAudioConverter`. Uses `CMSampleBufferCopyPCMDataIntoAudioBufferList` (see lesson #13). `stop()` calls `stream.stopCapture()` then `broadcaster.finishAll()`. |
+| `DenoisingAudioSource.swift` | Wraps any `AudioSource`. Applies `RNNoiseProcessor`, optional AGC (`vDSP_measqv` + `vDSP_vsmul`, targets 0.1 RMS, max 8× gain), optional crosstalk `muteWhen` gate (mic only). Maintains its own `BufferBroadcaster`. Pump task (`Task`) pulls from upstream broadcaster, denoises, re-emits, calls `broadcaster.finishAll()` on upstream end. `stop()` awaits upstream stop then awaits pump task. |
+| `RNNoiseProcessor.swift` | Thin Swift wrapper around RNNoise C API. Owns `DenoiseState *`. Buffers arbitrary-sized input into 480-sample frames, handles ±32768 ↔ ±1 Float32 scaling. `feed(samples:count:)` / `drain(into:count:)` API. 10 ms algorithmic latency. |
+| `CRNNoise/` | SwiftPM C target. Vendored xiph/rnnoise v0.1.1, BSD 3-clause. GRU weights statically linked from `rnn_data.c`. See `Sources/CRNNoise/README.md`. |
+| `WhisperCppTranscriber.swift` | The only `Transcriber` implementation. Loads GGML model lazily via `ensureContextLoaded()` (serialized by `ctxLoadLock: NSLock`). Two structured child tasks per `transcribe()` call: accumulator (VAD + chunk emission) and worker (whisper_full). Shares `ctx` across concurrent calls; `whisperLock: NSLock` serializes `whisper_full`. Implements `onChunkLifecycle` callback. Per-source `previousChunkTail: [SourceTag: String]` for `initial_prompt`. Cross-talk state: `lastSystemVoicedAt: Date` + `crosstalkLock: NSLock`. `runWhisperLocked` dispatches to `Task.detached` (cooperative-pool thread) to allow `NSLock.lock()`. Tunables are all `static var` (testable/overridable). Includes `WhisperResampler` (private, stateful `AVAudioConverter` for 48→16 kHz). |
+| `CWhisper/` | SwiftPM bridge target. Headers (`whisper.h`, `ggml*.h`) mirrored from `build/whisper-prefix/include/` by build script. Links `libwhisper.a`, `libggml*.a`. |
+| `AppleTranslator.swift` | `@MainActor Translator`. Holds a `TranslationSession?` injected by `Pipeline.installTranslationSession(_:)`. `translate(_:)` calls `session.translate(text)` and returns `response.targetText`. Throws `TranslateError.noSession` if no session yet. |
+| `TranscriptArchive.swift` | One-per-run JSONL writer. `append(_:)` is async (serial `DispatchQueue`). Static `encodeLine(_:)` produces the JSON string without disk IO — used by both `append` and `Pipeline.recordSentence` for SSE, keeping on-disk and over-wire representations identical. Record shape (sorted keys): `end`, `source`, `start`, `transcription`, `translation`. `flush()` calls `queue.sync {}`. |
+| `AudioRecorder.swift` | Per-stream WAV writer. `AVAudioFile(forWriting:settings:)` with 48 kHz mono 16-bit int PCM settings; `AVAudioFile.write(from:)` converts Float32 on the write path. `flush()` runs `queue.sync { self.file = nil }` — closing the file finalizes the WAV header data-chunk length (required for `MKVExporter` to probe duration correctly). |
+| `SubtitleArchive.swift` | Per-`(source, language)` SRT writer. Appends `counter / start --> end / text` cues. Cue times are offsets into the matching `<stamp>.<source>.wav`. Currently not actively used (SRT writing was moved to merged-only flow); kept for future per-source SRT revival. |
+| `MergedSubtitleArchive.swift` | Live-merged SRT per language (both sources interleaved). On each `add(text:startSeconds:endSeconds:)`: appends cue, re-sorts by start, rewrites file atomically. `flush()` awaits the write queue. Used by `MKVExporter`. |
+| `MKVExporter.swift` | Shells out to ffmpeg (checks `/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`). Builds 640×360 black H.264 + amix'd audio + embedded SRT tracks. Uses AVFoundation to probe WAV durations for `-t` bound on the lavfi video source. Also contains `ZipArchiver` (uses `/usr/bin/zip -j -q -X`). |
+| `CrashRecovery.swift` | Scans `NSTemporaryDirectory()` for `livetranslate-<stamp>/` leftover dirs (from crashes / force-quits) and runs MKV+zip+cleanup for each. Idempotent. Runs background at launch. |
+| `Paths.swift` | Single source of truth for path layout. `Paths.Outputs` struct: `timestamp`, `workDir` (temp), `zipDestination`, `transcript`, `recording(_:)`, `mergedSubtitle(_:)`, `mkvOutput`, `shippedFiles`. |
+| `Log.swift` | Append-only file logger at `/tmp/livetranslate.log`. Truncates on launch if > 5 MB. `line(_:)` prepends `HH:mm:ss.SSS` timestamp. All writes are async on a serial queue. |
+| `TTSSpeaker.swift` | `AVSpeechSynthesizer.write(_:toBufferCallback:)` — no local playback. Converts to 24 kHz mono PCM16 LE via per-utterance `AVAudioConverter`. Serial queue, 0.5 s gap between utterances. Max 5 pending; oldest dropped on overflow. `bestVoice(forTargetCode:)` matches primary BCP-47 subtag, ranks Premium > Enhanced > Default. Pre-warms on init. Listener-count gated: `enqueue` is only called by `Pipeline.graduate` when `server.audioListenerCount > 0`. |
+| `LiveAudioServer.swift` | Hand-rolled HTTP/1.1 on `NWListener` (port 8765). Routes: `/` → HTML listen page; `/live.wav` → open WAV stream (24 kHz PCM16 LE, `0xFFFFFFFF` chunk size, 200 ms heartbeat task with 50 ms silence = 2400 bytes); `/events` → SSE (200-entry replay, 5 s ping keepalive). `audioListenerCount` and `onAudioListenerCountChanged` drive Pipeline's `ttsActive`. `publishTranscript(jsonLine:)` broadcasts to SSE and buffers for replay. URL resolution prefers private-range IPv4, falls back to `scutil LocalHostName`.local, then `localhost`. |
+
+---
 
 ## Key behaviors / non-obvious bits
 
 ### One chunk = one sentence
 
-The RMS-based VAD in `WhisperCppTranscriber` already splits the audio
-at natural pauses, so each chunk fed to `whisper_full()` is, by
-construction, one utterance. Whisper's internal segmentation (it can
-emit multiple `whisper_segment`s per call when it detects sub-pauses)
-is joined into a single line before the snapshot leaves the
-transcriber. The Pipeline gets one `SessionSentence` per closed
-chunk, which lands as one `Sentence` row, which writes one JSONL line
-and one SRT cue.
+The RMS-based VAD in `WhisperCppTranscriber` already splits the audio at natural
+pauses, so each chunk fed to `whisper_full()` is, by construction, one utterance.
+Whisper's internal segmentation (it can emit multiple `whisper_segment`s per call)
+is joined into a single line before the snapshot leaves the transcriber. The
+Pipeline gets one `SessionSentence` per closed chunk, which lands as one `Sentence`
+row, which writes one JSONL line.
 
-This also means: the transcriber owns sentence segmentation. The
-Pipeline never splits, the Pipeline never edits-in-place.
+The transcriber owns sentence segmentation. The Pipeline never splits; it never
+edits in place; it only appends.
 
 ### Audio-stream timing (SRT/JSONL ↔ WAV alignment)
 
-The accumulator tracks a cumulative 16 kHz sample counter
-(`samplesEverEmitted16k`) across all chunks; the chunk's own start
-offset is the counter's value at chunk-open. From there the
-sentence's `startSeconds` / `endSeconds` come from
-`(chunkStartSample16k + voiceStart) / 16_000` etc. — i.e. **seconds
-into the audio stream**.
+The accumulator maintains `samplesEverEmitted16k` across all chunks. A chunk's
+`chunkStartSample16k` is that counter's value when the chunk opened.
+`startSeconds = (chunkStartSample16k + voiceStart) / 16_000`,
+`endSeconds = (chunkStartSample16k + voiceEnd) / 16_000`.
 
-Pipeline anchors those at `runStartedAt`, so `Sentence.createdAt /
-endsAt` are wall-clock Dates but the **offsets between them and
-`runStartedAt`** match audio-stream positions. The recorder consumes
-the same audio broadcaster, so audio-stream position = WAV position.
-SRT cues therefore line up sample-accurately with the `.wav` and the
-JSONL `start`/`end` ISO timestamps are usable as audio offsets.
-
-Backends that don't report timing pass `nil` for `startSeconds` /
-`endSeconds` and Pipeline falls back to `Date()` at ingest — but
-whisper.cpp always reports timing now, and there's no other backend.
+`Pipeline` anchors those at `runStartedAt`: `createdAt = runStartedAt +
+startSeconds`. The `AudioRecorder` subscribes to the same broadcaster, so
+WAV position = audio-stream sample position. SRT cues and JSONL timestamps
+are therefore sample-accurate with the `.wav` files.
 
 ### Concurrent accumulator + worker (the "second sentence dropped" bug)
 
-Whisper takes 1-3 s to process a chunk. If we ran the audio pump
-synchronously with whisper (close chunk → run whisper → resume pump),
-any utterance during whisper's processing would be lost — the
-upstream broadcaster keeps producing buffers but no one is consuming
-the AsyncStream.
+Whisper takes 1–3 s to process a chunk. Running the audio pump synchronously with
+whisper would lose any utterance during that processing window. The fix: two
+structured child tasks via `async let`. The *accumulator* runs continuously,
+emitting `ChunkBuffer`s into an unbounded `AsyncStream<ChunkBuffer>`. The *worker*
+drains that queue and runs `whisper_full()` serially. Queue is unbounded because
+audio rates are too low to create backpressure.
 
-The fix is two structured child tasks under one `async let`:
+### Whisper hallucination defences
 
-- **Accumulator** reads audio forever, emitting closed chunks into a
-  `AsyncStream<ChunkBuffer>` queue. Never blocked.
-- **Worker** drains the queue, runs whisper serially, yields
-  `SessionSnapshot`s back. Sees chunks in order.
+Whisper, trained on captioned video, fabricates phrases like "Thanks for watching!"
+or "[Music]" on near-silent or very short input. Four layers of defence:
 
-The queue is unbounded; backpressure isn't a concern at our rates.
-
-### Whisper hallucinates on silence
-
-Trained on captioned video, the model fabricates phrases like "Thanks
-for watching!" or "[Music]" given near-silent input. Four defences:
-
-1. **Skip chunks with no voice** — `firstVoiceSample16k == nil`.
-2. **Trim leading/trailing silence** off the chunk (with 100 ms of
-   padding so word edges aren't clipped).
-3. **Silence-close is gated on total chunk length** — the accumulator
-   only allows a silence-driven close once the *chunk as a whole* is
-   at least `minWhisperInputSeconds` (1.1 s). Without this, a short
-   utterance (e.g. "yes") would silence-close instantly and the worker
-   would have to either pad or drop it; with it, the chunk grows past
-   the threshold and we send a clean utterance through. Max-chunk
-   close still fires regardless (the worker's pad-to-1.1s is the
-   final safety net).
-4. **Pad short trimmed clips with trailing zeros to ≥1.1 s.** Whisper
-   silently returns zero segments for audio under ~1 s — its
-   mel-spectrogram threshold is 100 frames at 10 ms each. Padded
-   silence at the end is fine.
+1. Skip chunks where `voiceStart == nil` (pure-silence max-chunk close).
+2. Trim leading/trailing silence off the chunk (±100 ms `voicePaddingSeconds`).
+3. Silence-close is gated: only allowed once the chunk total is ≥
+   `minWhisperInputSeconds` (1.1 s), so a single "yes" grows past the threshold
+   before silence-closing. Max-chunk close fires regardless.
+4. Pad short trimmed clips with trailing zeros up to 1.1 s. Whisper silently
+   returns zero segments for audio under ~1 s (mel-spectrogram threshold: 100
+   frames × 10 ms).
 
 ### `initial_prompt` continuity across chunks
 
-The transcriber stashes the last ~120 chars of the previous chunk's
-text as `previousChunkTail` (a dictionary keyed by `SourceTag`) and
-passes it as `params.initial_prompt` on the next chunk. Per-source
-because mic and system content is unrelated — mixing the tails would
-pollute each.
+`previousChunkTail: [SourceTag: String]` (updated in `processChunk` on success,
+keyed by source) stores the last 120 chars of the previous chunk's text and passes
+it as `params.initial_prompt` on the next call. Per-source because mic and system
+audio are unrelated — mixing the tails would pollute each stream's context.
 
-### Per-source crosstalk suppression (speaker bleed into mic)
+### Crosstalk suppression (speaker bleed into mic)
 
-The mic always picks up some of what the system is playing through
-the speakers. To stop those phantom transcriptions on the mic side,
-`WhisperCppTranscriber` carries shared state — `lastSystemVoicedAt`
-(`Date`, NSLock-protected) — updated by the system accumulator on
-every voiced buffer. The mic accumulator queries it per buffer; if
-system was voiced within `crosstalkPersistSeconds` (250 ms, covers
-RNNoise envelope follower lag + room reverberation), the mic's
-current buffer is replaced with silence in the 16 kHz sample array
-AND the voiced-span markers aren't credited. The chunk's timing keeps
-advancing (so WAV alignment stays correct) but no false-positive
-voice gets attributed to the mic during system playback.
-
-Note: this affects only what's fed to whisper. The mic `.wav`
-recording still contains the raw bleed — that's a separate concern
-(the WAV is recorded from the broadcaster, upstream of the
-transcriber's per-source muting logic).
+The mic always picks up some system audio through the speakers. Mitigation:
+`WhisperCppTranscriber` has `lastSystemVoicedAt: Date` (NSLock-protected). The
+system accumulator calls `markSystemVoiced()` per voiced buffer. `Pipeline` wires
+`DenoisingAudioSource(mic, muteWhen: { whisper?.isSystemRecentlyVoiced() })`.
+When system was voiced within 250 ms, `DenoisingAudioSource.denoise()` zeros the
+output buffer with `memset` after denoising (RNNoise GRU stays coherent). Both
+`AudioRecorder` and the transcriber accumulator see the zeroed buffer.
 
 ### Broadcaster pattern (the "won't restart after Stop" problem)
-`AsyncStream` is single-consumer. The previous design exposed a single
-stored AsyncStream as `buffers` — when a second consumer tried to read
-from it after the first iterator was gone, it got no data. Both
-`MicrophoneSource` and `SystemAudioSource` now build a fresh AsyncStream
-per `buffers` access and fan tap callbacks out to all current subscribers.
+
+`AsyncStream` is single-consumer. Exposing a stored stream as `buffers` would
+break every start after the first — the second consumer iterates an already-drained
+stream. Both `MicrophoneSource` and `SystemAudioSource` build a fresh
+`AsyncStream` per `buffers` access via `BufferBroadcaster.stream` and fan tap
+callbacks to all current subscribers. Rule: `buffers` is a *fresh subscription
+factory* — call it per consumer, never cache the result.
 
 ### Translation framework quirks
-- A `TranslationSession` is **only** obtainable via SwiftUI's
-  `.translationTask` modifier. There is no public way to create one
-  programmatically. We work around this by parking the modifier's closure
-  on an `AsyncStream<Never>` that's never written to (cancellation from
-  SwiftUI wakes the iterator and unparks). `Task.sleep(nanoseconds: .max)`
-  was the original approach but trips a precondition on macOS 15+.
-- First time a language pair is used, macOS prompts to download translation
-  models. The user must accept. The download can be triggered ahead of time
-  via **System Settings → Apple Intelligence & Siri → Translation Languages**
-  or by opening the Translate app once.
-- `Configuration` source/target use bare language codes (`"de"`, `"en"`),
-  not full BCP-47 (`"de-DE"`). We trim the region in `translationConfig`.
+
+- A `TranslationSession` is **only** obtainable via SwiftUI's `.translationTask`
+  modifier. No public programmatic creation. We park the modifier's closure on an
+  `AsyncStream<Never>` (`let (parked, holder) = AsyncStream<Never>.makeStream()`
+  then `for await _ in parked { }`). Cancellation from SwiftUI wakes the iterator
+  and unparks cleanly. **`Task.sleep(nanoseconds: .max)` or similar trips a
+  precondition on macOS 15+** — do not use it for parking.
+- First time a language pair is used, macOS prompts to download translation models.
+  Trigger ahead of time via System Settings → Apple Intelligence & Siri →
+  Translation Languages, or open the Translate app.
+- `translationConfig` uses `String(pipeline.source.identifier.prefix(2))` — bare
+  2-letter code, not full BCP-47 (`"de"` not `"de-DE"`). Apple's `Translation`
+  framework requires this form for `Locale.Language(identifier:)`.
 
 ### Persisted settings
 
-User-facing settings are stored in `UserDefaults` and restored on launch:
-`translateEnabled`, `source` (BCP-47 locale), `target` (language code +
-display name). `compactMode` is stored separately via `@AppStorage`
-because it's a pure View concern. Mic-on / system-on are no longer user
-settings — both are always captured.
+`source` (`SourceLocale`) and `target` (`TargetLanguage`) stored as JSON-encoded
+data in `UserDefaults` under `"pipeline.source"` / `"pipeline.target"`. Default:
+`de-DE` / `en`. `compactMode` stored via `@AppStorage("compactMode")`. Mic-on /
+system-on are not persisted — both are always captured.
 
 ### Permissions
-The bundle declares:
-- `NSMicrophoneUsageDescription`
-- `NSScreenCaptureUsageDescription` (for system audio via SCK)
 
-Mic prompts via `AVCaptureDevice.requestAccess`. Screen recording
-prompts when `SCStream.startCapture()` runs the first time. No speech
-recognition permission — whisper.cpp runs locally against a bundled
-GGML model and doesn't touch Apple's Speech APIs.
+The bundle declares `NSMicrophoneUsageDescription` and
+`NSScreenCaptureUsageDescription`. Mic prompts via
+`AVCaptureDevice.requestAccess(for: .audio)`. Screen recording prompts when
+`SCStream.startCapture()` runs the first time. No speech recognition permission —
+whisper.cpp runs locally.
 
-Reset stale grants with:
+Reset stale grants:
 ```sh
 tccutil reset Microphone local.mtib.livetranslate
 tccutil reset ScreenCapture local.mtib.livetranslate
 ```
 
-**Persisting grants across rebuilds.** Ad-hoc signing (`codesign
---sign -`, the default) produces a fresh cdhash each build → TCC
-re-prompts. Set `LIVETRANSLATE_SIGN_IDENTITY` to a self-signed
-code-signing certificate name (created via Keychain Access →
-Certificate Assistant) and `build.sh` will use it. TCC keys grants
-on the certificate identity rather than the binary hash, so future
-builds reuse the existing grant. See README for the one-time setup.
+Ad-hoc signing produces a fresh cdhash each rebuild → TCC re-prompts. Set
+`LIVETRANSLATE_SIGN_IDENTITY` to a self-signed cert name (created via Keychain
+Access → Certificate Assistant) and `build.sh` will use it. TCC keys grants on
+the cert identity.
 
-### Window
-- Real macOS app (not menu-bar). `LSUIElement = false`.
-- Translucent (`NSVisualEffectView.Material.hudWindow`), floating
-  (`NSWindow.level = .floating`), movable from anywhere
-  (`isMovableByWindowBackground = true`), persists across Spaces
-  (`canJoinAllSpaces`).
-- Compact mode (`@AppStorage("compactMode")`) hides the controls and just
-  shows the sentence list — useful as a slim hover overlay.
-- **No in-window Quit / Copy / Clear buttons** — use the native macOS
-  quit (Cmd+Q / app menu) and select text in a row to copy. The archive
-  file is the durable record; no manual export needed.
+### Window behavior
+
+Real macOS app (`LSUIElement = false`). `.floating` level, translucent
+(`Color(nsColor: .textBackgroundColor).opacity(0.7)`, no blur), movable from any
+point (`isMovableByWindowBackground = true`), `canJoinAllSpaces`,
+`fullScreenAuxiliary`, hidden title bar + traffic lights. `fullSizeContentView`
+extends content into the title-bar area so there's no dead band.
+
+### Live stream routing and `ttsActive` flag
+
+`ttsActive` = `ttsSpeaker != nil && ttsListenerCount > 0`. The listener count is
+tracked by `LiveAudioServer.audioListenerCount` (NSLock-guarded dict of
+`NWConnection`s). `onAudioListenerCountChanged` callback hops to `@MainActor` to
+update `ttsListenerCount` and call `recomputeTTSActive()`. The UI icon turns
+green while `ttsActive`. The `TTSSpeaker.enqueue` call in `graduate()` is gated:
+`if !translation.isEmpty, let server = liveAudioServer, server.audioListenerCount > 0`.
+
+### Terminate hook
+
+`App.installTerminateHook` registers for `NSApplication.willTerminateNotification`
+once. The handler calls `MainActor.assumeIsolated { pipeline.flushPendingSentences() }`
+synchronously (not async Task, which might not complete before exit).
+`flushPendingSentences()` calls `archive?.flush()`, `sp.flush()` for each source
+pipeline, and `merged.flush()` for each merged subtitle archive — all use
+`queue.sync {}` to await their write queues.
+
+---
 
 ## Tools / SDKs in use
 
-- `AVAudioEngine`, `AVAudioConverter` — mic capture + sample-rate conversion
+- `AVAudioEngine`, `AVAudioConverter` — mic capture, sample-rate conversion
 - `Accelerate` (`vDSP_measqv`, `vDSP_vsmul`) — AGC RMS measurement + gain multiply
-- `ScreenCaptureKit` — system audio capture
-- `AVSpeechSynthesizer` — on-device TTS synthesis (no local playback)
-- `Translation` (`TranslationSession`, `.translationTask`)
-- `Network` (`NWListener`) — hand-rolled HTTP server for the audio/SSE stream
-- SwiftUI
+- `ScreenCaptureKit` — system audio capture via `SCStream` (audio-only config)
+- `AVSpeechSynthesizer` (`write(_:toBufferCallback:)`) — on-device TTS, no local playback
+- `Translation` (`TranslationSession`, `.translationTask`) — Apple on-device translation
+- `Network` (`NWListener`, `NWConnection`) — hand-rolled HTTP/1.1 server
+- `CoreImage` (`CIQRCodeGenerator`) — QR code in share popover
+- SwiftUI — UI, `@Published`, `@AppStorage`, `@ObservedObject`
+- `AVAudioFile` — WAV writing (auto Float32→Int16 conversion), duration probing
+- `DispatchQueue` — serial queues for disk IO in archive/recorder/subtitle classes
+- `NSLock` — serialization of whisper context load, whisper_full, crosstalk state, broadcaster listeners, LiveAudioServer subscriber dicts
+- ffmpeg (optional, external, Homebrew) — MKV assembly
+- `/usr/bin/zip` — session artifact packaging
 
-## Roadmap (rough)
+Does NOT include: `SFSpeechRecognizer` (removed), `MixedAudioSource` (removed),
+`AVCaptureSession` (not used).
 
-- [ ] Per-app audio capture (instead of whole-machine) via SCK's filter
+---
+
+## Roadmap
+
 - [x] RNNoise denoising per stream (vendored, BSD 3-clause)
-- [x] whisper.cpp backend (`WhisperCppTranscriber`, current default)
-- [x] Live LAN audio stream with HTML listen page + SSE transcript feed
+- [x] whisper.cpp transcriber (`WhisperCppTranscriber`, current)
+- [x] Live LAN stream with HTML listen page + SSE transcript feed + QR share
+- [x] Crash recovery (leftover work dirs finalized on next launch)
+- [ ] Per-app audio capture (instead of whole-machine) via SCK's filter
 - [ ] OpenRouter fallback as an alternative `Translator` impl
 - [ ] Global hotkey to start/stop
 - [ ] Click-through floating overlay mode
 - [ ] Persist transcript history
 
+---
+
 ## Build / run / debug commands
 
 ```sh
-./build.sh                                       # build & bundle
-open build/LiveTranslate.app                     # launch (always via `open`!)
-tail -f /tmp/livetranslate.log                      # see log output
-pkill -f LiveTranslate                           # kill all instances
+# First-time setup (pre-download model cache, faster subsequent builds)
+./dev-setup.sh
+
+# Build (always use LIVETRANSLATE_SIGN_IDENTITY to persist TCC grants)
+LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev ./build.sh
+
+# Launch (always via `open`, not the binary directly — TCC requires bundle context)
+open build/LiveTranslate.app
+
+# Tail the debug log
+tail -f /tmp/livetranslate.log
+
+# Kill all instances
+pkill -f LiveTranslate
+
+# Force-rebuild whisper.cpp from scratch
+./tools/build-whisper.sh --force
+
+# Reset permissions (if TCC gets confused)
+tccutil reset Microphone local.mtib.livetranslate
+tccutil reset ScreenCapture local.mtib.livetranslate
 ```
+
+---
 
 ## Things that have bitten us already
 
-1. **Running the binary directly** (not via `open`) loses bundle context,
-   TCC complains about missing usage-description keys, app crashes on
-   first permission request.
-2. **Reinstalling the audio tap** between recognition sessions caused
-   recognition to silently stop working after ~1 minute. Keep the tap
-   permanent.
-3. **`requiresOnDeviceRecognition = true`** hard-fails when the language
-   model isn't installed yet. We set it to `false` so the system can fall
-   back to cloud if needed.
-4. **`NSLog`** doesn't reliably appear in `log show` for ad-hoc-signed
-   apps on macOS 26. Use `Log.line(_:)` → `/tmp/livetranslate.log` instead.
+1. **Running the binary directly** (not via `open`) loses bundle context. TCC
+   complains about missing usage-description keys, app crashes on the first
+   permission request. Always `open build/LiveTranslate.app`.
+
+2. **Reinstalling the audio tap between recognition sessions** caused recognition
+   to silently stop after ~1 minute. Keep the tap permanent across sessions.
+   *(Historical: tap-reinstall era, pre-current architecture)*
+
+3. **`requiresOnDeviceRecognition = true`** hard-fails when the on-device model
+   isn't installed. *(Historical: Apple Speech era)*
+
+4. **`NSLog` doesn't appear reliably in `log show`** for ad-hoc-signed apps on
+   macOS 26. Use `Log.line(_:)` → `/tmp/livetranslate.log`.
+
 5. **Command Line Tools don't ship XCTest or Swift Testing.** No `swift test`
-   support without installing full Xcode. Tests deliberately omitted.
-6. **Single-consumer AsyncStream** silently breaks every Start after the
-   first one. Audio sources must broadcast to per-subscriber streams.
-7. **Stalled when audio plays out the speakers and the mic source is on.**
-   The recognizer choked on speaker bleed + room noise. Fix: use the
-   System Audio source instead (ScreenCaptureKit).
-8. **Index-only snapshot reconciliation** left orphan rows whenever the
-   recognizer revised away a sentence boundary. Always handle the "snapshot
-   shrunk" case explicitly.
-9. **`DispatchSemaphore.wait()` on the MainActor to block on an async
-   operation that itself hops to MainActor is an instant deadlock.** The
-   first version of `SystemAudioSource.start()` did this; the app froze on
-   Start when system audio was enabled. Rule: never block the main thread
-   with a semaphore for async work. `AudioSource.start()` is now `async
-   throws` so backends can implement it natively.
-10. **"Don't drop active-session sentences" was too aggressive.** The
-    original `prune` / `enforceMaxCount` exempted every sentence in the
-    active recognition session — and since a session can run for ~60
-    seconds emitting many sentences, the list kept growing forever. Only
-    the *live* (last-active) sentence per source needs protection.
-11. **Hoisting `let audio = source.buffers` out of the recognition-cycle
-    while-loop** silently broke session restarts: `AsyncStream` is
-    single-consumer, so the second session's pump task iterated an
-    already-drained stream and the recognizer hit "No speech detected".
-    Rule: `buffers` is a *fresh subscription factory* — call it per
-    consumer, never cache.
-12. **Unstructured `Task { ... }` children inside a cancellable parent
-    don't inherit cancellation.** The original `run()` spawned its
-    translation/prune workers and per-source recognition cycles as
-    independent Tasks, then awaited their `.value`. When the parent
-    Task was cancelled (via `Pipeline.stop()`), the await woke up but
-    the child Tasks kept running independently — recognition continued
-    producing transcripts, and a second Stop press would actually start
-    a *fresh* run on top (creating a duplicate JSONL archive). Fix:
-    spawn children inside `withTaskGroup` so cancellation cascades.
-    Related rule: don't `runTask = nil` inside `stop()` — leave it set
-    so `toggle()` no-ops during the wind-down rather than starting a
-    new run on top.
-13. **`CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer` with
-    `bufferListSize: MemoryLayout<AudioBufferList>.size` only fits ONE
-    AudioBuffer.** ScreenCaptureKit delivers non-interleaved stereo
-    Float32 — two separate AudioBuffers — which made the call fail with
-    `kCMSampleBufferError_ArrayTooSmall` on *every* sample. Diagnostic
-    counters (`SystemAudio: heartbeat received=X yielded=0 convFails=X`)
-    were the giveaway. Fix: use
-    `CMSampleBufferCopyPCMDataIntoAudioBufferList(_:at:frameCount:into:)`
-    with `AVAudioPCMBuffer.mutableAudioBufferList` — the destination
-    is already correctly sized for its format (separate buffers for
-    non-interleaved, one for interleaved).
-14. **Apple Speech serializes recognition tasks per-app — not just
-    on-device.** Two concurrent `SFSpeechRecognizer`s preempt each
-    other on every restart, both fast-failing with "No speech detected"
-    within ~0.3 s. Forcing one to the server (via
-    `recognizer.supportsOnDeviceRecognition = false`) does NOT help —
-    the contention is at the recognition-task level, not the on-device
-    model level. The only fix that works is to send a **single mixed
-    audio stream to one recognizer**. We did that via `MixedAudioSource`.
-    Trade-off: source attribution is lost (we removed `SentenceKind`
-    and color-coding from the UI as part of this).
-15a. **`SFTranscriptionSegment.timestamp` / `.duration` are zero on
-    partial results.** Apple only populates them on final results.
-    Pause-based sentence splitting in `splitIntoSentences` therefore
-    only fires when a recognition session ends (~60 s on-device, sooner
-    on errors/restarts) — at that point the text gets retroactively
-    re-split using the gaps. During a live session only punctuation
-    splits fire. Confirmed by dumping `[timestamp+duration substring]`
-    for every snapshot; partials looked like
-    `[0.00+0.00 Hello] [0.00+0.00 world]…` until the final result came
-    in with real timings. No fix from our side; just a known limit.
-15. **Naive "interleave buffer streams" mixing tanked recognition
-    latency.** Forwarding every upstream buffer as it arrived doubled
-    the recognizer's audio-time-to-wall-time ratio (it received ~2 s of
-    audio per real second). Transcription content was correct but
-    emission lagged badly. Fix: mix at the SAMPLE level — mic clocks
-    the output, each mic buffer produces one summed output buffer,
-    system samples are pulled from a small bounded queue and added per-
-    sample. 1:1 audio-to-wall ratio restored, recognition is instant
-    again. The per-sample sum runs through `vDSP_vadd` (Accelerate) on
-    a reusable `UnsafeMutablePointer<Float>` scratch buffer — SIMD on
-    NEON / AVX, no per-call malloc. **Mixing has since been removed
-    entirely** in favour of independent per-stream pipelines (see #18);
-    this lesson is kept for the audio-clocking principle.
-16. **Whisper silently drops audio under ~1 s.** Its mel-spectrogram
-    threshold is 100 frames at 10 ms each. The symptom was chunks
-    coming back with `segments=0` in 0.01 s — no error, just empty.
-    Two-layer defence: (a) `accumulator` only allows silence-close
-    once the *total* chunk length clears 1.1 s; (b) `processChunk`
-    pads short trimmed clips with trailing zeros up to 1.1 s as a
-    final safety net. Gating on trim length instead of total length
-    was a separate bug — short utterances kept the trim small and
-    silence-close never fired, leading to max-chunk drops.
-17. **Cancelling `runTask` aborts the recognition mid-flight and
-    drops trailing audio.** The old `Pipeline.stop()` cancelled the
-    run Task; that cancellation propagated to the accumulator's
-    `for await buf in audio`, which exits without emitting a final
-    in-flight chunk, and to the worker's `for await chunk in queue`,
-    which exits before draining. Anything still mid-utterance when
-    Stop is pressed was lost. Fix: shutdown is driven by *ending the
-    audio source*, not cancelling the task. Each `AudioSource.stop()`
-    calls `BufferBroadcaster.finishAll()` to close its subscriptions,
-    so the recognition pipeline drains naturally:
-    `audio source closes → accumulator's for-await ends → final chunk
-    emitted → queue closed → worker drains → run() exits`.
-    Background workers (translation, prune) still need cancellation
-    because they have `while !Task.isCancelled` loops with no
-    natural termination — they run in a separate `Task` cancelled
-    *after* the audio path drains.
-18. **Per-stream pipelines instead of mixing.** The old design
-    sample-summed mic + system before transcribing (lesson #14), then
-    later denoised the mix (lesson #15-era), losing source attribution.
-    The current design runs each input through its own
-    `DenoisingAudioSource`, its own `SourcePipeline` (recorder + SRT
-    writers + transcribe call), and only shares the whisper context
-    (with an `NSLock` around `whisper_full`), the JSONL archive (with
-    a per-row `source` field), and the visible UI sentence array.
-    No mixing, no attribution loss.
-19. **Two concurrent `whisper_init_from_file_with_params` calls fail
-    on Metal contexts.** When mic and system pipelines both invoke
-    `transcribe()` at the same instant, both reach
-    `ensureContextLoaded()` and both see `ctx == nil`. Both then call
-    `whisper_init_from_file_with_params` on the same path; one
-    succeeds, the other fails with "failed to load model". Symptom in
-    the log: `Whisper.transcribe[system]: error … failed to load
-    model`. Fix: serialize `ensureContextLoaded()` with an `NSLock`
-    so the second caller waits, finds `ctx` already set, and reuses
-    it. Without this the system pipeline never produced chunks (and
-    crosstalk suppression never activated because the system
-    accumulator was never running).
-20. **Crosstalk: mic always picks up some of the system's audio
-    through the speakers.** Affects transcription quality (mic
-    transcribes the bleed). Mitigation: `WhisperCppTranscriber`
-    carries a shared `lastSystemVoicedAt: Date` (NSLock-protected);
-    system accumulator stamps it per voiced buffer; mic accumulator
-    queries it per buffer; if system was voiced within
-    `crosstalkPersistSeconds` (250 ms), the mic's current buffer is
-    replaced with silence in the 16 kHz sample array and voiced-span
-    markers aren't credited. The chunk's timing keeps advancing so
-    WAV alignment stays correct. **Caveat**: this affects only what
-    whisper sees; the mic `.wav` recording still has the raw bleed
-    because it consumes the broadcaster directly, upstream of the
-    muting logic. Acceptable for transcription quality; a future
-    improvement could mute the recorded buffer too.
-21. **`SourcePipeline` shouldn't be `@MainActor`.** Pipeline is
-    @MainActor, and naively making child classes follow suit would
-    serialize the per-stream accumulators on the MainActor — both
-    audio paths plus the worker would queue behind UI updates. Keep
-    `SourcePipeline`, `WhisperCppTranscriber`, `DenoisingAudioSource`
-    as plain classes; their methods run on whatever executor the
-    Swift runtime chose (cooperative pool from `withTaskGroup`).
-    Only the UI-state writes hop back to MainActor (via
-    `Task { @MainActor in ... }` or via `Pipeline.consumeSentences`
-    which is itself @MainActor).
-22. **`tools/build-whisper.sh` skipped header mirroring when the prefix
-    was already on disk.** Symptom after switching from a feature
-    branch that didn't carry `Sources/CWhisper/` back to `main`:
-    `swift build` fails with `'whisper.h' file not found` despite
-    `build/whisper-prefix/lib/libwhisper.a` being right there. Cause:
-    the script's idempotency guard (`SKIP_LIB_BUILD=1`) wrapped the
-    `cp …/include/*.h Sources/CWhisper/include/` step as well as the
-    cmake build, so a branch-switch that wiped the bridge target's
-    include dir wasn't re-populated on the next build. Fix: the
-    header mirror runs unconditionally now — it's a fast `cp` and
-    keeps the bridge in sync with whatever prefix is currently
-    installed.
+   without full Xcode. Tests deliberately omitted.
+
+6. **Single-consumer `AsyncStream` silently breaks every Start after the first.**
+   If an audio source exposed a stored `AsyncStream` as its `buffers` property,
+   the second session's pump would iterate an already-drained stream and the
+   recognizer would get no audio. Fix: `BufferBroadcaster` creates a fresh stream
+   per `buffers` access. Rule: `buffers` is a subscription factory — never cache.
+
+7. **Speaker bleed / stall when mic captures system audio through the speakers.**
+   Old design: use system audio source instead of mic. Current design: crosstalk
+   suppression gate in `DenoisingAudioSource` (see above).
+
+8. **Index-only snapshot reconciliation** left orphan rows when a recognizer
+   revised sentence boundaries. Always handle the "snapshot shrunk" case
+   explicitly. *(Historical: Apple Speech era)*
+
+9. **`DispatchSemaphore.wait()` on the MainActor for async SCK setup is an instant
+   deadlock.** The original `SystemAudioSource.start()` blocked the main thread
+   waiting for SCK's async delegate callback, which needed the main thread to
+   deliver — instant freeze. Rule: never block the main thread with a semaphore
+   for async work. `AudioSource.start()` is `async throws`.
+
+10. **"Don't drop active-session sentences" was too aggressive.** The original
+    `prune` exempted every sentence in the current recognition session — since a
+    session can emit many sentences, the list grew forever. Only the last sentence
+    needs protection (`protectedIDs()` returns just `sentences.last?.id`).
+
+11. **Caching the `buffers` AsyncStream out of the recognition-cycle while-loop.**
+    `AsyncStream` is single-consumer; caching and reusing across sessions means the
+    second session's pump iterates a drained stream and the recognizer gets nothing.
+    Rule: call `audioSource.buffers` per consumer, per session.
+
+12. **Unstructured `Task { }` children inside a cancellable parent don't inherit
+    cancellation.** The old `Pipeline.run()` spawned per-source recognition cycles
+    as independent Tasks, then awaited `.value`. Cancelling the parent woke the
+    await but the children kept running. A second Stop triggered a duplicate run
+    on top. Fix: use `withTaskGroup` so cancellation cascades. Related: don't
+    `runTask = nil` inside `stop()` — leave it set so `toggle()` no-ops during
+    wind-down.
+
+13. **`CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer` with a fixed
+    `MemoryLayout<AudioBufferList>.size` only fits ONE AudioBuffer.** SCK delivers
+    non-interleaved stereo Float32 — two separate `AudioBuffer`s. The fixed-size
+    allocation failed with `kCMSampleBufferError_ArrayTooSmall` on every frame.
+    Symptom: `SystemAudio: heartbeat received=X yielded=0 convFails=X`. Fix: use
+    `CMSampleBufferCopyPCMDataIntoAudioBufferList(_:at:frameCount:into:)` with
+    `AVAudioPCMBuffer.mutableAudioBufferList` — already correctly sized.
+
+14. **Apple Speech serializes recognition tasks per-app** (even with two
+    `SFSpeechRecognizer` instances, even with one on-device and one server-side).
+    Each restart preempted the other; both fast-failed with "No speech detected".
+    The only fix was a single mixed audio stream to one recognizer. *(Historical:
+    Apple Speech era — whisper.cpp replaced this entirely)*
+
+15a. **`SFTranscriptionSegment.timestamp` / `.duration` are zero on partial
+     results.** Apple only populates them on finals. Pause-based splitting only
+     fires at session end (~60 s). *(Historical: Apple Speech era)*
+
+15. **Naive buffer-stream interleaving tanked recognition latency.** Forwarding
+    every upstream buffer as it arrived to a mixed stream doubled the
+    audio-time-to-wall-time ratio. Fix: mix at the sample level — mic clocks
+    the output; system samples pulled from a bounded queue. *(Historical: mixing
+    era — per-stream pipelines replaced this entirely)*
+
+16. **Whisper silently drops audio under ~1 s.** Mel-spectrogram threshold: 100
+    frames × 10 ms. Symptom: `segments=0` returned in 0.01 s, no error.
+    Fix (two layers): (a) accumulator silence-close gate: only allow silence-close
+    once chunk total ≥ `minWhisperInputSeconds` (1.1 s); (b) `processChunk` pads
+    short trimmed clips with trailing zeros to 1.1 s.
+
+17. **Cancelling `runTask` dropped trailing audio.** Cancellation propagated to
+    the accumulator's `for await buf in audio`, which exited without emitting the
+    in-flight chunk, and to the worker, which exited without draining the queue.
+    Fix: shutdown is driven by ending the audio source (not cancelling the task).
+    `AudioSource.stop()` → `BufferBroadcaster.finishAll()` → accumulator's
+    for-await exits naturally → final chunk emitted → queue closed → worker drains
+    → `run()` exits. Background workers (prune) still need explicit cancellation.
+
+18. **Per-stream pipelines replaced mixing entirely.** Old: sample-sum mic +
+    system → one recognizer. Current: independent `SourcePipeline`s, shared whisper
+    `ctx` with `NSLock`. No mixing, no attribution loss. The sample-clocking
+    principle from lesson #15 is worth keeping as general knowledge.
+
+19. **Two concurrent `whisper_init_from_file_with_params` calls fail on Metal
+    contexts.** Both mic and system pipelines reached `ensureContextLoaded()` with
+    `ctx == nil` simultaneously. One succeeded; the other failed with "failed to
+    load model". Symptom: `Whisper.transcribe[system]: error … failed to load
+    model`. Fix: `ctxLoadLock: NSLock` serializes `ensureContextLoaded()`.
+
+20. **Crosstalk: mic picks up system audio through the speakers.** (See
+    crosstalk-suppression design decision above.) Caveat: affects only what whisper
+    sees; the mic `.wav` previously still had raw bleed because the broadcaster
+    was upstream of any mute logic. Current design zeroes the buffer in
+    `DenoisingAudioSource.denoise()` after denoising but before `broadcaster.emit`,
+    so both the recorder and the transcriber accumulator see muted audio.
+
+21. **`SourcePipeline` must NOT be `@MainActor`.** Making child pipeline classes
+    follow `Pipeline`'s `@MainActor` isolation would serialize the per-stream
+    accumulators on the main thread — both audio paths and the worker would queue
+    behind UI updates. Keep `SourcePipeline`, `WhisperCppTranscriber`,
+    `DenoisingAudioSource` as plain classes running on the cooperative pool.
+    Only UI-state writes hop back to MainActor via `Task { @MainActor in ... }`.
+
+22. **`tools/build-whisper.sh` skipped header mirroring when the prefix was
+    already on disk.** After a branch switch that wiped `Sources/CWhisper/include/`,
+    `swift build` failed with `'whisper.h' file not found` even though
+    `libwhisper.a` was present. Cause: the `SKIP_LIB_BUILD=1` guard also wrapped
+    the `cp …/include/*.h Sources/CWhisper/include/` step. Fix: header mirroring
+    runs unconditionally — it's a fast `cp` and ensures the bridge stays in sync.
+
+23. **`Task.sleep(nanoseconds: .max)` (and similar large-duration sleeps) trips
+    a precondition on macOS 15+.** The original `.translationTask` parking used
+    `Task.sleep` to hold the session alive. This assertion-fails in debug and
+    silently misbehaves in release. Fix: park on `AsyncStream<Never>.makeStream()`
+    — `for await _ in parked { }` blocks the task indefinitely until the
+    continuation's `finish()` is called (in the `defer`).
+
+24. **`TranscriptArchive.encodeLine` must be static for SSE deduplication.** The
+    JSONL line written to disk and the SSE event sent to subscribers must be
+    bit-identical so the listen page's client-side dedup (`seen` Set keyed by
+    `start|end|transcription`) correctly deduplicates replayed events vs. live
+    events. If two different code paths produced slightly different JSON
+    (e.g., different key order), the dedup would fail and listeners would see
+    duplicate rows after reconnect. `encodeLine` is `static` and uses
+    `JSONEncoder(.sortedKeys)` so both consumers call the same function and get
+    the identical string.
+
+25. **`AVAudioFile.flush()` / close must be awaited before MKV export.** If the
+    `AVAudioFile` is not closed before `MKVExporter.export` probes WAV duration
+    via `AVAudioFile(forReading:)`, the WAV header's data-chunk length is stale
+    (still the value written at `init` time, not updated until close/deinit).
+    This made `ffmpeg`'s lavfi `-t` duration calculate as ~0 s, producing a
+    near-zero-length video. Fix: `AudioRecorder.flush()` runs `queue.sync {
+    self.file = nil }` — setting `file = nil` deinits `AVAudioFile`, which
+    finalizes the header. Pipeline calls `sp.flush()` before `MKVExporter.export`.
