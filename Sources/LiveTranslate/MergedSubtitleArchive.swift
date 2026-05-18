@@ -1,10 +1,10 @@
 import Foundation
 
 /// Live-updated SRT that merges cues from both input streams for one
-/// language. Each `add(...)` call appends a cue (tagged with the
-/// source's prefix), re-sorts the in-memory cue list by start time,
-/// and rewrites the file from scratch. Cheap for sessions with a few
-/// hundred cues (O(N²) total writes, O(N) per cue).
+/// language. Each `add(...)` call appends a cue, re-sorts the in-memory
+/// cue list by start time, and rewrites the file from scratch. Cheap
+/// for sessions with a few hundred cues (O(N²) total writes, O(N) per
+/// cue).
 ///
 /// Writes are serialised on a private dispatch queue so the MainActor
 /// (where `Pipeline.graduate` runs) never blocks on disk IO. Use
@@ -17,7 +17,6 @@ final class MergedSubtitleArchive {
     private struct Cue {
         let start: Double
         let end: Double
-        let prefix: String      // "[Mic]" or "[Sys]"
         let text: String
     }
 
@@ -37,13 +36,12 @@ final class MergedSubtitleArchive {
     /// Append one cue, re-sort by start time, rewrite the file. The
     /// caller passes seconds-from-recording-start; the file is then
     /// directly mountable on the matching `.wav` / `.mkv` timeline.
-    func add(text: String, prefix: String, startSeconds: Double, endSeconds: Double) {
+    func add(text: String, startSeconds: Double, endSeconds: Double) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let cue = Cue(
             start: max(0, startSeconds),
             end: max(startSeconds, endSeconds),
-            prefix: prefix,
             text: trimmed
         )
         let url = self.url
@@ -52,7 +50,7 @@ final class MergedSubtitleArchive {
             self.cues.sort { $0.start < $1.start }
             var out = ""
             for (i, c) in self.cues.enumerated() {
-                out += "\(i + 1)\n\(Self.format(c.start)) --> \(Self.format(c.end))\n\(c.prefix) \(c.text)\n\n"
+                out += "\(i + 1)\n\(Self.format(c.start)) --> \(Self.format(c.end))\n\(c.text)\n\n"
             }
             do {
                 try out.write(to: url, atomically: true, encoding: .utf8)

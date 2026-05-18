@@ -61,6 +61,17 @@ final class Pipeline: ObservableObject {
     /// QR code so a phone-with-headphones can listen along.
     @Published private(set) var liveStreamURL: String?
 
+    /// True while the TTS pipeline is doing real work — the speaker is
+    /// ready AND there's at least one listener connected to `/live.wav`.
+    /// UI shows this as a green stream icon. Flips off when the last
+    /// listener disconnects (the speaker stays resident for the rest of
+    /// the session, but it's no longer being driven).
+    @Published private(set) var ttsActive: Bool = false
+
+    /// Backing flags for `ttsActive`. Set by the listener-count callback
+    /// hopping back to MainActor; combined in `recomputeTTSActive()`.
+    private var ttsListenerCount = 0
+
     // MARK: - User settings (persisted)
 
     /// Changing source/target while a run is in progress flushes the
@@ -319,29 +330,34 @@ final class Pipeline: ObservableObject {
         sentences.append(sentence)
         inflightChunks.removeAll { $0.id == id }
         recordSentence(sentence)
-        // Feed the translation into the live audio stream. The
-        // speaker is nil when no voice is installed for the target
-        // (or src == tgt, set up in `run()`), so this is a cheap
-        // no-op in those cases.
-        if !translation.isEmpty {
+        // Feed the translation into the live audio stream — but only
+        // if someone's actually listening. With zero subscribers on
+        // /live.wav the speaker synthesizes into the void; gating here
+        // skips the synthesis and keeps it quiet when nobody is tuned in.
+        if !translation.isEmpty,
+           let server = liveAudioServer,
+           server.audioListenerCount > 0 {
             ttsSpeaker?.enqueue(translation)
         }
         enforceMaxCount()
     }
 
-    /// Write a freshly-graduated sentence to disk: shared JSONL +
-    /// per-language merged SRTs (with `[Mic]` / `[Sys]` prefix).
-    /// All writes are queue-backed so this returns immediately.
+    /// Write a freshly-graduated sentence to disk (shared JSONL +
+    /// per-language merged SRTs) and broadcast the same JSONL line on
+    /// the listen-page SSE channel. All writes are queue-backed so
+    /// this returns immediately.
     private func recordSentence(_ s: Sentence) {
         archive?.append(s)
-        let prefix = "[\(s.source.shortLabel)]"
+        if let line = TranscriptArchive.encodeLine(s) {
+            liveAudioServer?.publishTranscript(jsonLine: line)
+        }
         let start = s.createdAt.timeIntervalSince(runStartedAt)
         let end = max(start, s.endsAt.timeIntervalSince(runStartedAt))
         let srcLang = String(source.identifier.prefix(2))
-        mergedSubtitles[srcLang]?.add(text: s.text, prefix: prefix, startSeconds: start, endSeconds: end)
+        mergedSubtitles[srcLang]?.add(text: s.text, startSeconds: start, endSeconds: end)
         let tgtLang = target.code
         if tgtLang != srcLang, !s.translation.isEmpty {
-            mergedSubtitles[tgtLang]?.add(text: s.translation, prefix: prefix, startSeconds: start, endSeconds: end)
+            mergedSubtitles[tgtLang]?.add(text: s.translation, startSeconds: start, endSeconds: end)
         }
     }
 
@@ -455,6 +471,8 @@ final class Pipeline: ObservableObject {
             liveAudioServer?.stop()
             liveAudioServer = nil
             liveStreamURL = nil
+            ttsListenerCount = 0
+            recomputeTTSActive()
             if restartRequested {
                 restartRequested = false
                 sentences = []
@@ -551,6 +569,12 @@ final class Pipeline: ObservableObject {
                 }, onActivityChanged: { [weak server] active in
                     server?.setSpeaking(active)
                 })
+                server.onAudioListenerCountChanged = { [weak self] count in
+                    Task { @MainActor [weak self] in
+                        self?.ttsListenerCount = count
+                        self?.recomputeTTSActive()
+                    }
+                }
                 self.liveAudioServer = server
                 self.ttsSpeaker = speaker
                 self.liveStreamURL = LiveAudioServer.streamURL(port: liveStreamPort)
@@ -661,5 +685,12 @@ final class Pipeline: ObservableObject {
                 break
             }
         }
+    }
+
+    /// Recompute `ttsActive` from the listener count. Called whenever
+    /// the count changes (listener connect/disconnect) or when the
+    /// stream is torn down at run end.
+    private func recomputeTTSActive() {
+        ttsActive = ttsSpeaker != nil && ttsListenerCount > 0
     }
 }

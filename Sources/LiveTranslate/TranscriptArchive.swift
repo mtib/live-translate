@@ -45,6 +45,23 @@ final class TranscriptArchive {
         queue.sync {}
     }
 
+    /// Encode a sentence to its JSONL line without writing to disk.
+    /// Used by `Pipeline.recordSentence` to broadcast the same JSON
+    /// on the SSE channel and keep the on-disk and over-the-wire
+    /// representations bit-identical.
+    static func encodeLine(_ sentence: Sentence) -> String? {
+        let record = Record(
+            start: isoFormatter.string(from: sentence.createdAt),
+            end: isoFormatter.string(from: sentence.endsAt),
+            source: sentence.source.rawValue,
+            transcription: sentence.text,
+            translation: sentence.translation
+        )
+        guard let data = try? encoder.encode(record),
+              let line = String(data: data, encoding: .utf8) else { return nil }
+        return line
+    }
+
     /// Append one sentence record. Returns immediately; actual disk IO
     /// happens asynchronously on the archive's queue.
     func append(_ sentence: Sentence) {

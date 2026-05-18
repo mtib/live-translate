@@ -47,16 +47,23 @@ struct TranscriptView: View {
         // a dead band above our controls.
         .ignoresSafeArea()
         // Park the translation session for the lifetime of this config.
+        // SwiftUI cancels the closure on config change or view disappear;
+        // `defer` then clears the session before the next one is installed.
+        // We park by iterating an AsyncStream that's never written to —
+        // cancellation wakes the iterator. `Task.sleep` with anything
+        // close to Duration's range trips a precondition on macOS 15.
         .translationTask(translationConfig) { session in
             pipeline.installTranslationSession(session)
+            defer { pipeline.installTranslationSession(nil) }
             do {
                 try await session.prepareTranslation()
                 Log.line("Translation prepared")
             } catch {
                 Log.line("prepareTranslation failed: \(error.localizedDescription)")
             }
-            try? await Task.sleep(nanoseconds: .max)
-            pipeline.installTranslationSession(nil)
+            let (parked, holder) = AsyncStream<Never>.makeStream()
+            defer { holder.finish() }
+            for await _ in parked { }
         }
     }
 
@@ -124,6 +131,7 @@ struct TranscriptView: View {
     /// live (i.e. the target language has a voice installed and
     /// src != tgt). Click pops a small panel with the stream URL
     /// (copyable) and a QR code of the same URL for phone listeners.
+    /// Tints green while a listener is connected (i.e. `ttsActive`).
     @State private var streamShareShown: Bool = false
     @ViewBuilder
     private var streamShareButton: some View {
@@ -133,10 +141,13 @@ struct TranscriptView: View {
             } label: {
                 Image(systemName: "dot.radiowaves.left.and.right")
                     .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(
+                        pipeline.ttsActive ? AnyShapeStyle(.green) : AnyShapeStyle(.secondary)
+                    )
+                    .animation(.easeInOut(duration: 0.25), value: pipeline.ttsActive)
             }
             .buttonStyle(.plain)
-            .help("Live translated-audio stream")
+            .help(pipeline.ttsActive ? "Live audio stream — listener connected" : "Live translated-audio stream")
             .popover(isPresented: $streamShareShown, arrowEdge: .bottom) {
                 StreamShareView(url: url)
                     .padding(16)
