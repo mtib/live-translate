@@ -6,44 +6,25 @@ translation from one or two audio sources simultaneously. A learning / DIY clone
 
 ---
 
-## ┌─ RULE 1: Keep this file accurate ───────────────────────────────────┐
-## │ Update CLAUDE.md in the same commit as any meaningful code change.  │
-## │ What counts as "meaningful": source file layout, data-flow changes, │
-## │ new or changed protocols, settings keys, build pipeline, runtime    │
-## │ behavior, the files table, or any new entry in "Things That Bit Us".│
-## │ This file is the ONLY durable orientation document. It is read by   │
-## │ AI agents at session start; stale content directly misleads them    │
-## │ into making wrong assumptions about the codebase. Source comments   │
-## │ cover *what* a function does; CLAUDE.md covers *why the design is   │
-## │ shaped this way* and *what to never do again*.                      │
-## └──────────────────────────────────────────────────────────────────────┘
+## Rule 1: Keep this file accurate
 
-## ┌─ RULE 2: Persist learnings ──────────────────────────────────────────┐
-## │ Every bug that bites gets a numbered entry in "Things that have     │
-## │ bitten us": what went wrong AND the shape of the fix. This is the  │
-## │ durable institutional memory. Without it the same trap is re-       │
-## │ stepped in a later session. Mark historical entries (for approaches │
-## │ no longer in use) clearly so they are still readable as warnings.   │
-## └──────────────────────────────────────────────────────────────────────┘
+Update CLAUDE.md in the same commit as any meaningful code change. What counts as "meaningful": source file layout, data-flow changes, new or changed protocols, settings keys, build pipeline, runtime behavior, the files table, or any new entry in "Things That Bit Us". This file is the ONLY durable orientation document. It is read by AI agents at session start; stale content directly misleads them into making wrong assumptions about the codebase. Source comments cover *what* a function does; CLAUDE.md covers *why the design is shaped this way* and *what to never do again*.
 
-## ┌─ RULE 3: Eagerly load Swift sources at session start ────────────────┐
-## │ Before changing any code, read ALL of                               │
-## │   Sources/LiveTranslate/*.swift                                     │
-## │ and the relevant bridge headers. The data flow crosses many files   │
-## │ (audio source → denoiser → transcriber → pipeline → translator →   │
-## │ archives + UI), and surprising interactions live at the boundaries. │
-## │ Skimming or grepping for one symbol misses the patterns.            │
-## └──────────────────────────────────────────────────────────────────────┘
+## Rule 2: Persist learnings
 
-## ┌─ RULE 4: Always build with signing identity ─────────────────────────┐
-## │ Non-interactive bash (the agent's Bash tool) does NOT source        │
-## │ ~/.zshrc, so the env var is NOT set unless you pass it explicitly.  │
-## │ Every build the agent triggers without it is ad-hoc-signed,         │
-## │ producing a fresh cdhash, which causes macOS to re-prompt for mic   │
-## │ and screen-recording permissions on every run. Always prefix with:  │
-## │                                                                     │
-## │   LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev ./build.sh           │
-## └──────────────────────────────────────────────────────────────────────┘
+Every bug that bites gets a numbered entry in "Things that have bitten us": what went wrong AND the shape of the fix. This is the durable institutional memory. Without it the same trap is re-stepped in a later session. Mark historical entries (for approaches no longer in use) clearly so they are still readable as warnings.
+
+## Rule 3: Eagerly load Swift sources at session start
+
+Before changing any code, read ALL of `Sources/LiveTranslate/*.swift` and the relevant bridge headers. The data flow crosses many files (audio source → denoiser → transcriber → pipeline → translator → archives + UI), and surprising interactions live at the boundaries. Skimming or grepping for one symbol misses the patterns.
+
+## Rule 4: Always build with signing identity
+
+Non-interactive bash (the agent's Bash tool) does NOT source `~/.zshrc`, so the env var is NOT set unless you pass it explicitly. Every build the agent triggers without it is ad-hoc-signed, producing a fresh cdhash, which causes macOS to re-prompt for mic and screen-recording permissions on every run. Always prefix with:
+
+```sh
+LIVETRANSLATE_SIGN_IDENTITY=LiveTranslateDev ./build.sh
+```
 
 ---
 
@@ -102,54 +83,41 @@ translation from one or two audio sources simultaneously. A learning / DIY clone
 
 ## Architecture diagram
 
-```
-  Mic ──────▶ MicrophoneSource ──▶ DenoisingAudioSource(mic)
-                (AVAudioEngine)      (RNNoise + AGC + crosstalk gate)
-                                          │
-                                          ├──▶ AudioRecorder → <stamp>.mic.wav
-                                          │
-                                          └──▶ WhisperCppTranscriber.transcribe()
-                                                    │   accumulator task
-                                                    │   ↓ ChunkBuffer
-                                                    │   worker task → whisper_full()
-                                                    │   ↓ onChunkLifecycle callback
-                                                    │
-  System ──▶ SystemAudioSource ──▶ DenoisingAudioSource(system)
-              (ScreenCaptureKit)     (RNNoise + AGC, no mute gate)
-                                          │
-                                          ├──▶ AudioRecorder → <stamp>.system.wav
-                                          │
-                                          └──▶ WhisperCppTranscriber.transcribe()
-                                                    │   (shares same ctx + NSLock)
-                                                    │   ↓ onChunkLifecycle callback
-                                                    │
-                Both streams ──────────────────────▶ Pipeline.handleChunkLifecycle
-                                                           │ (hops to MainActor)
-                                                           ▼
-                                                   Pipeline.applyLifecycle
-                                                           │
-                                         ┌─────────────────┼──────────────────┐
-                                         ▼                 ▼                  ▼
-                                  .listening         .transcribing       .completed(text)
-                                  (reserve row)      (flip row)          → translate (or cache hit)
-                                                                          → graduate()
-                                                                               │
-                                                    ┌──────────────────────────┤
-                                                    ▼                          ▼
-                                           @Published sentences        TranscriptArchive.append
-                                           (UI rows)                   (JSONL, source-tagged)
-                                                    │
-                                                    ├──▶ MergedSubtitleArchive.add (per lang)
-                                                    │
-                                                    └──▶ LiveAudioServer.publishTranscript (SSE)
-                                                              │
-                                                              ├── / → HTML listen page
-                                                              ├── /live.wav → open WAV stream
-                                                              └── /events → SSE transcript
-                                                                                │
-                                                              TTSSpeaker ──────▶ /live.wav
-                                                              (AVSpeechSynthesizer, no local
-                                                               playback, 24 kHz PCM16 LE)
+```mermaid
+flowchart TD
+    Mic[Mic] --> MicSrc["MicrophoneSource\nAVAudioEngine"]
+    MicSrc --> DenMic["DenoisingAudioSource mic\nRNNoise + AGC + crosstalk gate"]
+    DenMic --> RecMic["AudioRecorder → .mic.wav"]
+    DenMic --> WMic["transcribe() — accumulator + worker tasks"]
+
+    Sys[System] --> SysSrc["SystemAudioSource\nScreenCaptureKit"]
+    SysSrc --> DenSys["DenoisingAudioSource system\nRNNoise + AGC"]
+    DenSys --> RecSys["AudioRecorder → .system.wav"]
+    DenSys --> WSys["transcribe() — accumulator + worker tasks"]
+
+    subgraph Transcriber["WhisperCppTranscriber — shared ctx + NSLock"]
+        WMic
+        WSys
+    end
+
+    WMic -->|onChunkLifecycle| Pipe["Pipeline.applyLifecycle\n@MainActor"]
+    WSys -->|onChunkLifecycle| Pipe
+
+    Pipe --> S1[".listening — reserve row"]
+    Pipe --> S2[".transcribing — flip row"]
+    Pipe --> S3[".completed — translate or cache hit — graduate()"]
+
+    S3 --> UI["@Published sentences\nUI rows"]
+    S3 --> JSONL["TranscriptArchive.append\nJSONL, source-tagged"]
+    S3 --> SRT["MergedSubtitleArchive.add\nper language"]
+    S3 --> Server["LiveAudioServer.publishTranscript\nport 8765"]
+    S3 -->|"audioListenerCount > 0"| TTS["TTSSpeaker\nAVSpeechSynthesizer\n24 kHz PCM16 LE, no local playback"]
+
+    TTS -->|PCM audio| Server
+
+    Server --> R1["/ — HTML listen page"]
+    Server --> R2["/live.wav — open WAV stream"]
+    Server --> R3["/events — SSE transcript"]
 ```
 
 Both streams share **one `WhisperCppTranscriber` instance** (and thus one
